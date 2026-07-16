@@ -190,6 +190,10 @@ struct cbm_pipeline {
     int committed_nodes;
     int committed_edges;
 
+    /* #769: set when a stale-format index was routed through the one-time
+     * full rebuild, so the MCP response can surface the migration. */
+    bool format_migration;
+
     /* ADR (project_summaries) captured before a full-reindex DB delete, so it
      * can be restored after the rebuild. NULL when no ADR existed. Issue #516. */
     char *saved_adr;
@@ -222,6 +226,10 @@ CBMHashTable *cbm_pipeline_get_pkgmap(void) {
 
 void cbm_pipeline_set_pkgmap(CBMHashTable *map) {
     g_pkgmap = map;
+}
+
+bool cbm_pipeline_had_format_migration(const cbm_pipeline_t *p) {
+    return p && p->format_migration;
 }
 
 /* ── Timing helper ──────────────────────────────────────────────── */
@@ -1393,6 +1401,24 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
         free(db_path);
         return CBM_PIPELINE_FORCE_FULL_REINDEX;
     }
+
+    cbm_store_t *fmt_store = cbm_store_open_path_query(db_path);
+    int fmt = 0;
+    if (fmt_store) {
+        cbm_store_get_format_version(fmt_store, &fmt);
+        cbm_store_close(fmt_store);
+    }
+    if (fmt != CBM_INDEX_FORMAT_VERSION) {
+        cbm_log_info("pipeline.route", "path", "format_change_reindex", "stored_format",
+                     itoa_buf(fmt));
+        p->format_migration = true;
+        int adr_rc = capture_existing_adr(p, db_path);
+        (void)cbm_unlink(db_path);
+        (void)cbm_remove_db_sidecars(db_path);
+        free(db_path);
+        return adr_rc != 0 ? adr_rc : CBM_PIPELINE_FORCE_FULL_REINDEX;
+    }
+
     cbm_log_info("pipeline.route", "path", "incremental_manifest");
     int rc = cbm_pipeline_run_incremental(p, db_path, files, file_count, baseline_manifest,
                                           baseline_count, force_full_on_mismatch);
@@ -1747,6 +1773,11 @@ int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_
         ok = cbm_store_adr_store(store, generation->project, generation->adr_content) ==
              CBM_STORE_OK;
     }
+
+    if (ok) {
+        ok = cbm_store_set_format_version(store, CBM_INDEX_FORMAT_VERSION) == CBM_STORE_OK;
+    }
+
     cbm_log_info("publish.timing", "block", "writes", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t_pub)));
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_pub);
