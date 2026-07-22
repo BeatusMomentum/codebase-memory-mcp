@@ -22,6 +22,7 @@ int tf_skip_count = 0;
 #include "daemon/version_cohort.h" /* Windows crash-turnover re-exec probe */
 #include "mcp/index_supervisor.h"  /* cbm_index_set_worker_role */
 #include "mcp/mcp.h"               /* cbm_mcp_handle_tool — act as a real worker */
+#include "ui/http_server.h"       /* deleted-self executable probe */
 #include <sqlite3.h>
 #include <errno.h>
 #include <stdbool.h>
@@ -608,6 +609,26 @@ static int tf_maybe_run_mcp_idxfailclosed_probe(int argc, char **argv) {
                                                              const char *cache_dir);
     alarm(20);
     return mcp_test_idxfailclosed_supervisor_start_check(argv[2], argv[3]);
+static int tf_maybe_run_deleted_self_probe(int argc, char **argv) {
+#if defined(__linux__)
+    if (argc != 5 || strcmp(argv[1], "__cbm_deleted_self_probe") != 0) {
+        return -1;
+    }
+    int ready_fd = atoi(argv[2]);
+    int continue_fd = atoi(argv[3]);
+    cbm_http_server_set_binary_path(argv[4]);
+    if (write(ready_fd, "R", 1) != 1) {
+        return 41;
+    }
+    char go = '\0';
+    if (read(continue_fd, &go, 1) != 1) {
+        return 42;
+    }
+    char resolved[1024];
+    if (!cbm_http_server_resolve_binary_path(NULL, resolved, sizeof(resolved))) {
+        return 43;
+    }
+    return strcmp(resolved, argv[4]) == 0 && access(resolved, X_OK) == 0 ? 0 : 44;
 #else
     (void)argc;
     (void)argv;
@@ -866,6 +887,9 @@ int main(int argc, char **argv) {
     int daemon_ipc_probe_rc = tf_maybe_run_daemon_ipc_lock_probe(argc, argv);
     if (daemon_ipc_probe_rc >= 0) {
         return daemon_ipc_probe_rc;
+    int deleted_self_rc = tf_maybe_run_deleted_self_probe(argc, argv);
+    if (deleted_self_rc >= 0) {
+        return deleted_self_rc;
     }
 
     /* #798 follow-up: if spawned as the socket-isolation probe, report whether an
