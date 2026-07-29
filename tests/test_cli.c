@@ -8795,46 +8795,61 @@ TEST(cli_hook_augment_bash_pattern_extractor) {
     char out[256];
 
     /* common forms */
-    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("rg -n CreateStripeCheckout .", out, sizeof(out)));
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("rg -n CreateStripeCheckout .", out,
+                                                                sizeof(out)));
     ASSERT_STR_EQ(out, "CreateStripeCheckout");
-    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("grep -rn CreateStripeCheckout .", out, sizeof(out)));
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("grep -rn CreateStripeCheckout .",
+                                                                out, sizeof(out)));
     ASSERT_STR_EQ(out, "CreateStripeCheckout");
-    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("grep -e CreateStripeCheckout .", out, sizeof(out)));
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("grep -e CreateStripeCheckout .",
+                                                                out, sizeof(out)));
     ASSERT_STR_EQ(out, "CreateStripeCheckout");
-    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("ag CreateStripeCheckout src/", out, sizeof(out)));
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("ag CreateStripeCheckout src/", out,
+                                                                sizeof(out)));
     ASSERT_STR_EQ(out, "CreateStripeCheckout");
-    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("git grep CreateStripeCheckout .", out, sizeof(out)));
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("git grep CreateStripeCheckout .",
+                                                                out, sizeof(out)));
     ASSERT_STR_EQ(out, "CreateStripeCheckout");
 
     /* value-taking flags are skipped correctly */
-    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("grep -A 5 CreateStripeCheckout .", out, sizeof(out)));
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("grep -A 5 CreateStripeCheckout .",
+                                                                out, sizeof(out)));
     ASSERT_STR_EQ(out, "CreateStripeCheckout");
-    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("rg -t py CreateStripeCheckout .", out, sizeof(out)));
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("rg -t py CreateStripeCheckout .",
+                                                                out, sizeof(out)));
     ASSERT_STR_EQ(out, "CreateStripeCheckout");
 
     /* env-var prefix and wrappers */
-    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("FOO=bar rg CreateStripeCheckout .", out, sizeof(out)));
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("FOO=bar rg CreateStripeCheckout .",
+                                                                out, sizeof(out)));
     ASSERT_STR_EQ(out, "CreateStripeCheckout");
-    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("rtk grep -n CreateStripeCheckout .", out, sizeof(out)));
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing(
+        "rtk grep -n CreateStripeCheckout .", out, sizeof(out)));
     ASSERT_STR_EQ(out, "CreateStripeCheckout");
-    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("tokf run rg CreateStripeCheckout .", out, sizeof(out)));
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing(
+        "tokf run rg CreateStripeCheckout .", out, sizeof(out)));
     ASSERT_STR_EQ(out, "CreateStripeCheckout");
-    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("env FOO=bar rg CreateStripeCheckout .", out, sizeof(out)));
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing(
+        "env FOO=bar rg CreateStripeCheckout .", out, sizeof(out)));
     ASSERT_STR_EQ(out, "CreateStripeCheckout");
 
     /* rtk -l <N> consumes N and still finds the pattern */
-    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("rtk grep -l 80 CreateStripeCheckout .", out, sizeof(out)));
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing(
+        "rtk grep -l 80 CreateStripeCheckout .", out, sizeof(out)));
     ASSERT_STR_EQ(out, "CreateStripeCheckout");
 
     /* bail-out cases */
-    ASSERT_FALSE(cbm_hook_augment_parse_bash_pattern_for_testing("grep -f /path/patterns .", out, sizeof(out)));
-    ASSERT_FALSE(cbm_hook_augment_parse_bash_pattern_for_testing("grep -e FOO -e BAR .", out, sizeof(out)));
+    ASSERT_FALSE(cbm_hook_augment_parse_bash_pattern_for_testing("grep -f /path/patterns .", out,
+                                                                 sizeof(out)));
+    ASSERT_FALSE(
+        cbm_hook_augment_parse_bash_pattern_for_testing("grep -e FOO -e BAR .", out, sizeof(out)));
     ASSERT_FALSE(cbm_hook_augment_parse_bash_pattern_for_testing("ls -la", out, sizeof(out)));
     ASSERT_FALSE(cbm_hook_augment_parse_bash_pattern_for_testing("", out, sizeof(out)));
     ASSERT_FALSE(cbm_hook_augment_parse_bash_pattern_for_testing(NULL, out, sizeof(out)));
 
     /* -- end-of-flags separator */
-    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("grep -- CreateStripeCheckout .", out, sizeof(out)));
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("grep -- CreateStripeCheckout .",
+                                                                out, sizeof(out)));
     ASSERT_STR_EQ(out, "CreateStripeCheckout");
 
     PASS();

@@ -1022,7 +1022,7 @@ static bool ha_dialect_event_supported(ha_lifecycle_dialect_t dialect, const cha
  * other ambiguity.  Never executes or rewrites the command. */
 
 #define HA_BASH_TOK_MAX 32
-#define HA_BASH_TOK_SZ  256
+#define HA_BASH_TOK_SZ 256
 
 static int ha_tokenize(const char *cmd, char toks[][HA_BASH_TOK_SZ], int max) {
     int n = 0;
@@ -1223,8 +1223,7 @@ static bool ha_tool_event_supported(ha_lifecycle_dialect_t dialect, const char *
     }
     if (dialect == HA_DIALECT_EVENT) {
         if (strcmp(event, "PreToolUse") == 0 &&
-            (strcmp(tool, "Grep") == 0 || strcmp(tool, "Glob") == 0 ||
-             strcmp(tool, "Bash") == 0)) {
+            (strcmp(tool, "Grep") == 0 || strcmp(tool, "Glob") == 0 || strcmp(tool, "Bash") == 0)) {
             return true;
         }
         if (strcmp(event, "PostToolUse") == 0 && strcmp(tool, "Read") == 0) {
