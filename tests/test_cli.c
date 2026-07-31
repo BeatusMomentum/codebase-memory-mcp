@@ -8833,10 +8833,9 @@ TEST(cli_hook_augment_bash_pattern_extractor) {
         "env FOO=bar rg CreateStripeCheckout .", out, sizeof(out)));
     ASSERT_STR_EQ(out, "CreateStripeCheckout");
 
-    /* rtk -l <N> consumes N and still finds the pattern */
-    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing(
+    /* rtk -l <N> shadows grep's -l with a value-taking form — bail out */
+    ASSERT_FALSE(cbm_hook_augment_parse_bash_pattern_for_testing(
         "rtk grep -l 80 CreateStripeCheckout .", out, sizeof(out)));
-    ASSERT_STR_EQ(out, "CreateStripeCheckout");
 
     /* bail-out cases */
     ASSERT_FALSE(cbm_hook_augment_parse_bash_pattern_for_testing("grep -f /path/patterns .", out,

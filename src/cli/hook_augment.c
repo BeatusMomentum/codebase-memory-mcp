@@ -1086,7 +1086,7 @@ static const char *ha_search_bin_val_flags(ha_bin_t bin, bool rtk_grep) {
     case HA_BIN_AG:
         return "ABCmpG";
     default:
-        return rtk_grep ? "ABCmdDl" : "ABCmdD";
+        return "ABCmdD";
     }
 }
 
@@ -1195,6 +1195,8 @@ static bool ha_parse_bash_search_pattern(const char *cmd, char *out, size_t out_
                 }
                 e_count++;
             } else if (flag == 'f') {
+                return false;
+            } else if (rtk && bin == HA_BIN_GREP && flag == 'l') {
                 return false;
             } else if (strchr(val_flags, flag)) {
                 if (*f) {
