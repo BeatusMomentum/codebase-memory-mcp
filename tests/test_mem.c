@@ -490,7 +490,12 @@ TEST(resolve_budget_override_when_total_unknown) {
     PASS();
 }
 
-TEST(resolve_budget_worker_cap_preserves_lower_user_override) {
+/* A user who explicitly raises CBM_MEM_BUDGET_MB must not be silently reduced
+ * by the daemon's capacity slice. The parent-level slice still protects the
+ * default path, but the explicit override is the documented escape hatch for a
+ * single large index (#1654). Before the fix, a 64 MiB request was reported as
+ * daemon_worker_cap at 16 MiB instead of honoring the requested 64 MiB. */
+TEST(resolve_budget_worker_cap_honors_explicit_override) {
     size_t total = 8192 * CBM_TEST_MB;
     size_t worker_cap = 16 * CBM_TEST_MB;
     cbm_mem_budget_t lower = cbm_mem_resolve_budget_capped(total, 0.5, "8", worker_cap);
@@ -498,10 +503,10 @@ TEST(resolve_budget_worker_cap_preserves_lower_user_override) {
     ASSERT_STR_EQ(lower.source, "CBM_MEM_BUDGET_MB");
     ASSERT_FALSE(lower.hard_capped);
 
-    cbm_mem_budget_t capped = cbm_mem_resolve_budget_capped(total, 0.5, "64", worker_cap);
-    ASSERT_EQ(capped.budget, worker_cap);
-    ASSERT_STR_EQ(capped.source, "daemon_worker_cap");
-    ASSERT_TRUE(capped.hard_capped);
+    cbm_mem_budget_t raised = cbm_mem_resolve_budget_capped(total, 0.5, "64", worker_cap);
+    ASSERT_EQ(raised.budget, 64 * CBM_TEST_MB);
+    ASSERT_STR_EQ(raised.source, "CBM_MEM_BUDGET_MB");
+    ASSERT_FALSE(raised.hard_capped);
     PASS();
 }
 
@@ -1288,7 +1293,7 @@ SUITE(mem) {
     RUN_TEST(resolve_budget_override_wins);
     RUN_TEST(resolve_budget_override_clamped_to_total);
     RUN_TEST(resolve_budget_override_when_total_unknown);
-    RUN_TEST(resolve_budget_worker_cap_preserves_lower_user_override);
+    RUN_TEST(resolve_budget_worker_cap_honors_explicit_override);
     RUN_TEST(resolve_budget_invalid_override_falls_back);
     RUN_TEST(resolve_budget_override_overflow_clamps_to_total);
     RUN_TEST(resolve_budget_override_overflow_total_unknown_caps);

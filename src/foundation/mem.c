@@ -248,10 +248,19 @@ cbm_mem_budget_t cbm_mem_resolve_budget(size_t total_ram, double ram_fraction,
 cbm_mem_budget_t cbm_mem_resolve_budget_capped(size_t total_ram, double ram_fraction,
                                                const char *budget_mb, size_t hard_cap_bytes) {
     cbm_mem_budget_t result = cbm_mem_resolve_budget(total_ram, ram_fraction, budget_mb);
-    if (hard_cap_bytes > 0 && (result.budget == 0 || result.budget > hard_cap_bytes)) {
-        result.budget = hard_cap_bytes;
-        result.source = "daemon_worker_cap";
-        result.hard_capped = true;
+    /* CBM_MEM_BUDGET_MB is the user-facing emergency override for a single
+     * large index. Applying the daemon's equal-share cap after resolving it
+     * makes a requested raise indistinguishable from the default and leaves a
+     * worker stuck at a quarter of the host budget (#1654). The normal
+     * fraction-derived path remains capped, preserving aggregate admission for
+     * concurrent jobs; an explicit value remains clamped to detected RAM by
+     * cbm_mem_resolve_budget(). */
+    if (result.source == NULL || strcmp(result.source, "CBM_MEM_BUDGET_MB") != 0) {
+        if (hard_cap_bytes > 0 && (result.budget == 0 || result.budget > hard_cap_bytes)) {
+            result.budget = hard_cap_bytes;
+            result.source = "daemon_worker_cap";
+            result.hard_capped = true;
+        }
     }
     return result;
 }
