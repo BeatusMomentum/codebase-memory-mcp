@@ -1122,11 +1122,15 @@ TEST(client_adapter_pi_default_exports_its_factory_issue1550) {
 TEST(client_adapter_pi_emits_parameters_and_execute) {
     char *js = cbm_client_adapter_pi("/usr/local/bin/codebase-memory-mcp");
     ASSERT_NOT_NULL(js);
-    ASSERT_NOT_NULL(strstr(js, "execute: (args, ctx) => call("));
+    ASSERT_NOT_NULL(strstr(js, "execute: async (args, ctx) => {"));
+    ASSERT_NOT_NULL(strstr(js, "result.content"));
     ASSERT_NULL(strstr(js, "run: (args, ctx)"));
     ASSERT_NOT_NULL(strstr(js, "parameters:"));
     /* The registry input_schema is embedded as a JSON object literal. */
     ASSERT_NOT_NULL(strstr(js, "\"type\":\"object\""));
+    /* Raw JSON output is required so the bridge can parse the MCP result; the
+     * human-readable path would leave `call` with nothing to JSON.parse. */
+    ASSERT_NOT_NULL(strstr(js, "'cli', '--json'"));
     free(js);
     PASS();
 }

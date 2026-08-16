@@ -164,7 +164,7 @@ char *cbm_client_adapter_pi(const char *binary_path) {
     sb_append(
         &sb, "async function call(tool, args, signal) {\n"
              "  return new Promise((resolve) => {\n"
-             "    const child = spawn(BIN, ['cli', tool, JSON.stringify(args ?? {})], {\n"
+             "    const child = spawn(BIN, ['cli', '--json', tool, JSON.stringify(args ?? {})], {\n"
              "      stdio: ['ignore', 'pipe', 'pipe'],\n"
              "      env: { ...process.env, CBM_LOG_LEVEL: 'error' },\n"
              "    });\n"
@@ -218,9 +218,20 @@ char *cbm_client_adapter_pi(const char *binary_path) {
          * literal; embedding it directly keeps the generated module free of a
          * JSON.parse indirection and of any escaping drift. */
         sb_append(&sb, schema ? schema : "{}");
-        sb_append(&sb, ",\n    execute: (args, ctx) => call(");
+        sb_append(&sb, ",\n    execute: async (args, ctx) => {\n");
+        sb_append(&sb, "      const result = await call(");
         sb_append_js_string(&sb, name);
-        sb_append(&sb, ", args, ctx?.signal),\n  });\n");
+        sb_append(&sb,
+                  ", args, ctx?.signal);\n"
+                  "      if (result && typeof result === 'object' && result.error) {\n"
+                  "        throw new Error(String(result.error));\n"
+                  "      }\n"
+                  "      const content = result && Array.isArray(result.content)\n"
+                  "        ? result.content\n"
+                  "        : [{ type: 'text', text: JSON.stringify(result ?? null, null, 2) }];\n"
+                  "      return { content, details: result ?? {} };\n"
+                  "    },\n"
+                  "  });\n");
     }
     sb_append(&sb, "}\n");
 
