@@ -73,7 +73,7 @@ static void sb_append_js_string(adapter_sb_t *sb, const char *s) {
             sb_append(sb, "\\r");
             break;
         default: {
-            char ch[2] = { *p, '\0' };
+            char ch[2] = {*p, '\0'};
             sb_append(sb, ch);
             break;
         }
