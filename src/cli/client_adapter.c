@@ -49,6 +49,39 @@ static void sb_append(adapter_sb_t *sb, const char *s) {
     sb->buf[sb->len] = '\0';
 }
 
+/* Append a single-quoted JavaScript string literal, escaping the characters
+ * that could terminate or corrupt it. Avoids the fixed buffer sizing that
+ * cbm_client_adapter_escape_js imposes, so long registry descriptions fit. */
+static void sb_append_js_string(adapter_sb_t *sb, const char *s) {
+    if (!s) {
+        sb_append(sb, "''");
+        return;
+    }
+    sb_append(sb, "'");
+    for (const char *p = s; *p; p++) {
+        switch (*p) {
+        case '\\':
+            sb_append(sb, "\\\\");
+            break;
+        case '\'':
+            sb_append(sb, "\\'");
+            break;
+        case '\n':
+            sb_append(sb, "\\n");
+            break;
+        case '\r':
+            sb_append(sb, "\\r");
+            break;
+        default: {
+            char ch[2] = { *p, '\0' };
+            sb_append(sb, ch);
+            break;
+        }
+        }
+    }
+    sb_append(sb, "'");
+}
+
 bool cbm_client_adapter_escape_js(const char *in, char *out, size_t out_sz) {
     if (!in || !out || out_sz == 0) {
         return false;
@@ -170,11 +203,24 @@ char *cbm_client_adapter_pi(const char *binary_path) {
         if (!name || !name[0]) {
             continue;
         }
-        sb_append(&sb, "  pi.registerTool({ name: '");
-        sb_append(&sb, name);
-        sb_append(&sb, "', run: (args, ctx) => call('");
-        sb_append(&sb, name);
-        sb_append(&sb, "', args, ctx?.signal) });\n");
+        const char *title = cbm_mcp_tool_title(name);
+        const char *description = cbm_mcp_tool_description(name);
+        const char *schema = cbm_mcp_tool_input_schema(name);
+        sb_append(&sb, "  pi.registerTool({\n");
+        sb_append(&sb, "    name: ");
+        sb_append_js_string(&sb, name);
+        sb_append(&sb, ",\n    label: ");
+        sb_append_js_string(&sb, title ? title : name);
+        sb_append(&sb, ",\n    description: ");
+        sb_append_js_string(&sb, description ? description : "");
+        sb_append(&sb, ",\n    parameters: ");
+        /* input_schema is compact JSON, which is a valid JavaScript object
+         * literal; embedding it directly keeps the generated module free of a
+         * JSON.parse indirection and of any escaping drift. */
+        sb_append(&sb, schema ? schema : "{}");
+        sb_append(&sb, ",\n    execute: (args, ctx) => call(");
+        sb_append_js_string(&sb, name);
+        sb_append(&sb, ", args, ctx?.signal),\n  });\n");
     }
     sb_append(&sb, "}\n");
 

@@ -1114,6 +1114,23 @@ TEST(client_adapter_pi_default_exports_its_factory_issue1550) {
     PASS();
 }
 
+/* Pi's ToolDefinition requires `parameters` and `execute`. The adapter used to
+ * emit `{ name, run }`, which Pi accepted but treated as a tool with no
+ * parameter schema — strict providers (xAI/Grok) then reject the request with
+ * a 422 "missing field parameters", and the tool is uncallable because Pi
+ * invokes `execute`, never `run`. Pin the corrected shape. */
+TEST(client_adapter_pi_emits_parameters_and_execute) {
+    char *js = cbm_client_adapter_pi("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    ASSERT_NOT_NULL(strstr(js, "execute: (args, ctx) => call("));
+    ASSERT_NULL(strstr(js, "run: (args, ctx)"));
+    ASSERT_NOT_NULL(strstr(js, "parameters:"));
+    /* The registry input_schema is embedded as a JSON object literal. */
+    ASSERT_NOT_NULL(strstr(js, "\"type\":\"object\""));
+    free(js);
+    PASS();
+}
+
 /* #616 rejected `"` in its path template but not `\`, so a Windows home like
  * C:\Users\urs\bin produced `\u` — an invalid unicode escape — and the whole
  * auto-loaded plugin failed to parse. A broken plugin in an auto-load directory
@@ -1204,6 +1221,7 @@ SUITE(agent_clients) {
     RUN_TEST(agent_clients_continue_refuses_foreign_same_name_and_nonsequence_section);
     RUN_TEST(client_adapter_pi_registers_every_registry_tool);
     RUN_TEST(client_adapter_pi_default_exports_its_factory_issue1550);
+    RUN_TEST(client_adapter_pi_emits_parameters_and_execute);
     RUN_TEST(client_adapter_escapes_windows_paths_and_quotes);
     RUN_TEST(client_adapter_opencode_sends_the_required_hook_event);
     RUN_TEST(client_adapter_rejects_missing_binary_path);
