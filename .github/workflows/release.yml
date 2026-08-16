@@ -316,10 +316,23 @@ jobs:
       # install.sh and install.ps1 are the highest-consequence non-executable
       # bytes we publish: users pipe them straight into a shell.
       #
-      # The selected executables are re-submitted too. That is deliberate and
-      # nearly free: VirusTotal is content-addressed, so identical bytes return
-      # the analysis it already holds instead of re-running 70+ engines — the
-      # same property that made the analysis-id equality check untenable.
+      # The selected executables are NOT re-submitted. They were scanned as
+      # candidates, and verify-release-selection.py has just proven every
+      # published container carries exactly those bytes — identity is settled by
+      # hash, so a second scan adds no assurance.
+      #
+      # It also is not free, contrary to what this comment used to claim.
+      # Measured on v0.10.5: all eight re-submissions produced a NEW analysis
+      # (same file-id, timestamp 47 minutes later), and Microsoft's ML engine
+      # answered differently for two of them within that hour — in opposite
+      # directions. The release notes then cited one scan while the links showed
+      # the other. See scripts/ci/exclude-rescanned-selected-objects.sh.
+      - name: Withhold already-scanned selected executables
+        run: |
+          bash scripts/ci/exclude-rescanned-selected-objects.sh \
+            binaries/objects "$RUNNER_TEMP/release-selection.tsv" \
+            binaries/virustotal-withheld.tsv
+
       - name: VirusTotal scan of every extracted release object
         uses: crazy-max/ghaction-virustotal@936d8c5c00afe97d3d9a1af26d017cfdf26800a2 # v5.0.0
         id: virustotal
