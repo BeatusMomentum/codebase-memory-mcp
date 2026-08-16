@@ -15329,15 +15329,38 @@ TEST(registry_short_name_indexes) {
     cbm_registry_build_type_short_index(&reg);
 
     /* Qualified-name bare segment "Trait": types 0, 4, then the bare-QN type
-     * 5. C-LSP applies its stricter dotted-QN predicate on top of this index. */
+     * 5. The iterator is a hash prefilter, so apply the exact predicate before
+     * asserting its order just like production consumers do. */
     CBMTypeNameIter nit;
     cbm_registry_types_by_short_name(&reg, "Trait", &nit);
-    ASSERT_EQ(cbm_type_name_iter_next(&nit), 0);
-    ASSERT_EQ(cbm_type_name_iter_next(&nit), 4);
-    ASSERT_EQ(cbm_type_name_iter_next(&nit), 5);
-    ASSERT_EQ(cbm_type_name_iter_next(&nit), -1);
+    {
+        int expected[] = {0, 4, 5};
+        int exact_count = 0;
+        int candidate;
+        while ((candidate = cbm_type_name_iter_next(&nit)) >= 0) {
+            const char *qn = reg.types[candidate].qualified_name;
+            const char *last_dot = qn ? strrchr(qn, '.') : NULL;
+            const char *candidate_short = last_dot ? last_dot + 1 : qn;
+            if (!candidate_short || strcmp(candidate_short, "Trait") != 0)
+                continue;
+            ASSERT_TRUE(exact_count < 3);
+            ASSERT_EQ(candidate, expected[exact_count++]);
+        }
+        ASSERT_EQ(exact_count, 3);
+    }
     cbm_registry_types_by_short_name(&reg, "Missing", &nit);
-    ASSERT_EQ(cbm_type_name_iter_next(&nit), -1);
+    {
+        int exact_count = 0;
+        int candidate;
+        while ((candidate = cbm_type_name_iter_next(&nit)) >= 0) {
+            const char *qn = reg.types[candidate].qualified_name;
+            const char *last_dot = qn ? strrchr(qn, '.') : NULL;
+            const char *candidate_short = last_dot ? last_dot + 1 : qn;
+            if (candidate_short && strcmp(candidate_short, "Missing") == 0)
+                exact_count++;
+        }
+        ASSERT_EQ(exact_count, 0);
+    }
 
     for (int name_i = 0; name_i < 23; name_i++) {
         char short_name[32];
@@ -15437,6 +15460,35 @@ TEST(registry_short_name_indexes) {
     }
     ASSERT_EQ(fallback_count, 4);
     reg.type_short_buckets = saved_type_short_buckets;
+
+    /* A failed rebuild must discard the previous auxiliary index. Re-finalize
+     * after adding the tail type so the QN boundary advances, then force arena
+     * exhaustion for the optional rebuild. The iterator must fall back to the
+     * complete linear scan instead of retaining the stale pre-tail index. */
+    cbm_registry_finalize(&reg);
+    int saved_nblocks = arena.nblocks;
+    size_t saved_used = arena.used;
+    arena.nblocks = CBM_ARENA_MAX_BLOCKS;
+    arena.used = arena.block_size;
+    cbm_registry_build_type_short_index(&reg);
+    arena.nblocks = saved_nblocks;
+    arena.used = saved_used;
+    ASSERT_NULL(reg.type_short_buckets);
+    ASSERT_NULL(reg.type_short_entries);
+    ASSERT_EQ(reg.type_short_bucket_count, 0);
+
+    cbm_registry_types_by_short_name(&reg, "Trait", &nit);
+    fallback_count = 0;
+    while ((candidate = cbm_type_name_iter_next(&nit)) >= 0) {
+        const char *qn = reg.types[candidate].qualified_name;
+        const char *last_dot = qn ? strrchr(qn, '.') : NULL;
+        const char *candidate_short = last_dot ? last_dot + 1 : qn;
+        if (!candidate_short || strcmp(candidate_short, "Trait") != 0)
+            continue;
+        ASSERT_TRUE(fallback_count < 4);
+        ASSERT_EQ(candidate, fallback_expected[fallback_count++]);
+    }
+    ASSERT_EQ(fallback_count, 4);
 
     cbm_arena_destroy(&arena);
     PASS();

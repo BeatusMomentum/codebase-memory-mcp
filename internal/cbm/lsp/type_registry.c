@@ -171,7 +171,12 @@ static void build_type_embed_index(CBMTypeRegistry *reg, CBMArena *idx_arena) {
  * Descending iteration plus prepend preserves ascending registry scan order.
  * Consumers opt in after the QN index captures the finalized tail boundary. */
 void cbm_registry_build_type_short_index(CBMTypeRegistry *reg) {
-    if (!reg || !reg->arena || !reg->type_qn_buckets || reg->type_qn_bucket_count <= 0)
+    if (!reg)
+        return;
+    reg->type_short_buckets = NULL;
+    reg->type_short_entries = NULL;
+    reg->type_short_bucket_count = 0;
+    if (!reg->arena || !reg->type_qn_buckets || reg->type_qn_bucket_count <= 0)
         return;
     CBMArena *idx_arena = reg->arena;
     int count = 0;
