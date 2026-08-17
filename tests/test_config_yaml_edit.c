@@ -812,6 +812,107 @@ TEST(config_yaml_edit_goose_extensions_preserve_siblings) {
     PASS();
 }
 
+TEST(config_yaml_edit_goose_accepts_empty_flow_mapping_in_sibling_issue1673) {
+    const char *initial = "extensions:\n"
+                          "  demo:\n"
+                          "    enabled: true\n"
+                          "    type: stdio\n"
+                          "    cmd: /bin/true\n"
+                          "    args:\n"
+                          "    - --serve\n"
+                          "    envs: {}\n"
+                          "    env_keys: []\n"
+                          "    timeout: 300\n"
+                          "GOOSE_THINKING_EFFORT: max\n";
+    const char *block = "    type: stdio\n"
+                        "    cmd: \"/opt/codebase-memory-mcp\"\n"
+                        "    args: []\n"
+                        "    enabled: true\n";
+    const char *expected = "extensions:\n"
+                           "  demo:\n"
+                           "    enabled: true\n"
+                           "    type: stdio\n"
+                           "    cmd: /bin/true\n"
+                           "    args:\n"
+                           "    - --serve\n"
+                           "    envs: {}\n"
+                           "    env_keys: []\n"
+                           "    timeout: 300\n"
+                           "  codebase-memory-mcp:\n"
+                           "    type: stdio\n"
+                           "    cmd: \"/opt/codebase-memory-mcp\"\n"
+                           "    args: []\n"
+                           "    enabled: true\n"
+                           "GOOSE_THINKING_EFFORT: max\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
+
+    ASSERT_EQ(cbm_yaml_upsert_owned_mapping_entry(fixture.path, "extensions", "codebase-memory-mcp",
+                                                  block),
+              CBM_YAML_IDENTITY_EDIT_OK);
+    char *installed = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(installed);
+    ASSERT_STR_EQ(installed, expected);
+
+    free(installed);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
+TEST(config_yaml_edit_goose_still_rejects_nonempty_flow_mapping_issue1673) {
+    const char *initial = "extensions:\n"
+                          "  demo:\n"
+                          "    enabled: true\n"
+                          "    type: stdio\n"
+                          "    cmd: /bin/true\n"
+                          "    args: []\n"
+                          "    envs: {FOO: bar}\n"
+                          "    env_keys: []\n"
+                          "    timeout: 300\n";
+    const char *block = "    type: stdio\n"
+                        "    cmd: \"/opt/codebase-memory-mcp\"\n"
+                        "    args: []\n"
+                        "    enabled: true\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
+
+    ASSERT_EQ(cbm_yaml_upsert_owned_mapping_entry(fixture.path, "extensions", "codebase-memory-mcp",
+                                                  block),
+              CBM_YAML_IDENTITY_EDIT_ERROR);
+    char *unchanged = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(unchanged);
+    ASSERT_STR_EQ(unchanged, initial);
+
+    free(unchanged);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
+TEST(config_yaml_edit_goose_still_rejects_merge_key_with_empty_mapping_issue1673) {
+    const char *initial = "extensions:\n"
+                          "  demo:\n"
+                          "    type: stdio\n"
+                          "    cmd: /bin/true\n"
+                          "    <<: {}\n";
+    const char *block = "    type: stdio\n"
+                        "    cmd: \"/opt/codebase-memory-mcp\"\n"
+                        "    args: []\n"
+                        "    enabled: true\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
+
+    ASSERT_EQ(cbm_yaml_upsert_owned_mapping_entry(fixture.path, "extensions", "codebase-memory-mcp",
+                                                  block),
+              CBM_YAML_IDENTITY_EDIT_ERROR);
+    char *unchanged = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(unchanged);
+    ASSERT_STR_EQ(unchanged, initial);
+
+    free(unchanged);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
 TEST(config_yaml_edit_owned_agent_mapping_installs_idempotently_and_removes_exact_state) {
     struct owned_mapping_case {
         const char *section;
@@ -1592,6 +1693,9 @@ SUITE(config_yaml_edit) {
     RUN_TEST(config_yaml_edit_hermes_mapping_lifecycle);
     RUN_TEST(config_yaml_edit_hermes_creates_missing_section);
     RUN_TEST(config_yaml_edit_goose_extensions_preserve_siblings);
+    RUN_TEST(config_yaml_edit_goose_accepts_empty_flow_mapping_in_sibling_issue1673);
+    RUN_TEST(config_yaml_edit_goose_still_rejects_nonempty_flow_mapping_issue1673);
+    RUN_TEST(config_yaml_edit_goose_still_rejects_merge_key_with_empty_mapping_issue1673);
     RUN_TEST(config_yaml_edit_owned_agent_mapping_installs_idempotently_and_removes_exact_state);
     RUN_TEST(config_yaml_edit_owned_agent_mapping_preserves_foreign_same_name_state);
     RUN_TEST(config_yaml_edit_mapping_remove_first_middle_last);

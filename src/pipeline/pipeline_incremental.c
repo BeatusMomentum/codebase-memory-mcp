@@ -1334,6 +1334,8 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                     cross_registries.c = cbm_c_build_cross_registry(xa, all_defs, all_def_count);
                     cross_registries.cs = cbm_cs_build_cross_registry(xa, all_defs, all_def_count);
                     cross_registries.ts = cbm_ts_build_cross_registry(xa, all_defs, all_def_count);
+                    cross_registries.java =
+                        cbm_java_build_cross_registry(xa, all_defs, all_def_count);
                     registries_arg = &cross_registries;
                 }
             } else {

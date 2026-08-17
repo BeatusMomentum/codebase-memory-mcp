@@ -1266,8 +1266,8 @@ static int yaml_find_comment(const char *data, size_t start, size_t end, size_t 
  * The test is positional and deliberately conservative: an indicator is only
  * honoured as one when nothing has appeared before it in the value. `key: *a`
  * is still an alias and still refused; `key: 2 * 3` and `key: a*b` are text.
- * `{`/`}` keep their existing treatment — empty flow mappings are a separate
- * change with its own semantics. */
+ * `{`/`}` keep their existing treatment here; mapping-body validation admits
+ * exact empty flow mappings through a context-specific exception. */
 static int yaml_range_has_unsupported(const char *data, size_t start, size_t end) {
     char quote = '\0';
     /* Last significant character seen, so an indicator can be judged by what
@@ -1387,6 +1387,19 @@ static int yaml_tail_is_explicit_empty_mapping(const char *data, size_t colon, s
     return 0;
 }
 
+static int yaml_mapping_body_line_has_unsupported(const yaml_doc_t *doc, const yaml_line_t *line) {
+    size_t start = line->start + line->indent;
+    size_t colon = 0U;
+    bool empty_mapping = false;
+    if (yaml_find_mapping_colon(doc->data, start, line->text_end, &colon) == 0 &&
+        yaml_tail_is_explicit_empty_mapping(doc->data, colon, line->text_end, &empty_mapping) ==
+            0 &&
+        empty_mapping) {
+        return yaml_range_has_unsupported(doc->data, start, colon + YAML_UNIT);
+    }
+    return yaml_range_has_unsupported(doc->data, start, line->text_end);
+}
+
 static int yaml_value_starts_multiline(const char *data, size_t colon, size_t end) {
     size_t pos = yaml_skip_spaces(data, colon + YAML_UNIT, end);
     return pos < end && (data[pos] == '|' || data[pos] == '>');
@@ -1404,7 +1417,7 @@ static int yaml_validate_mapping_body(const yaml_doc_t *doc, size_t first_line, 
             continue;
         }
         if (line->indent < YAML_ENTRY_INDENT || (line->indent & YAML_UNIT) != 0U ||
-            yaml_range_has_unsupported(doc->data, line->start + line->indent, line->text_end)) {
+            yaml_mapping_body_line_has_unsupported(doc, line)) {
             return YAML_ERROR;
         }
         size_t colon = 0U;

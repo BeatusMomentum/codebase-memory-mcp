@@ -680,6 +680,7 @@ extern void suite_str_util(void);
 extern void suite_workspace(void);
 extern void suite_platform(void);
 extern void suite_diagnostics(void);
+extern void suite_complexity(void);
 extern void suite_subprocess(void);
 extern void suite_private_file_lock(void);
 extern void suite_lock_registry(void);
@@ -926,6 +927,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(workspace);
     RUN_SELECTED_SUITE(platform);
     RUN_SELECTED_SUITE(diagnostics);
+    RUN_SELECTED_SUITE(complexity);
     RUN_SELECTED_SUITE(subprocess);
     RUN_SELECTED_SUITE(private_file_lock);
     RUN_SELECTED_SUITE(lock_registry);
