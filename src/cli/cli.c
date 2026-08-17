@@ -1672,16 +1672,45 @@ static size_t cbm_json_mcp_ownership_fields(cbm_json_mcp_schema_t schema, const 
  * populated from config content. */
 static CBM_TLS const char *g_previous_managed_mcp_command = NULL;
 
+/* Path-shape-insensitive equality for OUR OWN binary path (#1582): clients
+ * and installers spell the same Windows file with different separators (the
+ * entry stores `C:\...\cbm.exe`, the installer compares `C:/.../cbm.exe`),
+ * and Windows filesystems are case-insensitive. Separators always compare
+ * equal; case only folds on Windows. POSIX byte-exactness otherwise holds. */
+static bool cbm_json_mcp_paths_equal(const char *a, const char *b) {
+    while (*a && *b) {
+        char ca = *a;
+        char cb = *b;
+        if (ca == '\\') {
+            ca = '/';
+        }
+        if (cb == '\\') {
+            cb = '/';
+        }
+#ifdef _WIN32
+        ca = (char)tolower((unsigned char)ca);
+        cb = (char)tolower((unsigned char)cb);
+#endif
+        if (ca != cb) {
+            return false;
+        }
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
 static bool cbm_json_mcp_owned_command(const char *command, const char *expected_binary,
                                        const char *previous_managed_binary) {
     if (!command || command[0] == '\0') {
         return false;
     }
-    if (expected_binary && expected_binary[0] && strcmp(command, expected_binary) == 0) {
+    if (expected_binary && expected_binary[0] &&
+        cbm_json_mcp_paths_equal(command, expected_binary)) {
         return true;
     }
     if (previous_managed_binary && previous_managed_binary[0] &&
-        strcmp(command, previous_managed_binary) == 0) {
+        cbm_json_mcp_paths_equal(command, previous_managed_binary)) {
         return true;
     }
     return strcmp(command, "codebase-memory-mcp") == 0 ||
@@ -1694,7 +1723,12 @@ static bool cbm_json_mcp_owned_command(const char *command, const char *expected
  * missing. Upsert repairs it; remove leaves it alone like any other non-owned
  * entry. POSIX never probes config-supplied paths: only the running executable
  * identity above can authorize a moved-install refresh. */
-enum { CBM_JSON_MCP_OWNERSHIP_STALE = 100 };
+enum {
+    CBM_JSON_MCP_OWNERSHIP_STALE = 100,
+    /* Repairable like STALE, but the entry carries client-added keys: only a
+     * FIELD-level repair may touch it — full replacement would drop them. */
+    CBM_JSON_MCP_OWNERSHIP_EXTRAS_STALE = 101,
+};
 
 #ifdef _WIN32
 typedef enum {
@@ -1973,7 +2007,8 @@ static int cbm_json_mcp_snapshot_ownership(const char *document, size_t document
                                            const char *const *object_path, size_t path_len,
                                            cbm_json_mcp_schema_t schema, const char *entry_name,
                                            const char *argument, const char *expected_binary,
-                                           const char *previous_managed_binary) {
+                                           const char *previous_managed_binary,
+                                           char **command_out) {
     cbm_json_like_object_field_t fields[3];
     size_t field_count = cbm_json_mcp_ownership_fields(schema, argument, fields);
     char *command = NULL;
@@ -1983,15 +2018,45 @@ static int cbm_json_mcp_snapshot_ownership(const char *document, size_t document
          result == CBM_JSON_LIKE_OBJECT_MATCH_WITH_EXTRAS) &&
         !cbm_json_mcp_owned_command(command, expected_binary, previous_managed_binary)) {
 #ifdef _WIN32
-        result = cbm_json_mcp_command_availability(command) == CBM_JSON_MCP_COMMAND_MISSING
-                     ? CBM_JSON_MCP_OWNERSHIP_STALE
-                     : CBM_JSON_LIKE_OBJECT_MISMATCH;
+        bool had_extras = result == CBM_JSON_LIKE_OBJECT_MATCH_WITH_EXTRAS;
+        result =
+            cbm_json_mcp_command_availability(command) == CBM_JSON_MCP_COMMAND_MISSING
+                ? (had_extras ? CBM_JSON_MCP_OWNERSHIP_EXTRAS_STALE : CBM_JSON_MCP_OWNERSHIP_STALE)
+                : CBM_JSON_LIKE_OBJECT_MISMATCH;
 #else
         result = CBM_JSON_LIKE_OBJECT_MISMATCH;
 #endif
     }
-    free(command);
+    if (command_out) {
+        *command_out = command;
+    } else {
+        free(command);
+    }
     return result;
+}
+
+/* Render just the `command` member's VALUE for a schema — the raw JSON the
+ * field-level repair splices in place of a moved install's stale path. */
+static char *cbm_json_mcp_render_command_value(const char *binary_path,
+                                               cbm_json_mcp_schema_t schema) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return NULL;
+    }
+    yyjson_mut_val *command = cbm_json_mcp_command_is_array(schema)
+                                  ? yyjson_mut_arr(doc)
+                                  : yyjson_mut_strcpy(doc, binary_path);
+    bool ok = command != NULL;
+    if (ok && cbm_json_mcp_command_is_array(schema)) {
+        ok = yyjson_mut_arr_add_strcpy(doc, command, binary_path);
+    }
+    char *json = NULL;
+    if (ok) {
+        yyjson_mut_doc_set_root(doc, command);
+        json = yyjson_mut_write(doc, YYJSON_WRITE_NOFLAG, NULL);
+    }
+    yyjson_mut_doc_free(doc);
+    return json;
 }
 
 static int cbm_upsert_json_named_mcp(const char *binary_path, const char *config_path,
@@ -2008,9 +2073,10 @@ static int cbm_upsert_json_named_mcp(const char *binary_path, const char *config
         return CLI_ERR;
     }
     if (read_result == 0) {
+        char *command = NULL;
         int ownership = cbm_json_mcp_snapshot_ownership(
             document, document_length, object_path, path_len, schema, entry_name, argument,
-            binary_path, g_previous_managed_mcp_command);
+            binary_path, g_previous_managed_mcp_command, &command);
         /* An entry that already says what we would say, but carries extra keys
          * the client added, is ALREADY SATISFIED. Return success without
          * touching the file.
@@ -2028,11 +2094,55 @@ static int cbm_upsert_json_named_mcp(const char *binary_path, const char *config
          * while preserving the rest is the fuller fix and is tracked there;
          * this makes the common case work without risking anyone's config. */
         if (ownership == CBM_JSON_LIKE_OBJECT_MATCH_WITH_EXTRAS) {
+            /* Owned via the PREVIOUS managed binary during a relocating
+             * update: the annotated entry still names the old location, and a
+             * wholesale rewrite would drop the client's keys — repair only the
+             * command member (#1630's deferred field-merge). An entry already
+             * naming the current binary needs nothing. */
+            bool via_previous = command && g_previous_managed_mcp_command &&
+                                strcmp(command, g_previous_managed_mcp_command) == 0 &&
+                                strcmp(command, binary_path) != 0;
+            if (!via_previous) {
+                free(command);
+                free(document);
+                return CLI_OK;
+            }
+            char *value = cbm_json_mcp_render_command_value(binary_path, schema);
+            if (!value) {
+                free(command);
+                free(document);
+                return CLI_ERR;
+            }
+            int repair = cbm_json_like_replace_field_raw_if_unchanged(
+                config_path, object_path, path_len, entry_name, "command", value, document,
+                document_length);
+            free(value);
+            free(command);
             free(document);
-            return CLI_OK;
+            return repair == 0 ? CLI_OK : CLI_ERR;
         }
-        /* STALE (our exact shape, dead binary path) is repairable — that is
-         * the update contract. Only a genuinely foreign shape refuses. */
+        /* Windows only: our shape, annotated, and the named binary
+         * conclusively missing from the local fixed drives — repair ONLY the
+         * command member so the client's keys survive (#1630 field-merge). */
+        if (ownership == CBM_JSON_MCP_OWNERSHIP_EXTRAS_STALE) {
+            char *value = cbm_json_mcp_render_command_value(binary_path, schema);
+            if (!value) {
+                free(command);
+                free(document);
+                return CLI_ERR;
+            }
+            int repair = cbm_json_like_replace_field_raw_if_unchanged(
+                config_path, object_path, path_len, entry_name, "command", value, document,
+                document_length);
+            free(value);
+            free(command);
+            free(document);
+            return repair == 0 ? CLI_OK : CLI_ERR;
+        }
+        /* STALE (our exact shape, dead binary path on Windows) is repairable
+         * — that is the update contract. Only a genuinely foreign shape
+         * refuses. */
+        free(command);
         if (ownership != CBM_JSON_LIKE_OBJECT_MATCH && ownership != CBM_JSON_LIKE_OBJECT_MISSING &&
             ownership != CBM_JSON_MCP_OWNERSHIP_STALE) {
             free(document);
@@ -2080,7 +2190,7 @@ static int cbm_remove_json_named_mcp(const char *config_path, const char *const 
     }
     int ownership =
         cbm_json_mcp_snapshot_ownership(document, document_length, object_path, path_len, schema,
-                                        entry_name, argument, expected_binary, NULL);
+                                        entry_name, argument, expected_binary, NULL, NULL);
     if (ownership == CBM_JSON_LIKE_OBJECT_MISSING || ownership == CBM_JSON_LIKE_OBJECT_MISMATCH ||
         ownership == CBM_JSON_MCP_OWNERSHIP_STALE) {
         free(document);
@@ -3342,14 +3452,21 @@ int cbm_upsert_codex_mcp(const char *binary_path, const char *config_path) {
      * handshake closes during initialization, so Codex exposes no cbm tools at
      * all.
      *
-     * The name is listed unconditionally rather than only when the variable is
+     * The names are listed unconditionally rather than only when a variable is
      * set at install time: env_vars names variables to FORWARD IF PRESENT, so
-     * listing it costs nothing when unset and keeps working for someone who
-     * sets it after installing — which install-time detection would silently
-     * fail to cover. */
+     * listing them costs nothing when unset and keeps working for someone who
+     * sets one after installing — which install-time detection would silently
+     * fail to cover.
+     *
+     * CBM_RUNTIME_DIR joined the list with #1664: since #1645 it relocates
+     * the daemon rendezvous, so a Codex subprocess that does not receive it
+     * looks for the daemon in the DEFAULT location and never finds it — the
+     * same silent client/daemon split CBM_CACHE_DIR caused. Both names decide
+     * WHICH daemon a process talks to; behavioural knobs stay unforwarded. */
     int written = snprintf(block, sizeof(block),
                            CODEX_CMM_SECTION "\ncommand = \"%s\"\nargs = []\n"
-                                             "env_vars = [\"CBM_CACHE_DIR\"]\n",
+                                             "env_vars = [\"CBM_CACHE_DIR\", "
+                                             "\"CBM_RUNTIME_DIR\"]\n",
                            escaped);
     if (written < 0 || (size_t)written >= sizeof(block) ||
         cbm_remove_codex_legacy_mcp(config_path) != 0) {
@@ -3716,7 +3833,11 @@ static int cbm_build_yaml_stdio_mcp_block(const char *binary_path, bool goose_sc
         free(encoded);
         return CLI_ERR;
     }
+    /* goose's ExtensionConfig::Stdio requires `name` (serde, no default) and
+     * its loader silently drops entries that fail to deserialize (#1675) — an
+     * entry without it installs cleanly and is then invisible in goose. */
     int written = goose_schema ? snprintf(block, block_size,
+                                          "    name: codebase-memory-mcp\n"
                                           "    type: stdio\n"
                                           "    cmd: %s\n"
                                           "    args: []\n"
@@ -3726,6 +3847,19 @@ static int cbm_build_yaml_stdio_mcp_block(const char *binary_path, bool goose_sc
     free(encoded);
     return written > 0 && (size_t)written < block_size ? CLI_OK : CLI_ERR;
 }
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+/* Test seam for the agent-config block writers: the exact bytes written into a
+ * coding agent's config file are a compatibility contract with THAT agent's
+ * parser (goose deserializes with serde and silently drops entries that fail —
+ * #1675), so tests must be able to assert the block verbatim. */
+int cbm_cli_build_yaml_stdio_mcp_block_for_test(const char *binary_path, bool goose_schema,
+                                                char *block, size_t block_size) {
+    return cbm_build_yaml_stdio_mcp_block(binary_path, goose_schema, block, block_size) == CLI_OK
+               ? 0
+               : -1;
+}
+#endif
 
 static int cbm_upsert_yaml_stdio_mcp(const char *binary_path, const char *config_path,
                                      const char *section_key, bool goose_schema) {
@@ -3809,7 +3943,7 @@ static int cbm_junie_mcp_preflight(const char *binary_path, const char *config_p
     for (size_t i = 0U; i < sizeof(entries) / sizeof(entries[0]); i++) {
         int ownership = cbm_json_mcp_snapshot_ownership(
             document, document_length, path, 1U, CBM_JSON_MCP_STANDARD, entries[i].name,
-            entries[i].argument, binary_path, g_previous_managed_mcp_command);
+            entries[i].argument, binary_path, g_previous_managed_mcp_command, NULL);
         if (ownership != CBM_JSON_LIKE_OBJECT_MATCH && ownership != CBM_JSON_LIKE_OBJECT_MISSING &&
             ownership != CBM_JSON_MCP_OWNERSHIP_STALE) {
             result = CLI_ERR;
