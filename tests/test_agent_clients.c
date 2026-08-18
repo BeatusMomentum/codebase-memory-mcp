@@ -1122,7 +1122,11 @@ TEST(client_adapter_pi_default_exports_its_factory_issue1550) {
 TEST(client_adapter_pi_emits_parameters_and_execute) {
     char *js = cbm_client_adapter_pi("/usr/local/bin/codebase-memory-mcp");
     ASSERT_NOT_NULL(js);
-    ASSERT_NOT_NULL(strstr(js, "execute: async (args, ctx) => {"));
+    ASSERT_NOT_NULL(strstr(js, "execute: async (toolCallId, params, signal, _onUpdate, ctx) => {"));
+    ASSERT_NOT_NULL(strstr(js, ", params, signal ?? ctx?.signal)"));
+    ASSERT_NULL(strstr(js, "execute: async (args, ctx) => {"));
+    ASSERT_NULL(strstr(js, ", args, ctx?.signal)"));
+    ASSERT_NOT_NULL(strstr(js, "@earendil-works/pi-coding-agent"));
     ASSERT_NOT_NULL(strstr(js, "result.content"));
     ASSERT_NULL(strstr(js, "run: (args, ctx)"));
     ASSERT_NOT_NULL(strstr(js, "parameters:"));

@@ -153,6 +153,10 @@ char *cbm_client_adapter_pi(const char *binary_path) {
 
     adapter_sb_t sb = {0};
     emit_header(&sb, "pi");
+    /* Pin the coding-agent contract so a probe against @mariozechner/pi
+     * (pods CLI) or an old AgentTool arity cannot be mistaken for this file. */
+    sb_append(&sb, "// Target: @earendil-works/pi-coding-agent >= 0.74.0 (verified 0.84.2)\n"
+                   "// ToolDefinition.execute(toolCallId, params, signal, onUpdate, ctx)\n");
     sb_append(&sb, "import { spawn } from 'node:child_process';\n\n");
     sb_append(&sb, "const BIN = '");
     sb_append(&sb, bin);
@@ -218,11 +222,13 @@ char *cbm_client_adapter_pi(const char *binary_path) {
          * literal; embedding it directly keeps the generated module free of a
          * JSON.parse indirection and of any escaping drift. */
         sb_append(&sb, schema ? schema : "{}");
-        sb_append(&sb, ",\n    execute: async (args, ctx) => {\n");
+        /* 0.84.2 calls execute(toolCallId, params, signal, onUpdate, ctx).
+         * The previous (args, ctx) shape bound the call id as the MCP args. */
+        sb_append(&sb, ",\n    execute: async (toolCallId, params, signal, _onUpdate, ctx) => {\n");
         sb_append(&sb, "      const result = await call(");
         sb_append_js_string(&sb, name);
         sb_append(&sb,
-                  ", args, ctx?.signal);\n"
+                  ", params, signal ?? ctx?.signal);\n"
                   "      if (result && typeof result === 'object' && result.error) {\n"
                   "        throw new Error(String(result.error));\n"
                   "      }\n"
