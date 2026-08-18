@@ -83,7 +83,7 @@ windows_archive_names = (binary, "LICENSE", "install.ps1", "THIRD_PARTY_NOTICES.
 # defined and cannot fork per venue.
 package_release = read("scripts/package-release.sh")
 zip_call = re.search(
-    r"zip -q \"\$OUT_DIR/\$NAME\.zip\" \\\n(?P<members>(?:.|\n)*?)\n", package_release
+    r'zip -q -X "\$ARCHIVE_TMP" \\\n\s+(?P<members>[^\n]+)', package_release
 )
 require(zip_call is not None, "package-release.sh must build the Windows zip in one zip call")
 zip_members = zip_call.group("members").split() if zip_call else []
@@ -91,6 +91,13 @@ require(
     zip_members == list(windows_archive_names),
     "package-release.sh must archive EXACTLY "
     f"{' '.join(windows_archive_names)} (found: {' '.join(zip_members) or 'nothing'})",
+)
+require(
+    "--selected-binary" in package_release
+    and "--expected-sha256" in package_release
+    and 'assert_expected_hash "$VERIFY_DIR/archive/$STAGED_BINARY_NAME"' in package_release,
+    "package-release.sh must bind the selected input and archived executable to the same "
+    "caller-supplied SHA-256",
 )
 
 # ── 2. No shipped surface may name the payload or build a launcher ───────────
@@ -139,23 +146,37 @@ require(
     "Makefile.cbm must not expose a Windows launcher target or variable",
 )
 
-# Each archive variant is still produced through the ONE canonical packaging
-# entry, so the four-file layout above governs all of them.
+# Every archive is produced through the ONE canonical packaging entry, so the
+# four-file layout above governs all of them. Selection may choose stripped or
+# unstripped only inside the immutable Windows architecture tuple; it must hand
+# final bytes to the packager by hash, never revive a payload composition.
 build_workflow = read(".github/workflows/_build.yml")
-for archive, call, ui in (
-    ("codebase-memory-mcp-windows-amd64.zip", "scripts/package-release.sh windows amd64", False),
-    ("codebase-memory-mcp-ui-windows-amd64.zip",
-     "scripts/package-release.sh windows amd64 --variant ui", True),
-    ("codebase-memory-mcp-windows-arm64.zip", "scripts/package-release.sh windows arm64", False),
-    ("codebase-memory-mcp-ui-windows-arm64.zip",
-     "scripts/package-release.sh windows arm64 --variant ui", True),
-):
-    # The lookahead keeps a ui call from satisfying a standard check.
-    pattern = re.escape(call) + ("" if ui else r"(?!\s+--variant)")
+require(
+    "scripts/package-release.sh" in build_workflow
+    and "--selected-binary" in build_workflow
+    and "--expected-sha256" in build_workflow,
+    "_build.yml must hand hash-bound selected bytes to the canonical packager",
+)
+for target in ("windows-amd64", "windows-arm64"):
     require(
-        re.search(pattern, build_workflow) is not None,
-        f"_build.yml must produce {archive} via the canonical packaging entry ('{call}')",
+        target in build_workflow,
+        f"_build.yml must retain the {target} release product",
     )
+
+artifact_smoke = read("scripts/ci/smoke-artifact.sh")
+require(
+    "scripts/ci/prepare-release-candidates.sh" in artifact_smoke
+    and '${GOOS}-${GOARCH}/stripped/$SELECTED_NAME' in artifact_smoke
+    and "--selected-binary" in artifact_smoke
+    and "--expected-sha256" in artifact_smoke,
+    "local artifact smoke must derive both candidates, default-select stripped within its "
+    "target tuple, and package the selected bytes by SHA-256",
+)
+require(
+    'codesign --sign' not in artifact_smoke,
+    "local artifact smoke must not sign after candidate derivation; packaging starts from "
+    "already-final bytes",
+)
 
 # ── 3. install.ps1 retires the running binary before publishing ──────────────
 # This is THE step that replaces the launcher. Windows keeps an image lock on a
@@ -221,7 +242,7 @@ single_binary_contracts = {
     ),
     "pkg/pypi/src/codebase_memory_mcp/_cli.py": (
         r"_WINDOWS_BINARY_NAME\s*=\s*['\"]codebase-memory-mcp\.exe['\"]",
-        r"def\s+_windows_binary_ready\(",
+        r"def\s+_runtime_set_ready\(",
     ),
 }
 for relative, patterns in single_binary_contracts.items():
@@ -394,7 +415,7 @@ require(
         needle in read("src/daemon/ipc.c")
         for needle in (
             "win_directory_component_secure",
-            "win_file_security_secure(security, directory, false, mutation)",
+            "win_file_security_secure(security, directory, false, mutation, true)",
             "win_private_mutation_rights()",
             "~((DWORD)FILE_ADD_SUBDIRECTORY)",
             "FILE_ADD_FILE",
@@ -406,6 +427,30 @@ require(
         )
     ),
     "src/daemon/ipc.c must enforce the shared cross-account ancestor trust policy",
+)
+
+# ── 6b. AppContainer tolerance is ANCESTOR-ONLY ─────────────────────────────
+# Package (S-1-15-2-*) and capability (S-1-15-3-*) SIDs are admitted on ancestor
+# components so a machine running a sandboxed desktop app (Claude Desktop stamps
+# its package SID on %LOCALAPPDATA%) is not locked out. The private runtime
+# directory must keep demanding the exact current user: it is passed
+# ancestor=false and that is the whole boundary.
+require(
+    all(
+        needle in read("src/daemon/ipc.c")
+        for needle in (
+            "win_sid_is_app_container",
+            "ancestor && win_sid_is_app_container",
+            # both AppContainer forms, not capability alone
+            "first == 2U || first == 3U",
+            # APP_PACKAGE identifier authority
+            "sid[7] != 15U",
+            # the private runtime directory is validated with ancestor=false
+            "win_private_mutation_rights(), false)",
+        )
+    ),
+    "AppContainer SIDs must be tolerated on ancestors ONLY, covering both package "
+    "and capability forms, with the private runtime directory still strict",
 )
 
 # On Windows subprocess supervision receives a non-NULL lpApplicationName, so a
@@ -537,8 +582,14 @@ require(
 )
 require(
     sync_case is not None
-    and 'remote_head="$(vm clangarm64 "cd /c/cbm && git rev-parse --verify HEAD")"'
-    in sync_case.group("body")
+    # Assert the PROPERTY, not one spelling of it: capture the remote HEAD into
+    # a local variable and compare it here. The checkout path became a variable
+    # (per-run isolation), so pinning the literal `/c/cbm` was asserting the
+    # implementation rather than the contract it exists to protect.
+    and re.search(
+        r'remote_head="\$\(vm clangarm64 "cd \S+ && git rev-parse --verify HEAD"\)"',
+        sync_case.group("body"),
+    )
     and 'test \\"\\$(git rev-parse --verify HEAD)\\"' not in sync_case.group("body"),
     "win.sh sync must compare the remote HEAD locally instead of nesting shell quotes through "
     "cmd.exe",
@@ -743,8 +794,19 @@ update_windows_block = (
 require(
     update_start >= 0
     and "install.ps1" in update_windows_block
-    and "powershell -ExecutionPolicy Bypass -File" in update_windows_block,
+    and "powershell -File" in update_windows_block,
     "cbm_cmd_update must print the install.ps1 command on Windows",
+)
+# The printed command must NOT carry an execution-policy override. That is a
+# canonical malicious-loader pattern, and emitting it as a string literal put
+# the signature inside every Windows artifact we ship — to save the user one
+# documented step. The hand-off above is the property this contract cares
+# about; the bypass flag was only ever the literal form it happened to take.
+# Unblock-File covers the common case and the README covers the rest.
+require(
+    "ExecutionPolicy" not in update_windows_block,
+    "cbm_cmd_update must not print an execution-policy override "
+    "(document it instead of shipping the pattern in the binary)",
 )
 require(
     "cbm_windows_launcher" not in cli_source

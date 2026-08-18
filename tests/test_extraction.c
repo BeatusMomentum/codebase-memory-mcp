@@ -431,6 +431,55 @@ TEST(java_interface) {
     PASS();
 }
 
+/* Regression for #1234: Java interface/enum methods were emitted as both a
+ * Method node (correct, via extract_class_methods) and a duplicate Function
+ * node (incorrect, via walk_defs). Prevention in push_class_body_children
+ * (gated to Java) recognizes interface_body and enum_body as class body
+ * containers, stopping the fallback path from re-walking method_declaration
+ * children as top-level functions. */
+TEST(java_interface_no_duplicate_function_issue1234) {
+    CBMFileResult *r =
+        extract("public interface MarketplaceService {\n"
+                "    ReservationDTO createReservation(Authentication auth, RequestDTO req);\n"
+                "    void cancelReservation(long id);\n"
+                "}\n",
+                CBM_LANG_JAVA, "t", "MarketplaceService.java");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT(has_def(r, "Interface", "MarketplaceService"));
+    ASSERT(has_def(r, "Method", "createReservation"));
+    ASSERT(has_def(r, "Method", "cancelReservation"));
+    ASSERT_EQ(count_defs_with_label(r, "Function"), 0);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(java_enum_dedup_preserves_calls_issue1234) {
+    CBMFileResult *r =
+        extract("package app;\n\nenum Day {\n"
+                "    MON, TUE, WED, THU, FRI, SAT, SUN;\n\n"
+                "    public boolean isWeekend() { return this == SAT || this == SUN; }\n"
+                "    public String label() { return name().toLowerCase(); }\n}\n\n"
+                "class DayUtil {\n"
+                "    static String describe(Day d) {\n"
+                "        return d.label() + (d.isWeekend() ? \"(rest)\" : \"(work)\");\n    }\n}\n",
+                CBM_LANG_JAVA, "t", "Day.java");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT(has_def(r, "Enum", "Day"));
+    ASSERT(has_def(r, "Method", "isWeekend"));
+    ASSERT(has_def(r, "Method", "label"));
+    ASSERT(has_def(r, "Class", "DayUtil"));
+    ASSERT(has_def(r, "Method", "describe"));
+    ASSERT_EQ(count_defs_with_label(r, "Function"), 0);
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Regression for #279: a Java class declaring both `extends` and
  * `implements` must produce one INHERITS edge per base — the extends parent
  * AND every implements interface — with bare type names (not the keyword
@@ -3181,6 +3230,57 @@ TEST(extract_ts_template_string_url_issue1006) {
     PASS();
 }
 
+/* Issue #1249: a mux route built as `configVar + "/literal"` (Go's idiomatic
+ * configurable-base-path pattern) must index the literal suffix, both for a
+ * route registration and for an outbound URL built the same way. A real BFF
+ * with 47 such registrations produced only 9 Route nodes before this fix. */
+TEST(extract_go_binary_concat_url_issue1249) {
+    CBMFileResult *r = extract("package main\n"
+                               "import \"net/http\"\n"
+                               "func setup(mux *http.ServeMux, base string) {\n"
+                               "    mux.HandleFunc(base+\"/login\", loginHandler)\n"
+                               "}\n"
+                               "func report(host string, port string) {\n"
+                               "    http.Get(\"http://\" + host + \":\" + port + \"/log\")\n"
+                               "}\n",
+                               CBM_LANG_GO, "t", "routes.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMCall *reg = find_call_by_callee(r, "mux.HandleFunc");
+    ASSERT_NOT_NULL(reg);
+    ASSERT_NOT_NULL(reg->first_string_arg);
+    ASSERT_STR_EQ(reg->first_string_arg, "/login");
+
+    const CBMCall *out = find_call_by_callee(r, "http.Get");
+    ASSERT_NOT_NULL(out);
+    ASSERT_NOT_NULL(out->first_string_arg);
+    ASSERT_STR_EQ(out->first_string_arg, "/log");
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Same issue: when the right side of the concatenation is not itself a
+ * literal (`base + suffixVar`), there is no literal route to recover. The
+ * fix must leave this unresolved rather than fabricate a path. */
+TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249) {
+    CBMFileResult *r = extract("package main\n"
+                               "func setup(mux *http.ServeMux, base string, suffix string) {\n"
+                               "    mux.HandleFunc(base+suffix, dynHandler)\n"
+                               "}\n",
+                               CBM_LANG_GO, "t", "routes.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMCall *reg = find_call_by_callee(r, "mux.HandleFunc");
+    ASSERT_NOT_NULL(reg);
+    ASSERT_NULL(reg->first_string_arg);
+
+    cbm_free_result(r);
+    PASS();
+}
+
 
 /* Reproduce-first: Java module QN must derive from the CONTAINING DIRECTORY, not
  * the filename stem, so a top-level class `Outer` in `Outer.java` is `t.Outer`,
@@ -4093,6 +4193,111 @@ TEST(extract_rust_test_attr_marks_is_test_issue855) {
     PASS();
 }
 
+/* Function.is_test must follow the file's test-directory membership, not just
+ * a test_/_test basename convention: a helper under tests/ with none of those
+ * naming conventions (tests/helpers/fixtures.c) was previously indexed as an
+ * ordinary, non-test Function — invisible to store.c's `is_test != 1`
+ * dead-code/search filters even though trace_path's own independent path
+ * check already treated the same file as a test (#1294). */
+TEST(extract_c_test_dir_marks_is_test_issue1294) {
+    const char *src = "void helper(void) {}\n";
+
+    /* Regression: a test_*-named file directly under tests/ must remain a
+     * test (this already worked before the fix). */
+    CBMFileResult *r1 = extract(src, CBM_LANG_C, "t", "tests/test_pipeline.c");
+    ASSERT_NOT_NULL(r1);
+    ASSERT_FALSE(r1->has_error);
+    ASSERT(has_def(r1, "Function", "helper"));
+    int reg = -1;
+    for (int i = 0; i < r1->defs.count; i++) {
+        if (strcmp(r1->defs.items[i].label, "Function") == 0 && r1->defs.items[i].name &&
+            strcmp(r1->defs.items[i].name, "helper") == 0) {
+            reg = r1->defs.items[i].is_test ? 1 : 0;
+        }
+    }
+    ASSERT(reg == 1 && "test_*.c directly under tests/ is a test (regression)");
+    cbm_free_result(r1);
+
+    /* Positive: a file under tests/ that matches none of the test_/_test
+     * naming conventions must now ALSO be a test. */
+    CBMFileResult *r2 = extract(src, CBM_LANG_C, "t", "tests/helpers/fixtures.c");
+    ASSERT_NOT_NULL(r2);
+    ASSERT_FALSE(r2->has_error);
+    ASSERT(has_def(r2, "Function", "helper"));
+    int nonconv = -1;
+    for (int i = 0; i < r2->defs.count; i++) {
+        if (strcmp(r2->defs.items[i].label, "Function") == 0 && r2->defs.items[i].name &&
+            strcmp(r2->defs.items[i].name, "helper") == 0) {
+            nonconv = r2->defs.items[i].is_test ? 1 : 0;
+        }
+    }
+    ASSERT(nonconv == 1 && "non-test_-named file under tests/ is now a test");
+    cbm_free_result(r2);
+
+    /* Negative: a file with no test/ directory or test_/_test naming in its
+     * path must never be flagged — this fix must not widen detection beyond
+     * the tests/ (and sibling) directory tree. */
+    CBMFileResult *r3 = extract(src, CBM_LANG_C, "t", "src/pipeline/helper.c");
+    ASSERT_NOT_NULL(r3);
+    ASSERT_FALSE(r3->has_error);
+    ASSERT(has_def(r3, "Function", "helper"));
+    int outside = -1;
+    for (int i = 0; i < r3->defs.count; i++) {
+        if (strcmp(r3->defs.items[i].label, "Function") == 0 && r3->defs.items[i].name &&
+            strcmp(r3->defs.items[i].name, "helper") == 0) {
+            outside = r3->defs.items[i].is_test ? 1 : 0;
+        }
+    }
+    ASSERT(outside == 0 && "file outside tests/ is never a test");
+    cbm_free_result(r3);
+
+    PASS();
+}
+
+/* Same convergence for Method definitions (push_method_def), which take a
+ * separate code path from free functions: a class method on a class defined
+ * under tests/ with no test_/_test naming (e.g. tests/helpers/base.py) must
+ * be marked is_test too, and a method on the same class outside tests/ must
+ * not be (#1294). */
+TEST(extract_python_method_test_dir_marks_is_test_issue1294) {
+    const char *src = "class Foo:\n"
+                       "    def helper(self):\n"
+                       "        pass\n";
+
+    /* Python's LSP layer injects synthetic builtin stub Methods (str.upper,
+     * dict.get, ...) into defs.items alongside real ones (py_builtins.c), so
+     * matching must key on name, not just label="Method". */
+    CBMFileResult *r1 = extract(src, CBM_LANG_PYTHON, "t", "tests/helpers/base.py");
+    ASSERT_NOT_NULL(r1);
+    ASSERT_FALSE(r1->has_error);
+    ASSERT(has_def(r1, "Method", "helper"));
+    int in_tests = -1;
+    for (int i = 0; i < r1->defs.count; i++) {
+        if (strcmp(r1->defs.items[i].label, "Method") == 0 && r1->defs.items[i].name &&
+            strcmp(r1->defs.items[i].name, "helper") == 0) {
+            in_tests = r1->defs.items[i].is_test ? 1 : 0;
+        }
+    }
+    ASSERT(in_tests == 1 && "method on a class under tests/helpers/ is a test");
+    cbm_free_result(r1);
+
+    CBMFileResult *r2 = extract(src, CBM_LANG_PYTHON, "t", "app/models/base.py");
+    ASSERT_NOT_NULL(r2);
+    ASSERT_FALSE(r2->has_error);
+    ASSERT(has_def(r2, "Method", "helper"));
+    int outside_tests = -1;
+    for (int i = 0; i < r2->defs.count; i++) {
+        if (strcmp(r2->defs.items[i].label, "Method") == 0 && r2->defs.items[i].name &&
+            strcmp(r2->defs.items[i].name, "helper") == 0) {
+            outside_tests = r2->defs.items[i].is_test ? 1 : 0;
+        }
+    }
+    ASSERT(outside_tests == 0 && "method on a class outside tests/ is never a test");
+    cbm_free_result(r2);
+
+    PASS();
+}
+
 /* #1017: docstring truncation at MAX_COMMENT_LEN (500 bytes) can split a
  * multi-byte UTF-8 character, leaving an incomplete byte sequence.
  * Craft a Go comment whose 498th-500th bytes are a 3-byte CJK character
@@ -4292,6 +4497,87 @@ TEST(extract_wide_flat_file_is_linear) {
     }
     PASS();
 }
+
+#if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
+/* A flat block of value-reference statements exercises occurrence-role
+ * classification for every identifier. The old parent/child field lookup
+ * restarts at the block's first child for each statement, so 8x more source
+ * produces about 64x more lookup work. Count work instead of wall time: this
+ * RED is deterministic, sanitizer-independent, and finishes quickly even on
+ * the known-quadratic implementation. */
+static uint64_t extract_wide_reference_field_work(int statement_count, int *out_usages,
+                                                  uint64_t *out_slow_parent_fallbacks) {
+    static const char prefix[] = "function target() {}\nfunction wide() {\n";
+    static const char statement[] = "  target;\n";
+    static const char suffix[] = "}\n";
+    size_t capacity = sizeof(prefix) + (size_t)statement_count * sizeof(statement) + sizeof(suffix);
+    char *source = malloc(capacity);
+    if (!source) {
+        return UINT64_MAX;
+    }
+    size_t offset = 0;
+    memcpy(source + offset, prefix, sizeof(prefix) - 1U);
+    offset += sizeof(prefix) - 1U;
+    for (int i = 0; i < statement_count; i++) {
+        memcpy(source + offset, statement, sizeof(statement) - 1U);
+        offset += sizeof(statement) - 1U;
+    }
+    memcpy(source + offset, suffix, sizeof(suffix));
+    offset += sizeof(suffix) - 1U;
+
+    cbm_usage_field_lookup_test_reset();
+    CBMFileResult *result = cbm_extract_file(source, (int)offset, CBM_LANG_JAVASCRIPT, "proj",
+                                             "wide-references.js", 0, NULL, NULL);
+    free(source);
+    if (!result) {
+        return UINT64_MAX;
+    }
+    int usages = 0;
+    for (int i = 0; i < result->usages.count; i++) {
+        if (result->usages.items[i].ref_name &&
+            strcmp(result->usages.items[i].ref_name, "target") == 0) {
+            usages++;
+        }
+    }
+    uint64_t work = cbm_usage_field_lookup_test_work();
+    *out_slow_parent_fallbacks = cbm_usage_slow_parent_fallback_test_count();
+    cbm_free_result(result);
+    *out_usages = usages;
+    return work;
+}
+
+TEST(extract_wide_flat_reference_fields_are_linear) {
+    enum { SMALL = 128, BIG = 1024, INPUT_GROWTH = 8, WORK_RATIO_MAX = 12 };
+    int small_usages = 0;
+    int big_usages = 0;
+    uint64_t small_slow_parent_fallbacks = 0;
+    uint64_t big_slow_parent_fallbacks = 0;
+    uint64_t small_work =
+        extract_wide_reference_field_work(SMALL, &small_usages, &small_slow_parent_fallbacks);
+    uint64_t big_work =
+        extract_wide_reference_field_work(BIG, &big_usages, &big_slow_parent_fallbacks);
+    ASSERT_TRUE(small_work != UINT64_MAX);
+    ASSERT_TRUE(big_work != UINT64_MAX);
+    ASSERT_EQ(small_usages, SMALL);
+    ASSERT_EQ(big_usages, BIG);
+    ASSERT_EQ(small_slow_parent_fallbacks, 0);
+    ASSERT_EQ(big_slow_parent_fallbacks, 0);
+    ASSERT_GTE(small_work, (uint64_t)SMALL);
+    fprintf(stderr, "  [wide-reference-fields] work(%d)=%llu work(%d)=%llu input_growth=%dx\n",
+            SMALL, (unsigned long long)small_work, BIG, (unsigned long long)big_work, INPUT_GROWTH);
+    uint64_t maximum = small_work * WORK_RATIO_MAX + 256U;
+    if (big_work > maximum) {
+        char message[192];
+        snprintf(message, sizeof(message),
+                 "wide-reference field lookup grew from %llu to %llu for %dx input "
+                 "(maximum %dx + 256) -- quadratic sibling scan",
+                 (unsigned long long)small_work, (unsigned long long)big_work, INPUT_GROWTH,
+                 WORK_RATIO_MAX);
+        FAIL(message);
+    }
+    PASS();
+}
+#endif
 
 /* ===================================================================
  * Group H3: ObjectScript return type extraction
@@ -5034,6 +5320,9 @@ SUITE(extraction) {
 
     /* Wide-flat-file linearity (ms-typescript hang) */
     RUN_TEST(extract_wide_flat_file_is_linear);
+#if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
+    RUN_TEST(extract_wide_flat_reference_fields_are_linear);
+#endif
 
     /* Perl call-graph noise (#459 follow-up) */
     RUN_TEST(extract_perl_config_string_not_a_callee);
@@ -5099,6 +5388,8 @@ SUITE(extraction) {
     RUN_TEST(java_class);
     RUN_TEST(java_method);
     RUN_TEST(java_interface);
+    RUN_TEST(java_interface_no_duplicate_function_issue1234);
+    RUN_TEST(java_enum_dedup_preserves_calls_issue1234);
     RUN_TEST(java_class_extends_and_implements);
     RUN_TEST(python_class_base_extracted_bare);
     RUN_TEST(php_class);
@@ -5315,6 +5606,8 @@ SUITE(extraction) {
     RUN_TEST(extract_java_method_annotations_issue382);
     RUN_TEST(extract_java_jaxrs_path_composition_issue1005);
     RUN_TEST(extract_ts_template_string_url_issue1006);
+    RUN_TEST(extract_go_binary_concat_url_issue1249);
+    RUN_TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249);
     RUN_TEST(extract_java_no_double_class_qn);
     RUN_TEST(extract_go_no_filename_in_module_qn);
     RUN_TEST(extract_large_ts_has_functions_issue213);
@@ -5340,6 +5633,8 @@ SUITE(extraction) {
     RUN_TEST(extract_c_clean_file_no_recovery_duplicates_issue961);
     RUN_TEST(walk_defs_no_truncation_over_4096_issue668);
     RUN_TEST(extract_rust_test_attr_marks_is_test_issue855);
+    RUN_TEST(extract_c_test_dir_marks_is_test_issue1294);
+    RUN_TEST(extract_python_method_test_dir_marks_is_test_issue1294);
     RUN_TEST(docstring_utf8_truncation_boundary_issue1017);
     RUN_TEST(extract_ts_decorators_survive_interleaved_comment);
 

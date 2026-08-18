@@ -34,6 +34,14 @@ const char *cbm_cli_get_version(void);
  * must free. Caller frees the returned JSON string. */
 char *cbm_cli_build_args_json(const char *tool_name, int argc, char **argv, char **err_out);
 
+/* Decide whether `cli <tool>` may take its JSON arguments from stdin, given
+ * that no --args-file, raw-JSON positional and no --flag form was supplied.
+ * stdin_is_tty is the caller's isatty(0) result. True only for a non-terminal
+ * stdin AND a tool whose input_schema declares at least one property; a
+ * zero-argument tool such as list_projects must never read stdin, because an
+ * inherited-but-never-closed pipe makes that read block forever (#1359). */
+bool cbm_cli_args_from_stdin_allowed(const char *tool_name, bool stdin_is_tty);
+
 /* Print per-tool help (usage + the tool's flags with type/description/required)
  * derived from its input_schema, to stdout. Returns 0 if the tool is known,
  * non-zero (and prints nothing) if it is not. */
@@ -193,6 +201,25 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir);
 
 /* Install or refresh every detected agent integration below home. */
 int cbm_install_agent_configs(const char *home, const char *binary_path, bool force, bool dry_run);
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+/* #1558: client-selector vocabulary, exposed so a test can prove every token
+ * resolves and an unknown one is rejected. */
+bool cbm_cli_clients_apply_selection_for_testing(const char *spec, cbm_detected_agents_t *detected);
+size_t cbm_cli_clients_count_for_testing(void);
+const char *cbm_cli_clients_token_for_testing(size_t index);
+#endif
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+/* #1566: name the package manager that owns a binary path, or NULL when it is
+ * not recognisably foreign. Detection must be positive evidence — see the
+ * implementation comment. */
+const char *cbm_cli_external_manager_name_for_testing(const char *self_path);
+/* #1558: expose the config-key table so a test can prove a key is discoverable
+ * (`config list`/`set` both walk it). */
+size_t cbm_cli_config_key_count_for_testing(void);
+const char *cbm_cli_config_key_at_for_testing(size_t index);
+#endif
 
 #ifdef CBM_CLI_ENABLE_TEST_API
 int cbm_build_qwen_hook_command_for_testing(const char *binary_path, bool windows, char *command,
@@ -395,6 +422,10 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key);
 #define CBM_CONFIG_AUTO_INDEX_LIMIT "auto_index_limit"
 #define CBM_CONFIG_AUTO_WATCH "auto_watch"
 #define CBM_CONFIG_UI_LANG "ui-lang"
+/* #1558: the graph UI's loopback listener. Stored in the UI config file rather
+ * than the key-value store, but surfaced through `config` so it is findable. */
+#define CBM_CONFIG_UI_ENABLED "ui_enabled"
+#define CBM_CONFIG_UI_PORT "ui_port"
 
 /* ── Binary activation safety ─────────────────────────────────── */
 
@@ -451,6 +482,12 @@ int cbm_cmd_uninstall(int argc, char **argv);
 
 /* update: check latest release, prompt for index deletion, prompt for ui/standard,
  * download and replace binary. */
+/* True when the installer script (install.sh / install.ps1 on Windows) is
+ * present beside the binary. `update` prints a command built from this;
+ * naming a path that does not exist ends the interaction on a failing
+ * command (#1632). Exposed for testing. */
+bool cbm_cli_installer_beside_binary(const char *dir);
+
 int cbm_cmd_update(int argc, char **argv);
 
 /* config: get/set/list/reset runtime config values. */
@@ -476,6 +513,20 @@ char *cbm_hook_augment_lifecycle_json_for(const char *input, const char *forced_
  * hard fail-open deadline without constructing a local MCP/store instance. */
 void cbm_hook_augment_arm_deadline(void);
 char *cbm_hook_augment_read_stdin(void);
+
+/* Why a hook client is not augmenting. The hook caller only ever sees stdout,
+ * so each reason that is actionable by the user must have a stdout notice
+ * (#1388: a build-conflicted daemon used to report on stderr alone, which is
+ * invisible in-session and reads as silent skips). */
+typedef enum {
+    CBM_HOOK_ADMISSION_DAEMON_ABSENT = 0, /* no daemon running: `daemon start` heals it */
+    CBM_HOOK_ADMISSION_BUILD_CONFLICT     /* daemon runs another build: needs `daemon stop` */
+} cbm_hook_admission_t;
+
+/* The JSON systemMessage a hook client must print on stdout for `reason`, or
+ * NULL when nothing should be printed. hook_dialect NULL = Claude Code, the
+ * only dialect that surfaces a stdout systemMessage to the user. */
+const char *cbm_hook_admission_notice(cbm_hook_admission_t reason, const char *hook_dialect);
 
 /* Process one already-read hook payload using a caller-owned MCP session.
  * Returns a malloc-owned hook output JSON string, or NULL for fail-open/no

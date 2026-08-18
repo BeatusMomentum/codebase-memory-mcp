@@ -1,14 +1,15 @@
 """GREEN native-Windows guard for the `update` -> install.ps1 handoff.
 
-Windows ships ONE binary, exactly like Linux and macOS: ``codebase-memory-mcp.exe``.
+Windows ships one executable in its runtime set, exactly like Linux and macOS:
+``codebase-memory-mcp.exe``.
 
 There used to be a second, permanently resident launcher stub whose only job
 was to swap the product binary out from under itself, because a running .exe
-cannot replace its own image on Windows.  Defender's ML scored that stub
-Trojan:Win32/Wacatac.B!ml on x64 no matter what the build changed (bcrypt-free,
-stripped, versioned and resource-free variants were all flagged), while the
-product binary itself scans clean everywhere.  So the swap moved OUT of the
-process into install.ps1, which runs while CBM is NOT running.
+cannot replace its own image on Windows. Historical variants of that stub
+received Microsoft Wacatac verdicts. Those observations did not expose a
+stable feature or prove causation, but the stub remained unnecessary loader-
+like behavior and a second artifact to audit. The swap therefore moved OUT of
+the process into install.ps1, which runs while CBM is NOT running.
 
 This guard asserts the replacement contract on real native Windows:
 
@@ -20,8 +21,8 @@ This guard asserts the replacement contract on real native Windows:
   hole.
 * ``update`` does not disturb an already-open MCP/daemon session.
 
-A regression here means the in-process self-update — and therefore the
-AV-flagged launcher stub — came back.
+A regression here means the in-process self-update and removed launcher stub
+came back.
 
 Exit code: 0 == contract honored, 1 == regression, 2 == precondition failure.
 
@@ -115,9 +116,9 @@ def assert_update_hands_off_to_install_script(source, env, work):
     # of the just-written image inflates process load time, and the handoff
     # itself is a fast STATELESS local print (no daemon IPC, no download) whose
     # timing is what this guard measures. The warm-up behaves identically.
-    run([binary, "update", "--yes", "--standard"], command_env, timeout=20)
+    run([binary, "update", "--yes"], command_env, timeout=20)
     started = time.monotonic()
-    result = run([binary, "update", "--yes", "--standard"], command_env, timeout=20)
+    result = run([binary, "update", "--yes"], command_env, timeout=20)
     elapsed = time.monotonic() - started
     diagnostic = output_text(result)
     lowered = diagnostic.lower()
@@ -164,7 +165,7 @@ def assert_update_does_not_drain_active_session(source, env, cache, work):
         command = copy_binary(source, work / "update-session-command")
         command_env = dict(env)
         command_env["CBM_DOWNLOAD_URL"] = "https://127.0.0.1:1"
-        result = run([command, "update", "--yes", "--standard"], command_env, timeout=20)
+        result = run([command, "update", "--yes"], command_env, timeout=20)
         require(
             result.returncode == 0,
             "update exited %s beside a live session: %s"

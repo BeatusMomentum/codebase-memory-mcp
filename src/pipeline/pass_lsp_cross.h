@@ -35,6 +35,7 @@
 #include "lsp/c_lsp.h"    /* cbm_c_build_cross_registry / cbm_run_c_lsp_cross_with_registry */
 #include "lsp/cs_lsp.h"   /* cbm_cs_build_cross_registry / cbm_run_cs_lsp_cross_with_registry */
 #include "lsp/ts_lsp.h"   /* cbm_ts_build_cross_registry / cbm_run_ts_lsp_cross_with_registry */
+#include "lsp/java_lsp.h" /* cbm_java_build_cross_registry / cbm_run_java_lsp_cross_with_registry */
 #include "lsp/rust_lsp.h" /* cbm_rust_build_cross_registry / cbm_run_rust_lsp_cross_with_registry */
 #include "pipeline/pipeline_internal.h"
 #include <stdbool.h>
@@ -49,14 +50,29 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang);
  * def_modules[i] — caller must keep both alive while the array is in
  * use. Returns the malloc'd array (free() it) and writes the entry
  * count to *out_count. Returns NULL on alloc failure or when no defs
- * exist. */
+ * exist. out_def_starts (optional, file_count + 1 entries, caller-owned)
+ * receives per-file prefix offsets: file i's defs occupy
+ * [out_def_starts[i], out_def_starts[i+1]) — the LSP-surface serializer
+ * needs the per-file slices, which the flat array does not otherwise
+ * record. */
 CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t *files,
                                     int file_count, const char *project_name, char **def_modules,
-                                    int *out_count);
+                                    int *out_count, int *out_def_starts);
 
 /* Detect TS dialect flags from a relative path. */
 void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool *out_jsx,
                       bool *out_dts);
+
+/* Build the local-name -> semantic import-QN map consumed by cross-file LSPs.
+ * Both sequential and parallel drivers use this exact helper so import
+ * metadata cannot diverge between pipelines. Values are owned by the returned
+ * map (not borrowed from gbuf); release both arrays with
+ * cbm_pxc_free_import_map(). */
+int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, const char *rel_path,
+                             CBMLanguage lang, const CBMFileResult *result, const char ***out_keys,
+                             const char ***out_vals, int *out_count);
+
+void cbm_pxc_free_import_map(const char **keys, const char **vals, int count);
 
 /* ── Per-module def index (the gopls "package summary" pattern) ──
  *
@@ -87,11 +103,13 @@ void cbm_pxc_free_module_def_index(CBMModuleDefIndex *idx);
  * `src/main/kotlin` roots without import statements. String fields inside
  * each entry are borrowed from the original all_defs[] arena (caller keeps
  * it alive). Caller frees the returned array with free(). Writes the entry
- * count to *out_count. Returns NULL if no matches (with *out_count = 0). */
+ * count to *out_count and sets *out_success on every valid selection. A valid
+ * empty selection returns NULL with *out_count = 0 and *out_success = true;
+ * NULL with *out_success = false means invalid input or allocation failure. */
 CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef *all_defs,
                                         CBMLanguage caller_lang, const char *caller_namespace,
                                         const char *own_module, const char *const *imp_qns,
-                                        int imp_count, int *out_count);
+                                        int imp_count, int *out_count, bool *out_success);
 
 /* ── Tier 2 full: pre-built per-language cross-LSP registries ─────
  *
@@ -108,12 +126,21 @@ typedef struct {
     CBMTypeRegistry *ts;     /* CBM_LANG_JAVASCRIPT, TYPESCRIPT, TSX */
     CBMTypeRegistry *php;    /* CBM_LANG_PHP */
     CBMTypeRegistry *cs;     /* CBM_LANG_CSHARP */
+    CBMTypeRegistry *java;   /* CBM_LANG_JAVA (JVM def universe incl. Kotlin defs) */
     /* CBM_LANG_RUST: intentionally absent — the shared rust registry is built
      * LAZILY inside cbm_parallel_resolve (first NULL-filter rust file), not eagerly. */
 } CBMCrossLspRegistries;
 
 /* Return the appropriate pre-built registry for a language, or NULL
  * if none was built (or language has no cross-LSP entrypoint). */
+/* Per-file registry-build cost (#1669): how many defs the per-file cross-LSP
+ * path actually registered, and how often the module filter failed. */
+/* Count defs an overlay registered for one file (complexity-gate telemetry). */
+void cbm_pxc_count_perfile_defs(uint64_t defs);
+
+void cbm_pxc_filter_stats(uint64_t *defs_registered, uint64_t *build_files, uint64_t *filter_files,
+                          uint64_t *filter_failed);
+
 static inline CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegistries *r,
                                                          CBMLanguage lang) {
     if (!r)
@@ -135,6 +162,8 @@ static inline CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegist
         return r->php;
     case CBM_LANG_CSHARP:
         return r->cs;
+    case CBM_LANG_JAVA:
+        return r->java;
     default:
         return NULL; /* incl. CBM_LANG_RUST — its shared registry is built lazily */
     }

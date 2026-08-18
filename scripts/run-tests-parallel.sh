@@ -58,7 +58,33 @@ stamp_windows_build_dir() {
     esac
     local runner_dir_w me norm_out stamp_out reset_out
     runner_dir_w="$(cygpath -w "$(dirname "$RUNNER")")"
-    me="$(whoami | tr -d '\r')"
+    # Qualify the account with its domain. Git Bash resolves `whoami` to
+    # coreutils, which prints a bare name, and icacls resolves a bare name
+    # against the machine first: on a host whose name equals the user's
+    # (COMPUTERNAME=BUILD, user build) the grant lands on an empty principal
+    # (BUILD\) and, combined with /inheritance:r above, locks this script out
+    # of its own log directory.
+    # Identify the account by SID, never by name. icacls resolves a bare name
+    # against the machine first, so a host whose name equals the user's grants
+    # to an empty principal (#1532); and a USERDOMAIN-qualified name is
+    # UNRESOLVABLE on a workgroup machine — "WORKGROUP\test: No mapping between
+    # account names and security IDs was done" — which fails the grant outright
+    # and silently leaves the tree writable by Authenticated Users. A SID has
+    # neither ambiguity, and the SYSTEM/Administrators grants below already use
+    # this form. Name lookup remains only as a fallback where PowerShell is
+    # unavailable.
+    me="$(powershell.exe -NoProfile -NonInteractive -Command \
+        '[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value' 2>/dev/null |
+        tr -d '\r\n')"
+    case "${me}" in
+    S-1-*) me="*${me}" ;;
+    *)
+        me="$(whoami | tr -d '\r')"
+        if [ -n "${USERDOMAIN:-}" ]; then
+            me="${USERDOMAIN}\\${me}"
+        fi
+        ;;
+    esac
     # Normalize FIRST: some runner images stamp EXPLICIT (non-inherited)
     # Authenticated-Users ACEs onto the workspace tree, which /inheritance:r
     # cannot strip and /grant:r does not touch (it replaces only the granted
@@ -168,7 +194,19 @@ shard_filter() {
 # deadlines into deterministic failures while an idle machine passes 6/6.
 # They also all rendezvous through the shared per-account runtime namespace,
 # which the quiet tail keeps free of cross-suite admission traffic.
+# extraction carries the wide-flat SCALING-RATIO guard, which grows the input
+# 20x and asserts the time grows ~20x (linear) rather than ~128x (quadratic),
+# with a bound of 40x between them. Contention does not cancel out of that
+# ratio: the 400k-node measurement loses far more to memory pressure and
+# scheduling than the 20k one, so oversubscription inflates the ratio itself.
+# Measured on the Windows arm64 VM: 18.5x alone (passes) vs 53.8x and 55x in
+# the 18-job wave (fails) — reproducible, 3 of 3. The bound is deliberately NOT
+# widened; see the calibration note in tests/test_extraction.c, which records
+# that 40 sits >=2x from both the linear and quadratic signals, so inflating it
+# would move the test toward the very thing it exists to catch. Quiet is the
+# fix, and at ~22s the suite is cheap to run alone.
 SERIAL_SUITES="cli subprocess watcher incremental httpd ui index_resilience mcp \
+    extraction \
     stack_overflow_a stack_overflow_b stack_overflow_c \
     index_supervisor daemon_application daemon_runtime daemon_frontend \
     daemon_bootstrap daemon_ipc"
@@ -245,8 +283,13 @@ run_wave "$PAR_FILE" "$JOBS"
 # time on an idle machine. The EXCL group (daemon-family plus the suites
 # that drive daemon one-shots or supervisor rendezvous) then runs strictly
 # sequentially on a machine exactly as quiet as the old tail gave it.
+# extraction is in this group for a DIFFERENT reason than the rest: it does not
+# rendezvous through the daemon namespace, it measures a scaling ratio, and even
+# the FLEX group's small fixed overlap is load the measurement would absorb.
+# Strictly sequential is what makes its verdict a function of the code instead
+# of the scheduler.
 TAIL_EXCL="cli mcp index_supervisor daemon_application daemon_runtime \
-    daemon_frontend daemon_bootstrap daemon_ipc"
+    daemon_frontend daemon_bootstrap daemon_ipc extraction"
 is_tail_excl() {
     case " $TAIL_EXCL " in *" $1 "*) return 0 ;; *) return 1 ;; esac
 }

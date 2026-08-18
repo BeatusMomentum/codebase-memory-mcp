@@ -11,6 +11,7 @@
 #include "foundation/macos_acl.h"
 #include "foundation/private_file_lock_internal.h"
 #include "foundation/sha256.h"
+#include "foundation/secure_random.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -40,6 +41,13 @@ static void ipc_validation_detail_set(const char *format, ...) {
                     arguments);
     va_end(arguments);
 }
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_daemon_ipc_set_validation_detail_for_testing(const char *detail) {
+    (void)snprintf(ipc_validation_detail_buffer, sizeof(ipc_validation_detail_buffer), "%s",
+                   detail ? detail : "");
+}
+#endif
 
 const char *cbm_daemon_ipc_validation_detail(void) {
     return ipc_validation_detail_buffer;
@@ -1336,12 +1344,18 @@ static bool private_log_base_name_valid(const char *base_name) {
 }
 
 static char *private_log_directory_path_copy(const char *directory_path) {
-#ifdef __APPLE__
-    /* Darwin exposes the trusted top-level aliases /tmp -> /private/tmp and
-     * /var -> /private/var.  Resolve only those root-owned aliases before the
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    /* Resolve only those root-owned aliases before the
      * component-wise O_NOFOLLOW walk.  Canonicalizing the complete caller path
      * would follow an attacker-controlled cache/log symlink and is forbidden. */
+#if defined(__APPLE__)
+    /* Darwin exposes the trusted top-level aliases /tmp -> /private/tmp and
+     * /var -> /private/var. */
     static const char *const aliases[] = {"/tmp", "/var"};
+#else
+    /* FreeBSD additionally exposes /home -> /usr/home as a root-owned alias. */
+    static const char *const aliases[] = {"/tmp", "/var", "/home"};
+#endif
     for (size_t index = 0; index < sizeof(aliases) / sizeof(aliases[0]); index++) {
         const char *alias = aliases[index];
         size_t alias_length = strlen(alias);
@@ -1382,8 +1396,26 @@ static bool posix_directory_parent_secure(int directory_fd) {
         !cbm_macos_extended_acl_fd_is_deny_only(directory_fd)) {
         return false;
     }
-    return (status.st_mode & 0022) == 0 ||
-           (status.st_uid == (uid_t)0 && (status.st_mode & S_ISVTX) != 0);
+    /* #1537: this ANCESTOR check refused any group-write bit, which is the same
+     * rule #1535 removed on the activation side — and the sibling that decision
+     * covers but that never got changed. A group-writable ~ or ~/.cache is
+     * ordinary (WSL2 ships 0775, so do several distro skeletons and any site
+     * with a shared primary group), and refusing it here made the daemon
+     * unusable with no way for the reader to see why.
+     *
+     * WORLD-writable is still refused: any local user could swap a path
+     * component. Group-writable is admitted for ancestors only — the private
+     * directory itself is chmod'd to 0700 and verified after this walk, so the
+     * thing that actually holds data stays owner-private either way. */
+    if ((status.st_mode & 0002) != 0) {
+        return status.st_uid == (uid_t)0 && (status.st_mode & S_ISVTX) != 0;
+    }
+    if ((status.st_mode & 0020) != 0) {
+        char mode_text[16];
+        (void)snprintf(mode_text, sizeof(mode_text), "%04o", (unsigned)(status.st_mode & 07777));
+        cbm_log_warn("daemon.private_dir_group_writable_ancestor", "mode", mode_text);
+    }
+    return true;
 }
 
 /* Validate a path transition only through the two already-open directory
@@ -1434,6 +1466,29 @@ static int private_directory_tree_open(const char *directory_path) {
             ok = false;
         } else {
             ok = posix_directory_parent_secure(current_fd);
+            if (!ok) {
+                /* #1537: this branch used to leave the detail empty, so the
+                 * caller fell back to printing errno — which NOTHING here sets.
+                 * A reporter was handed "errno 2" (ENOENT) for a permission
+                 * refusal and went looking for a missing file that existed.
+                 * An unset errno is not a diagnosis.
+                 *
+                 * The first version of that fix then named the WRONG directory.
+                 * posix_directory_parent_secure() validates current_fd — the
+                 * directory we are already in — but the message printed
+                 * `component`, the child about to be entered. So #1537 read
+                 * "ancestor '.cache'" when /Users/<user> was refusing, and
+                 * #1621 read "cbm-daemon-501" when /private/tmp was. Both
+                 * reporters inspected a directory that was not the one
+                 * refusing, found it clean, and said so — correctly. Naming the
+                 * containing directory is the difference between a report we
+                 * can act on and weeks of talking past each other. */
+                ipc_validation_detail_set(
+                    "%s: the directory CONTAINING '%s' is not a usable private-directory parent "
+                    "(it must be owned by you, not world-writable, and carry no allow-ACL). Check "
+                    "that containing directory, not '%s' itself",
+                    directory_path, component, component);
+            }
             bool created = ok && mkdirat(current_fd, component, 0700) == 0;
             if (!created && errno != EEXIST) {
                 ok = false;
@@ -3311,10 +3366,13 @@ typedef BOOL(WINAPI *is_well_known_sid_fn)(PSID, WELL_KNOWN_SID_TYPE);
 typedef BOOL(WINAPI *is_valid_acl_fn)(PACL);
 typedef BOOL(WINAPI *initialize_acl_fn)(PACL, DWORD, DWORD);
 typedef BOOL(WINAPI *add_access_allowed_ace_fn)(PACL, DWORD, DWORD, PSID);
+typedef BOOL(WINAPI *add_access_allowed_ace_ex_fn)(PACL, DWORD, DWORD, DWORD, PSID);
 typedef BOOL(WINAPI *initialize_security_descriptor_fn)(PSECURITY_DESCRIPTOR, DWORD);
 typedef BOOL(WINAPI *set_security_descriptor_dacl_fn)(PSECURITY_DESCRIPTOR, BOOL, PACL, BOOL);
 typedef BOOL(WINAPI *set_security_descriptor_owner_fn)(PSECURITY_DESCRIPTOR, PSID, BOOL);
 typedef BOOL(WINAPI *get_acl_information_fn)(PACL, LPVOID, DWORD, ACL_INFORMATION_CLASS);
+typedef BOOL(WINAPI *get_security_descriptor_control_fn)(PSECURITY_DESCRIPTOR,
+                                                         PSECURITY_DESCRIPTOR_CONTROL, LPDWORD);
 typedef BOOL(WINAPI *get_ace_fn)(PACL, DWORD, LPVOID *);
 typedef DWORD(WINAPI *get_security_info_fn)(HANDLE, SE_OBJECT_TYPE, SECURITY_INFORMATION, PSID *,
                                             PSID *, PACL *, PACL *, PSECURITY_DESCRIPTOR *);
@@ -3338,10 +3396,12 @@ typedef struct {
     is_valid_acl_fn is_valid_acl;
     initialize_acl_fn initialize_acl;
     add_access_allowed_ace_fn add_access_allowed_ace;
+    add_access_allowed_ace_ex_fn add_access_allowed_ace_ex;
     initialize_security_descriptor_fn initialize_security_descriptor;
     set_security_descriptor_dacl_fn set_security_descriptor_dacl;
     set_security_descriptor_owner_fn set_security_descriptor_owner;
     get_acl_information_fn get_acl_information;
+    get_security_descriptor_control_fn get_security_descriptor_control;
     get_ace_fn get_ace;
     get_security_info_fn get_security_info;
     set_security_info_fn set_security_info;
@@ -3351,6 +3411,9 @@ typedef struct {
     PACL acl;
     PSECURITY_DESCRIPTOR descriptor;
     SECURITY_ATTRIBUTES attributes;
+    PACL directory_acl;
+    PSECURITY_DESCRIPTOR directory_descriptor;
+    SECURITY_ATTRIBUTES directory_attributes;
 } win_security_t;
 
 typedef struct win_generation_address {
@@ -3559,6 +3622,8 @@ static void win_security_destroy(win_security_t *security) {
     }
     free(security->descriptor);
     free(security->acl);
+    free(security->directory_descriptor);
+    free(security->directory_acl);
     free(security->user_sid);
     if (security->advapi) {
         (void)FreeLibrary(security->advapi);
@@ -3613,6 +3678,8 @@ static bool win_security_init(win_security_t *security) {
     RESOLVE_ADVAPI_MEMBER(security, initialize_acl, initialize_acl_fn, "InitializeAcl");
     RESOLVE_ADVAPI_MEMBER(security, add_access_allowed_ace, add_access_allowed_ace_fn,
                           "AddAccessAllowedAce");
+    RESOLVE_ADVAPI_MEMBER(security, add_access_allowed_ace_ex, add_access_allowed_ace_ex_fn,
+                          "AddAccessAllowedAceEx");
     RESOLVE_ADVAPI_MEMBER(security, initialize_security_descriptor,
                           initialize_security_descriptor_fn, "InitializeSecurityDescriptor");
     RESOLVE_ADVAPI_MEMBER(security, set_security_descriptor_dacl, set_security_descriptor_dacl_fn,
@@ -3621,6 +3688,8 @@ static bool win_security_init(win_security_t *security) {
                           "SetSecurityDescriptorOwner");
     RESOLVE_ADVAPI_MEMBER(security, get_acl_information, get_acl_information_fn,
                           "GetAclInformation");
+    RESOLVE_ADVAPI_MEMBER(security, get_security_descriptor_control,
+                          get_security_descriptor_control_fn, "GetSecurityDescriptorControl");
     RESOLVE_ADVAPI_MEMBER(security, get_ace, get_ace_fn, "GetAce");
     RESOLVE_ADVAPI_MEMBER(security, get_security_info, get_security_info_fn, "GetSecurityInfo");
     RESOLVE_ADVAPI_MEMBER(security, set_security_info, set_security_info_fn, "SetSecurityInfo");
@@ -3678,6 +3747,37 @@ static bool win_security_init(win_security_t *security) {
     security->attributes.nLength = sizeof(security->attributes);
     security->attributes.lpSecurityDescriptor = security->descriptor;
     security->attributes.bInheritHandle = FALSE;
+
+    /* Containers need a second, inheritable ACL. AddAccessAllowedAce above
+     * cannot express inheritance flags, and a flagless ACE applied to a
+     * directory together with PROTECTED_DACL_SECURITY_INFORMATION yields
+     * D:PAI(A;;FA;;;<user>): the protection severs the inherited ACEs while
+     * the new one propagates nothing, so every child is created with an empty
+     * DACL. Files and kernel objects are leaves and keep the flagless ACL.
+     *
+     * The rights here must be specific (FILE_ALL_ACCESS) rather than
+     * GENERIC_ALL. Windows splits an inheritable generic-rights ACE into an
+     * effective mapped ACE plus an INHERIT_ONLY one carrying the generic bits,
+     * and the owner-only DACL validators require exactly one ACE. */
+    security->directory_acl = malloc(acl_size);
+    security->directory_descriptor = malloc(SECURITY_DESCRIPTOR_MIN_LENGTH);
+    if (!security->directory_acl || !security->directory_descriptor ||
+        !security->initialize_acl(security->directory_acl, (DWORD)acl_size, ACL_REVISION) ||
+        !security->add_access_allowed_ace_ex(security->directory_acl, ACL_REVISION,
+                                             CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+                                             FILE_ALL_ACCESS, security->user_sid) ||
+        !security->initialize_security_descriptor(security->directory_descriptor,
+                                                  SECURITY_DESCRIPTOR_REVISION) ||
+        !security->set_security_descriptor_dacl(security->directory_descriptor, TRUE,
+                                                security->directory_acl, FALSE) ||
+        !security->set_security_descriptor_owner(security->directory_descriptor, security->user_sid,
+                                                 FALSE)) {
+        win_security_destroy(security);
+        return false;
+    }
+    security->directory_attributes.nLength = sizeof(security->directory_attributes);
+    security->directory_attributes.lpSecurityDescriptor = security->directory_descriptor;
+    security->directory_attributes.bInheritHandle = FALSE;
     return true;
 }
 
@@ -3910,8 +4010,45 @@ static bool win_sid_trusted(win_security_t *security, PSID sid) {
            win_sid_is_trusted_installer((const uint8_t *)sid, (size_t)sid_length);
 }
 
+/* AppContainer identities: package SIDs (S-1-15-2-*) and capability SIDs
+ * (S-1-15-3-*), under the APP_PACKAGE identifier authority (15).
+ *
+ * These are tolerated on ANCESTOR components only — never on the private
+ * runtime directory itself, which keeps demanding the exact current user.
+ *
+ * Why they are admissible there: a sandboxed package's ACE on %LOCALAPPDATA%
+ * grants that package, and a process cannot select which AppContainer it runs
+ * in — the identity is stamped by the OS at process creation from the package
+ * it was launched from. So such an ACE cannot be exercised by arbitrary local
+ * code the way a live local group can. What it does permit is the packaged
+ * application itself; that is the residual risk this exemption accepts, and it
+ * is the same trust already extended to whatever installed that package.
+ *
+ * Why BOTH forms: capability SIDs alone are not enough. The most common real
+ * ACE of this shape is `S-1-15-2-*` — a package SID. On reported machines it
+ * resolves through HKCR\...\AppContainer\Mappings to Anthropic Claude
+ * Desktop, an application many of our users run and cannot be asked to
+ * uninstall. Covering only S-1-15-3-* leaves exactly that case failing.
+ *
+ * Grounded in #1533 (four independent reproductions across four SID classes)
+ * and #1574. Approach and the ancestor-only boundary follow @mlandolfi90's
+ * PR #1447, extended to package SIDs. */
+static bool win_sid_is_app_container(const uint8_t *sid, size_t sid_length) {
+    if (!windows_sid_valid(sid, sid_length) || sid[1] < 1U) {
+        return false;
+    }
+    /* identifier authority must be exactly 15 (APP_PACKAGE_AUTHORITY) */
+    if (sid[2] != 0U || sid[3] != 0U || sid[4] != 0U || sid[5] != 0U || sid[6] != 0U ||
+        sid[7] != 15U) {
+        return false;
+    }
+    uint32_t first = win_sid_read_u32_le(sid + 8U);
+    return first == 2U || first == 3U;
+}
+
 static bool win_bounded_sid_trusted(win_security_t *security, const uint8_t *sid,
-                                    size_t sid_capacity, bool creator_owner_inherit_only) {
+                                    size_t sid_capacity, bool creator_owner_inherit_only,
+                                    bool ancestor) {
     if (!security || !sid || sid_capacity < 8U || sid[1] > 15U) {
         return false;
     }
@@ -3927,7 +4064,8 @@ static bool win_bounded_sid_trusted(win_security_t *security, const uint8_t *sid
              * user, so such an ACE only ever grants to us. Default Windows
              * profile/temp ACLs (and GitHub runner profiles) carry it, and
              * rejecting it locked real current-user directories out. */
-            security->is_well_known_sid((PSID)sid, WinCreatorOwnerRightsSid));
+            security->is_well_known_sid((PSID)sid, WinCreatorOwnerRightsSid) ||
+            (ancestor && win_sid_is_app_container(sid, sid_length)));
 }
 
 static bool win_file_owner_secure(win_security_t *security, HANDLE file,
@@ -3962,7 +4100,8 @@ static DWORD win_private_mutation_rights(void) {
            DELETE | WRITE_DAC | WRITE_OWNER | ACCESS_SYSTEM_SECURITY;
 }
 
-static bool win_file_acl_secure(win_security_t *security, HANDLE file, DWORD mutation) {
+static bool win_file_acl_secure(win_security_t *security, HANDLE file, DWORD mutation,
+                                bool ancestor) {
     PACL dacl = NULL;
     PSECURITY_DESCRIPTOR descriptor = NULL;
     DWORD status = security->get_security_info(file, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
@@ -4003,7 +4142,8 @@ static bool win_file_acl_secure(win_security_t *security, HANDLE file, DWORD mut
         const uint8_t *sid = (const uint8_t *)&ace->SidStart;
         size_t sid_capacity = (size_t)header->AceSize - sid_offset;
         bool creator_owner_inherit_only = (header->AceFlags & INHERIT_ONLY_ACE) != 0U;
-        if (!win_bounded_sid_trusted(security, sid, sid_capacity, creator_owner_inherit_only)) {
+        if (!win_bounded_sid_trusted(security, sid, sid_capacity, creator_owner_inherit_only,
+                                     ancestor)) {
             /* Name the untrusted identity class so a harness/profile ACL leak
              * (an inherited Users / Authenticated Users / Everyone ACE) is
              * distinguishable from a genuinely hostile grant. */
@@ -4036,9 +4176,190 @@ static bool win_file_acl_secure(win_security_t *security, HANDLE file, DWORD mut
 }
 
 static bool win_file_security_secure(win_security_t *security, HANDLE file,
-                                     bool require_current_user, DWORD mutation) {
+                                     bool require_current_user, DWORD mutation, bool ancestor) {
     return win_file_owner_secure(security, file, require_current_user) &&
-           win_file_acl_secure(security, file, mutation);
+           win_file_acl_secure(security, file, mutation, ancestor);
+}
+
+/* Is this object's DACL present but EMPTY (zero ACEs)? That denies everyone,
+ * including the owner, for anything the owner-rights path does not cover.
+ *
+ * It needs its own test because win_file_acl_secure() cannot detect it: that
+ * function scans ACEs for untrusted mutation grants, and a DACL with zero ACEs
+ * trivially has none, so damage reads as compliance. */
+/* The lock-directory ADOPTION predicate (private_win_owner_only_dacl in the
+ * foundation layer) demands a PROTECTED DACL whose single non-inherited ACE
+ * grants the CURRENT USER full access — strictly narrower than "no untrusted
+ * mutation rights", which also admits SYSTEM/Administrators ACEs. The
+ * already-correct fast path below must apply the CONSUMER'S predicate: a
+ * directory that merely passes the general secure() check but is not
+ * owner-only would skip the re-stamp and then strand every subsequent lock
+ * adoption (observed as 59 daemon-suite failures on a fresh runtime dir whose
+ * inherited DACL carried SYSTEM+Administrators). */
+static bool win_file_dacl_is_owner_only(win_security_t *security, HANDLE file) {
+    if (!security->get_security_descriptor_control) {
+        return false;
+    }
+    PSID owner = NULL;
+    PACL dacl = NULL;
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    if (security->get_security_info(file, SE_FILE_OBJECT,
+                                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &owner,
+                                    NULL, &dacl, NULL, &descriptor) != ERROR_SUCCESS) {
+        return false;
+    }
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    ACL_SIZE_INFORMATION information;
+    memset(&information, 0, sizeof(information));
+    LPVOID opaque_ace = NULL;
+    bool valid = descriptor && owner && dacl && security->is_valid_sid(owner) &&
+                 security->equal_sid(owner, security->user_sid) &&
+                 security->get_security_descriptor_control(descriptor, &control, &revision) &&
+                 (control & SE_DACL_PRESENT) != 0 && (control & SE_DACL_PROTECTED) != 0 &&
+                 security->is_valid_acl(dacl) &&
+                 security->get_acl_information(dacl, &information, sizeof(information),
+                                               AclSizeInformation) &&
+                 information.AceCount == 1U && security->get_ace(dacl, 0, &opaque_ace) &&
+                 opaque_ace;
+    if (valid) {
+        ACCESS_ALLOWED_ACE *ace = (ACCESS_ALLOWED_ACE *)opaque_ace;
+        PSID ace_sid = (PSID)&ace->SidStart;
+        valid = ace->Header.AceType == ACCESS_ALLOWED_ACE_TYPE &&
+                ace->Header.AceSize >= sizeof(ACCESS_ALLOWED_ACE) &&
+                (ace->Header.AceFlags & (INHERITED_ACE | INHERIT_ONLY_ACE)) == 0 &&
+                security->is_valid_sid(ace_sid) &&
+                security->equal_sid(ace_sid, security->user_sid) &&
+                (ace->Mask == FILE_ALL_ACCESS || ace->Mask == GENERIC_ALL);
+    }
+    if (descriptor) {
+        (void)LocalFree(descriptor);
+    }
+    return valid;
+}
+
+static bool win_file_dacl_is_empty(win_security_t *security, HANDLE file) {
+    PACL dacl = NULL;
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    if (security->get_security_info(file, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL,
+                                    &dacl, NULL, &descriptor) != ERROR_SUCCESS) {
+        return false;
+    }
+    ACL_SIZE_INFORMATION information;
+    memset(&information, 0, sizeof(information));
+    bool empty = dacl && security->is_valid_acl(dacl) &&
+                 security->get_acl_information(dacl, &information, sizeof(information),
+                                               AclSizeInformation) &&
+                 information.AceCount == 0U;
+    if (descriptor) {
+        (void)LocalFree(descriptor);
+    }
+    return empty;
+}
+
+/* Repair cache/runtime children left unusable by the pre-v0.10.3 DACL regime.
+ *
+ * Between v0.9.1-rc and v0.10.2 the runtime directory carried a PROTECTED DACL
+ * whose ACE was not inheritable. Windows therefore gave every file created
+ * inside it either an empty DACL or the token default (SYSTEM + TokenOwner +
+ * logon SID). Under an elevated token TokenOwner is BUILTIN\Administrators, so
+ * the interactive user ends up with no durable grant at all and the file is
+ * unreadable after the next logon — #1601, where takeown and icacls both fail
+ * non-elevated and the daemon can no longer open _config.db.
+ *
+ * #1531 fixed the cause forward-only in v0.10.3: the directory ACE is
+ * inheritable now, so newly created children are fine. Nothing repaired the
+ * children already damaged, which is why upgrading did not rescue anyone whose
+ * cache was written under the old regime. This is that repair.
+ *
+ * Deliberately bounded and conservative:
+ *  - immediate children only, no recursion, capped;
+ *  - regular files only; directories, reparse points and symlinks are skipped
+ *    entirely rather than followed;
+ *  - a child is touched ONLY when it is demonstrably damaged - an empty DACL,
+ *    or an owner that is not the current user. A child that is merely unusual
+ *    is left alone;
+ *  - failures are counted and reported, never fatal. This runs inside daemon
+ *    startup and must not be able to prevent it.
+ *
+ * Scope note: this only ever runs on cbm's own runtime/cache directory, which
+ * we created and own. It does not reach into user directories. */
+static void win_repair_runtime_children(win_security_t *security, const wchar_t *runtime_dir) {
+    enum { WIN_CHILD_REPAIR_MAX = 4096 };
+    if (!security || !runtime_dir || !security->user_sid) {
+        return;
+    }
+    size_t dir_length = wcslen(runtime_dir);
+    if (dir_length == 0U || dir_length > 32000U) {
+        return;
+    }
+    wchar_t *pattern = calloc(dir_length + 3U, sizeof(wchar_t));
+    if (!pattern) {
+        return;
+    }
+    (void)swprintf(pattern, dir_length + 3U, L"%ls\\*", runtime_dir);
+    WIN32_FIND_DATAW entry;
+    HANDLE search = FindFirstFileW(pattern, &entry);
+    free(pattern);
+    if (search == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    unsigned examined = 0U;
+    unsigned repaired = 0U;
+    unsigned failed = 0U;
+    do {
+        if (wcscmp(entry.cFileName, L".") == 0 || wcscmp(entry.cFileName, L"..") == 0) {
+            continue;
+        }
+        if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0U ||
+            (entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U) {
+            continue;
+        }
+        if (++examined > (unsigned)WIN_CHILD_REPAIR_MAX) {
+            break;
+        }
+        size_t name_length = wcslen(entry.cFileName);
+        size_t child_capacity = dir_length + name_length + 2U;
+        wchar_t *child_path = calloc(child_capacity, sizeof(wchar_t));
+        if (!child_path) {
+            continue;
+        }
+        (void)swprintf(child_path, child_capacity, L"%ls\\%ls", runtime_dir, entry.cFileName);
+        HANDLE child = CreateFileW(child_path, READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                                   OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+        free(child_path);
+        if (child == INVALID_HANDLE_VALUE) {
+            continue;
+        }
+        BY_HANDLE_FILE_INFORMATION child_info;
+        bool regular = GetFileInformationByHandle(child, &child_info) != 0 &&
+                       (child_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0U &&
+                       (child_info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0U;
+        bool damaged = regular && (win_file_dacl_is_empty(security, child) ||
+                                   !win_file_owner_secure(security, child, true));
+        if (damaged) {
+            if (security->set_security_info(
+                    child, SE_FILE_OBJECT,
+                    (DWORD)OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION |
+                        PROTECTED_DACL_SECURITY_INFORMATION,
+                    security->user_sid, NULL, security->acl, NULL) == ERROR_SUCCESS) {
+                repaired++;
+            } else {
+                failed++;
+            }
+        }
+        (void)CloseHandle(child);
+    } while (FindNextFileW(search, &entry) != 0);
+    (void)FindClose(search);
+    if (repaired > 0U || failed > 0U) {
+        char repaired_text[16];
+        char failed_text[16];
+        (void)snprintf(repaired_text, sizeof(repaired_text), "%u", repaired);
+        (void)snprintf(failed_text, sizeof(failed_text), "%u", failed);
+        cbm_log_warn("daemon.runtime_child_acl_repaired", "repaired", repaired_text, "failed",
+                     failed_text);
+    }
 }
 
 static bool win_runtime_directory_secure(const wchar_t *runtime_dir) {
@@ -4046,7 +4367,7 @@ static bool win_runtime_directory_secure(const wchar_t *runtime_dir) {
     if (!win_security_init(&security)) {
         return false;
     }
-    bool created = CreateDirectoryW(runtime_dir, &security.attributes) != 0;
+    bool created = CreateDirectoryW(runtime_dir, &security.directory_attributes) != 0;
     if (!created && GetLastError() != ERROR_ALREADY_EXISTS) {
         win_security_destroy(&security);
         return false;
@@ -4087,13 +4408,35 @@ static bool win_runtime_directory_secure(const wchar_t *runtime_dir) {
      * refused, and the final validation below still demands the exact user. */
     bool owner_ok = owner_exact || (valid_handle && can_write_owner &&
                                     win_file_owner_secure(&security, directory, false));
+    /* Re-stamp only when the directory is not ALREADY correct.
+     *
+     * This used to fire on every process start, whether or not anything was
+     * wrong. Two costs, both observed in the field:
+     *
+     *  - It rewrites the security descriptor of a directory that already has
+     *    the right one, and Windows propagates that to children. #1601 counted
+     *    ELEVEN "Security change" USN records against a single _config.db in
+     *    one day, none of which changed anything.
+     *  - Every rewrite is a window. #1620 loses an atomic publish to exactly
+     *    this: MoveFileEx needs DELETE on the destination, and a concurrent
+     *    re-protect of the parent is a chance to be refused for a state that is
+     *    about to be correct again anyway.
+     *
+     * The repair is what matters, not the ritual. If the owner is already the
+     * exact current user and the DACL already passes the private-directory
+     * check, there is nothing to fix and the correct action is to leave it
+     * alone. When it IS wrong we still repair exactly as before. */
     DWORD secure_result = ERROR_ACCESS_DENIED;
-    if (valid_handle && owner_ok) {
+    bool already_correct =
+        valid_handle && owner_exact && win_file_dacl_is_owner_only(&security, directory);
+    if (already_correct) {
+        secure_result = ERROR_SUCCESS;
+    } else if (valid_handle && owner_ok) {
         secure_result = security.set_security_info(
             directory, SE_FILE_OBJECT,
             (owner_exact ? 0U : (DWORD)OWNER_SECURITY_INFORMATION) | DACL_SECURITY_INFORMATION |
                 PROTECTED_DACL_SECURITY_INFORMATION,
-            owner_exact ? NULL : security.user_sid, NULL, security.acl, NULL);
+            owner_exact ? NULL : security.user_sid, NULL, security.directory_acl, NULL);
     }
     if (valid_handle && owner_ok && secure_result != ERROR_SUCCESS) {
         ipc_validation_detail_set("owner/DACL repair failed (status %lu%s)",
@@ -4102,7 +4445,13 @@ static bool win_runtime_directory_secure(const wchar_t *runtime_dir) {
     }
     bool final_private =
         secure_result == ERROR_SUCCESS &&
-        win_file_security_secure(&security, directory, true, win_private_mutation_rights());
+        win_file_security_secure(&security, directory, true, win_private_mutation_rights(), false);
+    /* Repair damaged children only once the directory itself is known good.
+     * Repairing into a parent we have not secured would re-derive the same
+     * broken state on the next file created there. */
+    if (final_private) {
+        win_repair_runtime_children(&security, runtime_dir);
+    }
     (void)CloseHandle(directory);
     win_security_destroy(&security);
     return valid_handle && owner_ok && final_private;
@@ -4125,7 +4474,7 @@ static bool win_directory_component_secure(win_security_t *security, const wchar
     bool valid = GetFileInformationByHandle(directory, &info) != 0 &&
                  (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
                  (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
-                 win_file_security_secure(security, directory, false, mutation);
+                 win_file_security_secure(security, directory, false, mutation, true);
     (void)CloseHandle(directory);
     return valid;
 }
@@ -4180,7 +4529,7 @@ static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
             if (attributes == INVALID_FILE_ATTRIBUTES) {
                 DWORD error = GetLastError();
                 ok = (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) &&
-                     CreateDirectoryW(path, &security.attributes) != 0;
+                     CreateDirectoryW(path, &security.directory_attributes) != 0;
             }
             /* Ancestors are observe-only and must already be secure.  The
              * final current-user directory is intentionally handled below by
@@ -4644,21 +4993,8 @@ static win_rendezvous_status_t win_endpoint_refresh_rendezvous(
     return result;
 }
 
-typedef LONG(WINAPI *bcrypt_gen_random_fn)(void *, unsigned char *, ULONG, ULONG);
-
 static bool win_generation_nonce(uint8_t nonce[CBM_DAEMON_IPC_WINDOWS_NONCE_SIZE]) {
-    enum { WIN_BCRYPT_USE_SYSTEM_PREFERRED_RNG = 0x00000002 };
-    HMODULE bcrypt = LoadLibraryW(L"bcrypt.dll");
-    bcrypt_gen_random_fn generate =
-        bcrypt ? (bcrypt_gen_random_fn)(void (*)(void))GetProcAddress(bcrypt, "BCryptGenRandom")
-               : NULL;
-    LONG status = generate ? generate(NULL, nonce, CBM_DAEMON_IPC_WINDOWS_NONCE_SIZE,
-                                      WIN_BCRYPT_USE_SYSTEM_PREFERRED_RNG)
-                           : (LONG)-1;
-    if (bcrypt) {
-        (void)FreeLibrary(bcrypt);
-    }
-    return status >= 0;
+    return cbm_secure_random(nonce, CBM_DAEMON_IPC_WINDOWS_NONCE_SIZE);
 }
 
 static int win_private_lock_probe(cbm_private_lock_directory_t *directory, const char *base_name) {

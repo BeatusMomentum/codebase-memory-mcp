@@ -1,5 +1,6 @@
 /* Transactional binary activation. See activation_transaction.h. */
 #include "cli/activation_transaction.h"
+#include "foundation/log.h"
 #include "foundation/macos_acl.h"
 
 #include <errno.h>
@@ -106,9 +107,37 @@ static void activation_note_refusal(const char *predicate, unsigned long os_erro
                    g_activation_refusal_object ? g_activation_refusal_object : "");
 }
 
+#ifndef _WIN32
+/* A permission refusal has no errno to report — the syscall succeeded and the
+ * POLICY said no. Reporters spent hours chasing "I/O failed" for what was a
+ * mode bit (#1535), so these refusals carry the mode and the path instead of a
+ * fabricated OS error code. POSIX-only: the Windows validators refuse on ACL
+ * predicates and report through activation_note_refusal with a real OS error. */
+static void activation_note_refusal_detail(const char *predicate, const char *detail) {
+    if (g_activation_refusal_note[0] != '\0') {
+        return;
+    }
+    (void)snprintf(g_activation_refusal_note, sizeof(g_activation_refusal_note), "%s (%s)%s%s",
+                   predicate, detail, g_activation_refusal_object ? " at " : "",
+                   g_activation_refusal_object ? g_activation_refusal_object : "");
+}
+#endif
+
 const char *cbm_activation_transaction_refusal_note(void) {
     return g_activation_refusal_note;
 }
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* #1416 test seam: install a refusal note so the CLI attribution path is
+ * testable without constructing a real Windows ACL refusal. */
+void cbm_activation_transaction_note_refusal_for_testing(const char *predicate,
+                                                         unsigned long os_error) {
+    activation_refusal_clear();
+    if (predicate && predicate[0]) {
+        activation_note_refusal(predicate, os_error);
+    }
+}
+#endif
 
 #ifdef _WIN32
 typedef HANDLE activation_native_file_t;
@@ -424,6 +453,52 @@ static bool activation_windows_owner_is_trusted(HANDLE handle) {
     return trusted;
 }
 
+/* The SID Windows will stamp as OWNER on objects this process creates.
+ *
+ * That is TokenOwner, NOT TokenUser, and the two differ exactly when it matters:
+ * for a member of the Administrators group the default owner is
+ * BUILTIN\Administrators (the "System objects: Default owner for objects
+ * created by members of the Administrators group" policy, default on Server and
+ * common on hardened clients). So an elevated install created its staging file,
+ * then refused it as "owner-not-current-user" — we rejected a file we had just
+ * written ourselves (#1580), and the daemon path failed the same way, exiting
+ * before it could say anything (#1582).
+ *
+ * Reading TokenOwner is STRICTER-or-equal, never looser: it is the one SID this
+ * process stamps. On a non-elevated account TokenOwner == TokenUser and nothing
+ * changes. It does not accept "anything an administrator owns" — only the exact
+ * SID our own creations carry. */
+static bool activation_windows_token_owner(void **information_out, PSID *sid_out) {
+    *information_out = NULL;
+    *sid_out = NULL;
+    HANDLE token = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        return false;
+    }
+    DWORD needed = 0;
+    (void)GetTokenInformation(token, TokenOwner, NULL, 0, &needed);
+    if (needed == 0 || GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+        (void)CloseHandle(token);
+        return false;
+    }
+    void *information = calloc(1, needed);
+    bool ok =
+        information && GetTokenInformation(token, TokenOwner, information, needed, &needed) != 0;
+    (void)CloseHandle(token);
+    if (!ok) {
+        free(information);
+        return false;
+    }
+    PSID sid = ((TOKEN_OWNER *)information)->Owner;
+    if (!sid || !IsValidSid(sid)) {
+        free(information);
+        return false;
+    }
+    *information_out = information;
+    *sid_out = sid;
+    return true;
+}
+
 static bool activation_windows_owner_is_current(HANDLE handle) {
     void *information = NULL;
     PSID user_sid = NULL;
@@ -435,6 +510,17 @@ static bool activation_windows_owner_is_current(HANDLE handle) {
     DWORD result = GetSecurityInfo(handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &owner, NULL,
                                    NULL, NULL, &descriptor);
     bool same = result == ERROR_SUCCESS && owner && IsValidSid(owner) && EqualSid(owner, user_sid);
+    /* Not our user SID — but Windows may legitimately have stamped our token's
+     * OWNER instead (Administrators, for an elevated account). Accept that and
+     * only that; see activation_windows_token_owner. */
+    if (!same && result == ERROR_SUCCESS && owner && IsValidSid(owner)) {
+        void *owner_information = NULL;
+        PSID token_owner = NULL;
+        if (activation_windows_token_owner(&owner_information, &token_owner)) {
+            same = EqualSid(owner, token_owner) != 0;
+            free(owner_information);
+        }
+    }
     if (!same) {
         activation_note_refusal("owner-not-current-user", result);
     }
@@ -728,11 +814,25 @@ static char *activation_posix_walk_path(const char *directory) {
     return activation_string_copy(directory);
 }
 
+/* ANCESTOR policy (#1535). World-writable is still fatal: any local user could
+ * swap a path component mid-transaction. GROUP-writable is not — it is the
+ * default shape of ordinary home trees (WSL2 ships ~ and ~/.local at 0775, as
+ * do several distro skeletons and any site using a shared primary group), and
+ * refusing it made `install.sh` fail for a large fraction of Linux users with
+ * no actionable message. The group is a bounded, administratively-chosen set;
+ * the LEAF directory (below) stays strictly owner-private either way, so the
+ * binary itself is never left in a group-writable directory. Group-writable
+ * ancestors are warned about, out loud, rather than silently accepted. */
 static bool activation_posix_intermediate_secure(const struct stat *status) {
     bool trusted_owner = status->st_uid == 0 || status->st_uid == geteuid();
-    bool private_permissions = (status->st_mode & 0022) == 0;
+    bool world_writable = (status->st_mode & 0002) != 0;
     bool root_sticky = status->st_uid == 0 && (status->st_mode & S_ISVTX) != 0;
-    return S_ISDIR(status->st_mode) && trusted_owner && (private_permissions || root_sticky);
+    return S_ISDIR(status->st_mode) && trusted_owner && (!world_writable || root_sticky);
+}
+
+static bool activation_posix_intermediate_group_writable(const struct stat *status) {
+    bool root_sticky = status->st_uid == 0 && (status->st_mode & S_ISVTX) != 0;
+    return (status->st_mode & 0020) != 0 && !root_sticky;
 }
 
 static bool activation_directory_secure(const char *directory, int *directory_fd_out,
@@ -776,8 +876,23 @@ static bool activation_directory_secure(const char *directory, int *directory_fd
             while (*remaining == '/') {
                 remaining++;
             }
-            if (next_ok && *remaining && !activation_posix_intermediate_secure(&next_status)) {
-                next_ok = false;
+            if (next_ok && *remaining) {
+                if (!activation_posix_intermediate_secure(&next_status)) {
+                    char detail[64];
+                    (void)snprintf(detail, sizeof(detail), "mode %04o, uid %lu",
+                                   (unsigned)(next_status.st_mode & 07777),
+                                   (unsigned long)next_status.st_uid);
+                    g_activation_refusal_object = walk_path;
+                    activation_note_refusal_detail("ancestor_directory_world_writable", detail);
+                    g_activation_refusal_object = NULL;
+                    next_ok = false;
+                } else if (activation_posix_intermediate_group_writable(&next_status)) {
+                    char mode_text[16];
+                    (void)snprintf(mode_text, sizeof(mode_text), "%04o",
+                                   (unsigned)(next_status.st_mode & 07777));
+                    cbm_log_warn("activation.ancestor_group_writable", "path", walk_path, "mode",
+                                 mode_text);
+                }
             }
             if (next_ok) {
                 (void)close(descriptor);
@@ -795,9 +910,36 @@ static bool activation_directory_secure(const char *directory, int *directory_fd
         }
     }
     struct stat status;
-    ok = ok && fstat(descriptor, &status) == 0 && S_ISDIR(status.st_mode) &&
-         status.st_uid == geteuid() && (status.st_mode & 0022) == 0 &&
-         activation_posix_acl_empty(descriptor);
+    if (ok && fstat(descriptor, &status) == 0) {
+        /* LEAF policy: strictly owner-private. This is the directory the binary
+         * is published into, so group/other write here would let another
+         * account replace the executable between validation and exec. Unlike
+         * the ancestors above, this one is refused — but it now says exactly
+         * which directory and which mode (#1535), instead of surfacing as a
+         * generic I/O failure that sent reporters hunting phantom disk errors. */
+        bool is_dir = S_ISDIR(status.st_mode);
+        bool owned = status.st_uid == geteuid();
+        bool private_permissions = (status.st_mode & 0022) == 0;
+        if (!is_dir || !owned || !private_permissions) {
+            char detail[64];
+            (void)snprintf(detail, sizeof(detail), "mode %04o, uid %lu",
+                           (unsigned)(status.st_mode & 07777), (unsigned long)status.st_uid);
+            g_activation_refusal_object = directory;
+            activation_note_refusal_detail(!is_dir  ? "install_dir_not_a_directory"
+                                           : !owned ? "install_dir_not_owned_by_you"
+                                                    : "install_dir_group_or_world_writable",
+                                           detail);
+            g_activation_refusal_object = NULL;
+            ok = false;
+        } else if (!activation_posix_acl_empty(descriptor)) {
+            g_activation_refusal_object = directory;
+            activation_note_refusal_detail("install_dir_carries_extra_acl_entries", "posix acl");
+            g_activation_refusal_object = NULL;
+            ok = false;
+        }
+    } else {
+        ok = false;
+    }
     free(walk_path);
     if (!ok) {
         if (descriptor >= 0) {
@@ -1695,6 +1837,7 @@ static activation_publish_status_t activation_publish_absent_link_fallback(
 }
 #endif
 
+#if defined(_WIN32) || defined(__APPLE__) || (defined(__linux__) && defined(SYS_renameat2))
 static activation_publish_status_t activation_finish_absent_publish(
     cbm_activation_transaction_t *transaction) {
     transaction->staged_exists = false;
@@ -1705,6 +1848,7 @@ static activation_publish_status_t activation_finish_absent_publish(
                ? ACTIVATION_PUBLISH_OK
                : ACTIVATION_PUBLISH_CHANGED_ERROR;
 }
+#endif
 
 static activation_publish_status_t activation_publish_absent_replacement(
     cbm_activation_transaction_t *transaction) {

@@ -11,6 +11,8 @@
 #include "foundation/log.h"
 #include "foundation/mem.h"
 #include "foundation/platform.h"
+#include "foundation/secure_random.h"
+#include "foundation/sha256.h"
 #include "foundation/subprocess.h"
 #include "mcp/index_supervisor.h"
 #include "mcp/mcp.h"
@@ -46,6 +48,7 @@ enum {
     APPLICATION_CONTEXT_HEADER_SIZE = 19,
     APPLICATION_TOOL_HEADER_SIZE = 5,
     APPLICATION_UI_CONFIG_REQUEST_SIZE = 7,
+    APPLICATION_UI_READINESS_REQUEST_SIZE = 1 + CBM_SHA256_DIGEST_LEN,
     APPLICATION_PATH_CAP = 4096,
     APPLICATION_JOB_THREAD_STACK = 256 * 1024,
     APPLICATION_JOB_POLL_US = 10000,
@@ -191,6 +194,8 @@ struct cbm_daemon_application {
     bool stopping;
     /* See cbm_daemon_application_set_permanent. */
     bool permanent;
+    uint8_t ui_readiness_secret[CBM_SHA256_DIGEST_LEN];
+    bool ui_readiness_secret_set;
 };
 
 static void application_job_unsubscribe_locked(cbm_daemon_application_job_t *job);
@@ -2340,6 +2345,70 @@ static cbm_daemon_runtime_application_status_t application_set_context(
     return CBM_DAEMON_RUNTIME_APPLICATION_OK;
 }
 
+/* Build the JSON-RPC error that replaces a reply too large to frame.
+ *
+ * Says the two numbers a caller needs to act — what the reply measured and what
+ * fits — because the alternative the reporter lived through was a silent exit
+ * with nothing to go on. The advice is concrete for the same reason: "narrow the
+ * projection or add LIMIT" is actionable, "internal error" is not.
+ *
+ * `request` may be NULL when the message did not parse; the response then omits
+ * the id, which is what JSON-RPC requires for an unidentifiable request. */
+static char *application_oversized_response_error(const cbm_jsonrpc_request_t *request,
+                                                  size_t response_length) {
+    char message[CBM_SZ_256];
+    (void)snprintf(message, sizeof(message),
+                   "response too large: %zu bytes exceeds the %u byte transport limit; "
+                   "narrow the projection, add LIMIT, or paginate",
+                   response_length, (unsigned)CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return NULL;
+    }
+    yyjson_mut_val *err = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, err);
+    /* -32603 (internal error) is the closest standard code: the request was
+     * well-formed and the failure is server-side. */
+    yyjson_mut_obj_add_int(doc, err, "code", -32603);
+    yyjson_mut_obj_add_str(doc, err, "message", message);
+    char *error_json = yyjson_mut_write(doc, 0, NULL);
+    yyjson_mut_doc_free(doc);
+    if (!error_json) {
+        return NULL;
+    }
+
+    cbm_jsonrpc_response_t response = {
+        .id = request && request->has_id ? request->id : 0,
+        .id_str = request ? request->id_str : NULL,
+        .error_json = error_json,
+        .error_code = -32603,
+    };
+    char *encoded = cbm_jsonrpc_format_response(&response);
+    free(error_json);
+    return encoded;
+}
+
+/* Decide whether `response` can be framed, substituting the error when it
+ * cannot. Owns `response` either way and returns the reply to send, or NULL
+ * only on allocation failure. This is ONE function on purpose: the bug was the
+ * DECISION (an oversized reply travelling on as if it were fine), so the
+ * decision and the substitution have to be testable together — a test that
+ * only builds the error passes even with the size check removed. */
+static char *application_framable_response(char *response, const cbm_jsonrpc_request_t *request) {
+    if (!response || strlen(response) <= CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX) {
+        return response;
+    }
+    char *replacement = application_oversized_response_error(request, strlen(response));
+    free(response);
+    return replacement;
+}
+
+char *cbm_daemon_application_framable_response_for_test(char *response,
+                                                        const cbm_jsonrpc_request_t *request) {
+    return application_framable_response(response, request);
+}
+
 static cbm_daemon_runtime_application_status_t application_mcp_request(
     cbm_daemon_application_session_t *session, const uint8_t *request, uint32_t request_length,
     uint8_t **response_out, uint32_t *response_length_out) {
@@ -2365,17 +2434,36 @@ static cbm_daemon_runtime_application_status_t application_mcp_request(
     } else if (tool_request && response) {
         application_update_notice_inject(session, &response);
     }
-    if (parsed_ok) {
-        cbm_jsonrpc_request_free(&parsed);
-    }
     if (response) {
         size_t response_length = strlen(response);
         if (response_length > UINT32_MAX) {
+            if (parsed_ok) {
+                cbm_jsonrpc_request_free(&parsed);
+            }
             free(response);
             return CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
         }
+        /* A reply larger than one frame has to become a JSON-RPC error HERE,
+         * while the request id is still in hand. Handing it to the transport
+         * instead is indistinguishable from a dead socket at the frontend
+         * worker, which responds by _Exit()ing the process — right for a broken
+         * transport, a fatal over-reaction to a large answer. Under an MCP host
+         * that does not respawn the server, that took every tool on it out for
+         * the rest of the session, leaving exit=1 and an empty stderr to debug
+         * from (#1375). */
+        response = application_framable_response(response, parsed_ok ? &parsed : NULL);
+        if (!response) {
+            if (parsed_ok) {
+                cbm_jsonrpc_request_free(&parsed);
+            }
+            return CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
+        }
+        response_length = strlen(response);
         *response_out = (uint8_t *)response;
         *response_length_out = (uint32_t)response_length;
+    }
+    if (parsed_ok) {
+        cbm_jsonrpc_request_free(&parsed);
     }
     application_refresh_watch(session);
     return CBM_DAEMON_RUNTIME_APPLICATION_OK;
@@ -2455,6 +2543,24 @@ static cbm_daemon_runtime_application_status_t application_set_ui_config(
     return saved ? CBM_DAEMON_RUNTIME_APPLICATION_OK : CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
 }
 
+static cbm_daemon_runtime_application_status_t application_ui_readiness_proof(
+    cbm_daemon_application_t *application, const uint8_t *request, uint32_t request_length,
+    uint8_t **response_out, uint32_t *response_length_out) {
+    if (!application->ui_readiness_secret_set ||
+        request_length != APPLICATION_UI_READINESS_REQUEST_SIZE) {
+        return CBM_DAEMON_RUNTIME_APPLICATION_REJECTED;
+    }
+    uint8_t *proof = malloc(CBM_SHA256_DIGEST_LEN);
+    if (!proof) {
+        return CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
+    }
+    cbm_hmac_sha256(application->ui_readiness_secret, sizeof(application->ui_readiness_secret),
+                    request + 1, CBM_SHA256_DIGEST_LEN, proof);
+    *response_out = proof;
+    *response_length_out = CBM_SHA256_DIGEST_LEN;
+    return CBM_DAEMON_RUNTIME_APPLICATION_OK;
+}
+
 static cbm_daemon_runtime_application_status_t application_request_dispatch(
     cbm_daemon_application_t *application, cbm_daemon_application_session_t *session,
     const uint8_t *request, uint32_t request_length, uint8_t **response_out,
@@ -2470,6 +2576,9 @@ static cbm_daemon_runtime_application_status_t application_request_dispatch(
                                         response_length_out);
     case CBM_DAEMON_APPLICATION_REQUEST_SET_UI_CONFIG:
         return application_set_ui_config(application, session, request, request_length);
+    case CBM_DAEMON_APPLICATION_REQUEST_UI_READINESS_PROOF:
+        return application_ui_readiness_proof(application, request, request_length, response_out,
+                                              response_length_out);
     case CBM_DAEMON_APPLICATION_REQUEST_HOOK_AUGMENT: {
         if (!session->context_set || request_length <= 1) {
             return CBM_DAEMON_RUNTIME_APPLICATION_REJECTED;
@@ -2742,6 +2851,15 @@ cbm_daemon_application_t *cbm_daemon_application_new(
     application->physical_job_limit = APPLICATION_DEFAULT_PHYSICAL_JOB_LIMIT;
     size_t aggregate_memory_budget_bytes = cbm_mem_budget();
     if (config) {
+        if ((config->ui_readiness_secret != NULL || config->ui_readiness_secret_length != 0) &&
+            (!config->ui_readiness_secret ||
+             config->ui_readiness_secret_length != sizeof(application->ui_readiness_secret))) {
+            cbm_mutex_destroy(&application->mutex);
+            cbm_secure_zero(application->ui_readiness_secret,
+                            sizeof(application->ui_readiness_secret));
+            free(application);
+            return NULL;
+        }
         application->watcher = config->watcher;
         application->config = config->config;
         application->project_locks = config->project_locks;
@@ -2756,6 +2874,12 @@ cbm_daemon_application_t *cbm_daemon_application_new(
         }
         if (config->update_ops) {
             application->update_ops = *config->update_ops;
+        }
+        if (config->ui_readiness_secret &&
+            config->ui_readiness_secret_length == sizeof(application->ui_readiness_secret)) {
+            memcpy(application->ui_readiness_secret, config->ui_readiness_secret,
+                   sizeof(application->ui_readiness_secret));
+            application->ui_readiness_secret_set = true;
         }
     }
     /* Equal fixed slices keep admission deterministic: starting fewer jobs does
@@ -2783,6 +2907,7 @@ cbm_daemon_application_t *cbm_daemon_application_new(
     if (!application->worker_ops.poll || !application->worker_ops.cancel ||
         !application->worker_ops.log_path || !application->worker_ops.destroy) {
         cbm_mutex_destroy(&application->mutex);
+        cbm_secure_zero(application->ui_readiness_secret, sizeof(application->ui_readiness_secret));
         free(application);
         return NULL;
     }
@@ -2794,6 +2919,7 @@ cbm_daemon_application_t *cbm_daemon_application_new(
         (!application->update_ops.poll || !application->update_ops.cancel ||
          !application->update_ops.destroy)) {
         cbm_mutex_destroy(&application->mutex);
+        cbm_secure_zero(application->ui_readiness_secret, sizeof(application->ui_readiness_secret));
         free(application);
         return NULL;
     }
@@ -2929,6 +3055,7 @@ bool cbm_daemon_application_free_with_timeout(cbm_daemon_application_t *applicat
         mutations = next;
     }
     cbm_mutex_destroy(&application->mutex);
+    cbm_secure_zero(application->ui_readiness_secret, sizeof(application->ui_readiness_secret));
     free(application);
     return true;
 }
@@ -3092,6 +3219,38 @@ cbm_daemon_runtime_application_status_t cbm_daemon_application_client_set_ui_con
         status = CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
     }
     free(unexpected);
+    return status;
+}
+
+cbm_daemon_runtime_application_status_t cbm_daemon_application_client_ui_readiness_proof(
+    cbm_daemon_runtime_client_t *client, const uint8_t challenge[CBM_SHA256_DIGEST_LEN],
+    uint8_t proof_out[CBM_SHA256_DIGEST_LEN], uint32_t timeout_ms) {
+    if (!client || !challenge || !proof_out) {
+        return CBM_DAEMON_RUNTIME_APPLICATION_REJECTED;
+    }
+    cbm_secure_zero(proof_out, CBM_SHA256_DIGEST_LEN);
+    uint8_t *request = malloc(APPLICATION_UI_READINESS_REQUEST_SIZE);
+    if (!request) {
+        return CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    }
+    request[0] = CBM_DAEMON_APPLICATION_REQUEST_UI_READINESS_PROOF;
+    memcpy(request + 1, challenge, CBM_SHA256_DIGEST_LEN);
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    cbm_daemon_runtime_application_status_t status =
+        application_client_exchange(client, request, APPLICATION_UI_READINESS_REQUEST_SIZE,
+                                    &response, &response_length, timeout_ms);
+    if (status == CBM_DAEMON_RUNTIME_APPLICATION_OK) {
+        if (!response || response_length != CBM_SHA256_DIGEST_LEN) {
+            status = CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
+        } else {
+            memcpy(proof_out, response, CBM_SHA256_DIGEST_LEN);
+        }
+    }
+    if (response) {
+        cbm_secure_zero(response, response_length);
+    }
+    free(response);
     return status;
 }
 

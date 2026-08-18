@@ -778,6 +778,69 @@ static bool ui_adr_equals(const ui_delete_fixture_t *fx, const char *project,
     return equal;
 }
 
+TEST(ui_server_readiness_proof_is_exact_and_generation_bound) {
+    static const char challenge[] =
+        "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f";
+    static const char expected[] =
+        "62215de7bddcea7e2c4047ff6bb94f8d18262fc8b3f3648134bb7d44158ff84d";
+    uint8_t secret[CBM_SHA256_DIGEST_LEN];
+    for (size_t index = 0; index < sizeof(secret); index++) {
+        secret[index] = (uint8_t)index;
+    }
+
+    th_server_t without_secret;
+    ASSERT_EQ(th_server_start(&without_secret), 0);
+    char request[512];
+    ASSERT_GT(snprintf(request, sizeof(request),
+                       "GET /__cbm/ui-readiness?challenge=%s HTTP/1.1\r\n\r\n", challenge),
+              0);
+    char response[4096];
+    int response_length =
+        th_http(cbm_http_server_port(without_secret.srv), request, response, sizeof(response));
+    int missing_secret_status = response_length > 0 ? th_status(response) : -1;
+    th_server_stop(&without_secret);
+
+    th_server_t server = {0};
+    server.srv = cbm_http_server_new(0);
+    ASSERT_NOT_NULL(server.srv);
+    cbm_http_server_set_readiness_secret(server.srv, secret);
+    ASSERT_EQ(th_server_thread_start(&server.tid, server.srv), 0);
+    int port = cbm_http_server_port(server.srv);
+    response_length = th_http(port, request, response, sizeof(response));
+    char *body = response_length > 0 ? strstr(response, "\r\n\r\n") : NULL;
+    body = body ? body + 4 : NULL;
+    bool exact_proof = response_length > 0 && th_status(response) == 200 && body &&
+                       strcmp(body, expected) == 0 &&
+                       strstr(response, "Content-Type: text/plain; charset=utf-8") != NULL &&
+                       strstr(response, "Cache-Control: no-store") != NULL;
+
+    ASSERT_GT(snprintf(request, sizeof(request),
+                       "GET /__cbm/ui-readiness?challenge="
+                       "202122232425262728292A2b2c2d2e2f303132333435363738393a3b3c3d3e3f "
+                       "HTTP/1.1\r\n\r\n"),
+              0);
+    response_length = th_http(port, request, response, sizeof(response));
+    int uppercase_status = response_length > 0 ? th_status(response) : -1;
+
+    ASSERT_GT(snprintf(request, sizeof(request),
+                       "GET /__cbm/ui-readiness?challenge=%s&extra=1 HTTP/1.1\r\n\r\n", challenge),
+              0);
+    response_length = th_http(port, request, response, sizeof(response));
+    int extra_parameter_status = response_length > 0 ? th_status(response) : -1;
+
+    response_length =
+        th_http(port, "GET /__cbm/ui-readiness HTTP/1.1\r\n\r\n", response, sizeof(response));
+    int missing_challenge_status = response_length > 0 ? th_status(response) : -1;
+    th_server_stop(&server);
+
+    ASSERT_EQ(missing_secret_status, 503);
+    ASSERT_TRUE(exact_proof);
+    ASSERT_EQ(uppercase_status, 400);
+    ASSERT_EQ(extra_parameter_status, 400);
+    ASSERT_EQ(missing_challenge_status, 400);
+    PASS();
+}
+
 TEST(ui_server_unknown_path_404) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
@@ -899,8 +962,12 @@ TEST(ui_server_free_never_joins_active_index_worker) {
     PASS();
 }
 
-TEST(ui_server_root_serves_stub_404) {
-    /* Test binary links embedded_stub.c → no frontend → 404 with marker */
+TEST(ui_server_root_without_embedded_assets_is_not_found) {
+    /* The frontend is linked into the image, so its availability is decided at
+     * build time, not warmed at runtime: a binary built without --with-ui has
+     * no index.html and never will. That is a permanent 404, NOT a retryable
+     * 503 -- promising a retry for a condition that cannot change would make
+     * every client poll forever. */
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
     char resp[4096];
@@ -908,6 +975,7 @@ TEST(ui_server_root_serves_stub_404) {
     ASSERT_GT(n, 0);
     ASSERT_EQ(th_status(resp), 404);
     ASSERT_NOT_NULL(strstr(resp, "no frontend embedded"));
+    ASSERT_NULL(strstr(resp, "Retry-After"));
     th_server_stop(&ts);
     PASS();
 }
@@ -2030,10 +2098,168 @@ TEST(ui_server_browse_wide_dir_no_overflow) {
 #endif
 }
 
+/* The log endpoint serialises the ring into one heap buffer budgeted at
+ * LOG_LINE_MAX + 10 bytes per line. JSON escaping doubles every '"' and '\\',
+ * so an escape-dense line needs ~2x LOG_LINE_MAX. The inner escape loop stops
+ * at buf_size - 10, but the per-line framing writes (separator comma, opening
+ * quote, closing quote) were raw indexes, so every line past saturation wrote
+ * three bytes beyond the allocation. Fill the ring with escape-dense lines and
+ * read it back in a forked child, so the overflow surfaces as a killing signal
+ * (ASan abort) instead of silent heap corruption. */
+TEST(ui_server_logs_escape_dense_no_overflow) {
+#ifdef _WIN32
+    SKIP_PLATFORM("fork crash-isolation is POSIX-only; the clamp is platform-agnostic");
+#else
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Worst case the ring can hold: every byte escapes to two bytes. */
+        char dense[512];
+        for (size_t i = 0; i < sizeof(dense) - 1; i++) {
+            dense[i] = (i % 2 == 0) ? '"' : '\\';
+        }
+        dense[sizeof(dense) - 1] = '\0';
+        for (int i = 0; i < 500; i++) { /* fills the whole 500-entry ring */
+            cbm_ui_log_append(dense);
+        }
+        th_server_t ts;
+        if (th_server_start(&ts) != 0) {
+            _exit(2);
+        }
+        char req[256];
+        int port = cbm_http_server_port(ts.srv);
+        snprintf(req, sizeof(req), "GET /api/logs?lines=500 HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n",
+                 port);
+        size_t cap = 4u * 1024u * 1024u;
+        char *resp = malloc(cap);
+        int n = resp ? th_http(port, req, resp, (int)cap) : 0;
+        int ok = (n > 0 && strstr(resp, "HTTP/1.1 200") != NULL);
+        free(resp);
+        th_server_stop(&ts);
+        _exit(ok ? 0 : 3);
+    }
+    ASSERT_TRUE(pid > 0);
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    if (WIFSIGNALED(status)) {
+        char m[96];
+        snprintf(m, sizeof(m), "logs killed by signal %d — response buffer overflow",
+                 WTERMSIG(status));
+        FAIL(m);
+    }
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    PASS();
+#endif
+}
+
+/* The index-status endpoint renders every active job into a fixed 2 KB stack
+ * buffer. http_appendf clamps its own writes, but the separator and the closing
+ * bracket were raw indexes, so two jobs holding ~1 KB root paths (the field is
+ * 1024 bytes and the value comes straight from POST /api/index) pushed pos to
+ * the clamp and the close then wrote past the buffer. Drive it through the real
+ * endpoint with the index executor stubbed out, in a forked child so the
+ * overflow surfaces as a killing signal. */
+#define MAX_TEST_INDEX_JOBS 4
+TEST(ui_server_index_status_long_paths_no_overflow) {
+#ifdef _WIN32
+    SKIP_PLATFORM("fork crash-isolation is POSIX-only; the clamp is platform-agnostic");
+#else
+    char *base = th_mktempdir("cbm_status");
+    if (!base) {
+        FAIL("mktempdir");
+    }
+    /* Two real directories whose paths are long enough that two rendered job
+     * entries exceed the 2 KB response buffer. */
+    /* Four slots x ~520 chars overflows the 2 KB buffer while every path stays
+     * well inside PATH_MAX — a single pair of ~1 KB paths would reach the
+     * buffer too, but mkdir refuses them once the temp-dir prefix is added. */
+    char comp[200];
+    memset(comp, 'd', sizeof(comp) - 1);
+    comp[sizeof(comp) - 1] = '\0';
+    char deep[MAX_TEST_INDEX_JOBS][800];
+    for (int j = 0; j < MAX_TEST_INDEX_JOBS; j++) {
+        int n = snprintf(deep[j], sizeof(deep[j]), "%s/%d", base, j);
+        while (n < 520) {
+            n += snprintf(deep[j] + n, sizeof(deep[j]) - (size_t)n, "/%s", comp);
+        }
+        th_mkdir_p(deep[j]);
+    }
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* The blocking executor holds every job open so all four slots are
+         * occupied at once. With the non-blocking stub each job finishes
+         * immediately and handle_index_start recycles the same slot, leaving a
+         * single entry to render — far short of the buffer. */
+        th_ui_blocking_index_executor_t executor = {0};
+        atomic_init(&executor.calls, 0);
+        atomic_init(&executor.release, 0);
+        th_server_t ts;
+        ts.srv = cbm_http_server_new(0);
+        if (!ts.srv) {
+            _exit(2);
+        }
+        cbm_http_server_set_index_executor(ts.srv, th_ui_blocking_index_executor, &executor);
+        if (th_server_thread_start(&ts.tid, ts.srv) != 0) {
+            _exit(2);
+        }
+        int port = cbm_http_server_port(ts.srv);
+        for (int j = 0; j < MAX_TEST_INDEX_JOBS; j++) {
+            char body[1200];
+            snprintf(body, sizeof(body), "{\"root_path\":\"%s\",\"project_name\":\"p%d\"}", deep[j],
+                     j);
+            char request[1500];
+            snprintf(request, sizeof(request),
+                     "POST /api/index HTTP/1.1\r\nContent-Type: application/json\r\n"
+                     "Content-Length: %zu\r\n\r\n%s",
+                     strlen(body), body);
+            char response[4096];
+            int rn = th_http(port, request, response, sizeof(response));
+            /* A rejected POST would leave the slot empty and the endpoint would
+             * render nothing — a vacuous pass. Fail loudly instead. */
+            if (rn <= 0 || th_status(response) != 202) {
+                _exit(4);
+            }
+        }
+        /* Wait for the state the assertion depends on — all four jobs actually
+         * running — rather than for a duration. */
+        if (!th_wait_atomic_int(&executor.calls, MAX_TEST_INDEX_JOBS, 5000)) {
+            atomic_store(&executor.release, 1);
+            _exit(5);
+        }
+        char req[256];
+        snprintf(req, sizeof(req), "GET /api/index-status HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n",
+                 port);
+        char resp[8192];
+        int n = th_http(port, req, resp, sizeof(resp));
+        int ok = (n > 0 && strstr(resp, "HTTP/1.1 200") != NULL);
+        atomic_store(&executor.release, 1);
+        th_server_stop(&ts);
+        _exit(ok ? 0 : 3);
+    }
+    ASSERT_TRUE(pid > 0);
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    th_cleanup(base);
+    if (WIFSIGNALED(status)) {
+        char m[96];
+        snprintf(m, sizeof(m), "index-status killed by signal %d — response buffer overflow",
+                 WTERMSIG(status));
+        FAIL(m);
+    }
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    PASS();
+#endif
+}
+
 /* ── Suite ────────────────────────────────────────────────────── */
 
 SUITE(httpd) {
     RUN_TEST(ui_server_browse_wide_dir_no_overflow);
+    RUN_TEST(ui_server_logs_escape_dense_no_overflow);
+    RUN_TEST(ui_server_index_status_long_paths_no_overflow);
     /* Parser / helpers */
     RUN_TEST(httpd_parse_simple_get);
     RUN_TEST(httpd_parse_security_headers_and_rejects_duplicates);
@@ -2061,12 +2287,13 @@ SUITE(httpd) {
     RUN_TEST(httpd_close_refuses_while_connection_owns_listener);
 
     /* Full UI server */
+    RUN_TEST(ui_server_readiness_proof_is_exact_and_generation_bound);
     RUN_TEST(ui_server_rejects_non_loopback_host);
     RUN_TEST(ui_server_unknown_path_404);
     RUN_TEST(ui_server_process_kill_route_is_unavailable);
     RUN_TEST(ui_server_routes_indexing_through_joinable_daemon_executor);
     RUN_TEST(ui_server_free_never_joins_active_index_worker);
-    RUN_TEST(ui_server_root_serves_stub_404);
+    RUN_TEST(ui_server_root_without_embedded_assets_is_not_found);
     RUN_TEST(ui_server_same_origin_request_is_allowed);
     RUN_TEST(ui_server_rejects_foreign_and_null_origins);
     RUN_TEST(ui_server_mutations_require_json_content_type);

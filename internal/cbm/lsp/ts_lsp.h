@@ -40,6 +40,10 @@ typedef struct {
 
     // Output: resolved calls accumulate here.
     CBMResolvedCallArray *resolved_calls;
+    // Optional raw usages owned by the per-file extraction result. The scope
+    // pass marks occurrence-exact module/import shadows without emitting a
+    // semantic reference record for them.
+    CBMUsageArray *usages;
 
     // Type-parameter scope (innermost generic function/class).
     // type_param_constraints may be NULL or shorter — entries default to "any".
@@ -51,16 +55,28 @@ typedef struct {
     bool js_mode;
     bool jsx_mode;
     bool dts_mode;
+    bool cross_file_mode; // project-wide registry is available for exact reference proof
     bool strict; // tsconfig "strict": true → fewer implicit-any fallbacks
     bool debug;  // CBM_LSP_DEBUG env
 
     // Recursion guard for ts_eval_expr_type (mirrors c_lsp).
     int eval_depth;
+    // Expression-type memo: node.id -> evaluated type (lazily created on the
+    // first completed eval; see TsEvalMemo in ts_lsp.c). Kills the exponential
+    // re-evaluation of shared subexpressions under overload resolution.
+    struct TsEvalMemo *eval_memo;
     // Recursion guard for lookup_member_type: cyclic type graphs (mutually
     // recursive unions/wrappers across registered types) otherwise recurse
     // without bound — stack overflow on real repos.
     int member_depth;
 } TSLSPContext;
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+// Complexity-regression seam: remaining expression-eval budget / warned flag
+// for the calling thread, valid after a cbm_run_ts_lsp on the same thread.
+long cbm_ts_lsp_test_budget_remaining(void);
+bool cbm_ts_lsp_test_budget_warned(void);
+#endif
 
 // --- Initialization ---
 

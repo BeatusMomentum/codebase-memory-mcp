@@ -29,12 +29,15 @@
 /* pipeline.h no longer needed — indexing runs as subprocess */
 #include "foundation/log.h"
 #include "foundation/platform.h"
+#include "foundation/secure_random.h"
+#include "foundation/sha256.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/str_util.h"
 #include "foundation/compat_thread.h"
 #include "foundation/subprocess.h" /* cbm_build_win_cmdline — shared MS-CRT arg quoting */
 #include "foundation/win_utf8.h"   /* cbm_utf8_to_wide — CreateProcessW wide cmdline (#423/#20) */
+#include "foundation/workspace.h"
 
 #include <sqlite3/sqlite3.h>
 #include <yyjson/yyjson.h>
@@ -179,6 +182,8 @@ struct cbm_http_server {
     atomic_int run_state;
     int port;
     bool listener_ok;
+    uint8_t readiness_secret[CBM_SHA256_DIGEST_LEN];
+    bool readiness_secret_set;
 };
 
 /* ── Serve embedded asset ─────────────────────────────────────── */
@@ -205,7 +210,8 @@ static bool serve_embedded(cbm_http_conn_t *c, const char *path) {
     char hdrs[1024];
     snprintf(hdrs, sizeof(hdrs),
              "%sContent-Type: %s\r\n"
-             "Cache-Control: public, max-age=31536000, immutable\r\n" CBM_UI_CSP,
+             "Cache-Control: public, max-age=31536000, immutable\r\n"
+             "X-Content-Type-Options: nosniff\r\n" CBM_UI_CSP,
              g_cors, f->content_type);
 
     cbm_http_reply_buf(c, 200, hdrs, f->data, (size_t)f->size);
@@ -482,8 +488,18 @@ static void handle_logs(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     int start = (g_log_head - count + LOG_RING_SIZE) % LOG_RING_SIZE;
     int total = g_log_count;
 
-    /* Copy lines under lock */
-    size_t buf_size = (size_t)count * (LOG_LINE_MAX + 10) + 64;
+    /* Copy lines under lock.
+     *
+     * JSON escaping expands '"', '\\' and '\n' to two bytes each, so an
+     * line made mostly of those serialises to roughly twice its stored length.
+     * The previous budget of LOG_LINE_MAX + 10 per line under-counted that by
+     * half. Ring contents come from indexer stderr, which is not escaped on
+     * ingest and can legitimately contain both doubling characters — a POSIX
+     * filename may.
+     *
+     * Budget the escaped worst case, and clamp the framing writes below anyway
+     * so the size calculation is not the only thing keeping pos in range. */
+    size_t buf_size = (size_t)count * (2 * LOG_LINE_MAX + 8) + 64;
     char *buf = malloc(buf_size);
     if (!buf) {
         cbm_mutex_unlock(&g_log_mutex);
@@ -496,9 +512,9 @@ static void handle_logs(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     for (int i = 0; i < count; i++) {
         int idx = (start + i) % LOG_RING_SIZE;
         if (i > 0)
-            buf[pos++] = ',';
+            http_appendf(buf, buf_size, &pos, ",");
         /* Escape quotes in log lines */
-        buf[pos++] = '"';
+        http_appendf(buf, buf_size, &pos, "\"");
         for (int j = 0; g_log_ring[idx][j] && (size_t)pos < buf_size - 10; j++) {
             char ch = g_log_ring[idx][j];
             if (ch == '"') {
@@ -514,10 +530,18 @@ static void handle_logs(cbm_http_conn_t *c, const cbm_http_req_t *req) {
                 buf[pos++] = ch;
             }
         }
-        buf[pos++] = '"';
+        http_appendf(buf, buf_size, &pos, "\"");
     }
     cbm_mutex_unlock(&g_log_mutex);
     http_appendf(buf, buf_size, &pos, "],\"total\":%d}", total);
+
+    /* http_appendf pins pos to buf_size on truncation and then writes nothing,
+     * so a saturated buffer would reach the "%s" reply with no terminator in
+     * range. Terminate explicitly. */
+    if ((size_t)pos >= buf_size) {
+        pos = (int)buf_size - 1;
+    }
+    buf[pos] = '\0';
 
     cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
     free(buf);
@@ -627,7 +651,9 @@ static void append_roots_json(char *buf, size_t bufsz, int *pos) {
             continue;
         }
         if (count++ > 0) {
-            buf[(*pos)++] = ',';
+            /* Once a wide listing saturates buf, http_appendf has already
+             * pinned *pos to bufsz, so this separator goes through it too. */
+            http_appendf(buf, bufsz, pos, ",");
         }
         http_appendf(buf, bufsz, pos, "\"%c:/\"", 'A' + i);
     }
@@ -915,15 +941,7 @@ static bool resolve_self_executable(char *out, size_t outsz) {
 }
 #else
 static bool resolve_self_executable(char *out, size_t outsz) {
-    /* GetModuleFileNameA renders the module path through the ANSI code page,
-     * which mangles non-ASCII install paths (café_日本語 -> caf?_???). Resolve
-     * wide and convert to UTF-8 so the returned path survives verbatim. */
-    wchar_t wbuf[1024];
-    DWORD n = GetModuleFileNameW(NULL, wbuf, (DWORD)(sizeof(wbuf) / sizeof(wbuf[0])));
-    if (n == 0 || n >= sizeof(wbuf) / sizeof(wbuf[0])) {
-        return false;
-    }
-    char *utf8 = cbm_wide_to_utf8(wbuf);
+    char *utf8 = cbm_module_path_utf8();
     if (!utf8) {
         return false;
     }
@@ -1032,6 +1050,28 @@ static void handle_index_start(cbm_http_server_t *server, cbm_http_conn_t *c,
         return;
     }
 
+    /* Same workspace boundary the MCP indexing tool applies, through the same
+     * function. This route used to check only that the path was a directory, so
+     * it accepted roots the MCP path refused — an operator's boundary held on one
+     * entry point and not the other. Canonicalize first: the policy is defined
+     * over resolved paths, and a symlink would otherwise launder the verdict. */
+    char canonical_root[4096];
+    char boundary_err[1024];
+    if (!cbm_canonical_path(rpath, canonical_root, sizeof(canonical_root))) {
+        yyjson_doc_free(doc);
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"cannot resolve root_path\"}");
+        return;
+    }
+    if (!cbm_workspace_root_allowed(canonical_root, cbm_workspace_home_dir(),
+                                    cbm_workspace_cache_dir(), getenv("CBM_ALLOWED_ROOT"),
+                                    boundary_err, sizeof(boundary_err))) {
+        yyjson_doc_free(doc);
+        char escaped[1024];
+        cbm_json_escape(escaped, (int)sizeof(escaped), boundary_err);
+        cbm_http_replyf(c, 403, g_cors_json, "{\"error\":\"%s\"}", escaped);
+        return;
+    }
+
     /* Find free job slot */
     int slot = -1;
     for (int i = 0; i < MAX_INDEX_JOBS; i++) {
@@ -1089,14 +1129,28 @@ static void handle_index_status(cbm_http_server_t *server, cbm_http_conn_t *c) {
         if (st == 0)
             continue;
         if (pos > 1)
-            buf[pos++] = ',';
+            http_appendf(buf, sizeof(buf), &pos, ",");
         const char *ss = st == 1 ? "indexing" : st == 2 ? "done" : "error";
+        /* root_path comes from POST /api/index and is up to 1023 bytes, so four
+         * occupied slots exceed this buffer. http_appendf pins pos to
+         * sizeof(buf) on truncation, so the separator and the close have to go
+         * through it as well rather than indexing raw. Both fields are free-form,
+         * so escape them — a quote in a path would otherwise end its JSON string
+         * early. */
+        /* Escaping can double each byte: root_path is 1024, error_msg 256. */
+        char esc_path[2048];
+        char esc_error[512];
+        cbm_json_escape(esc_path, (int)sizeof(esc_path), server->index_jobs[i].root_path);
+        cbm_json_escape(esc_error, (int)sizeof(esc_error),
+                        st == 3 ? server->index_jobs[i].error_msg : "");
         http_appendf(buf, sizeof(buf), &pos,
                      "{\"slot\":%d,\"status\":\"%s\",\"path\":\"%s\",\"error\":\"%s\"}", i, ss,
-                     server->index_jobs[i].root_path,
-                     st == 3 ? server->index_jobs[i].error_msg : "");
+                     esc_path, esc_error);
     }
-    buf[pos++] = ']';
+    http_appendf(buf, sizeof(buf), &pos, "]");
+    if ((size_t)pos >= sizeof(buf)) {
+        pos = (int)sizeof(buf) - 1;
+    }
     buf[pos] = '\0';
     cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
 }
@@ -1659,6 +1713,77 @@ static bool content_type_is_json(const char *content_type) {
     return *suffix == '\0' || *suffix == ';';
 }
 
+static int readiness_hex_nibble(char value) {
+    if (value >= '0' && value <= '9') {
+        return value - '0';
+    }
+    if (value >= 'a' && value <= 'f') {
+        return value - 'a' + 10;
+    }
+    return -1;
+}
+
+static bool readiness_hex_decode(const char *hex, uint8_t out[CBM_SHA256_DIGEST_LEN]) {
+    if (!hex || strlen(hex) != CBM_SHA256_HEX_LEN) {
+        return false;
+    }
+    for (size_t i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        int high = readiness_hex_nibble(hex[i * 2U]);
+        int low = readiness_hex_nibble(hex[i * 2U + 1U]);
+        if (high < 0 || low < 0) {
+            return false;
+        }
+        out[i] = (uint8_t)((high << 4) | low);
+    }
+    return true;
+}
+
+static void readiness_hex_encode(const uint8_t bytes[CBM_SHA256_DIGEST_LEN],
+                                 char out[CBM_SHA256_HEX_LEN + 1U]) {
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2U] = hex[bytes[i] >> 4];
+        out[i * 2U + 1U] = hex[bytes[i] & 0x0fU];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+}
+
+static void handle_ui_readiness(cbm_http_server_t *srv, cbm_http_conn_t *c,
+                                const cbm_http_req_t *req) {
+    if (!srv->readiness_secret_set) {
+        cbm_http_replyf(c, 503, "Cache-Control: no-store\r\n", "%s", "readiness proof unavailable");
+        return;
+    }
+    char challenge_hex[CBM_SHA256_HEX_LEN + 1U];
+    uint8_t challenge[CBM_SHA256_DIGEST_LEN];
+    static const char prefix[] = "challenge=";
+    if (strncmp(req->query, prefix, sizeof(prefix) - 1U) != 0 ||
+        strlen(req->query) != sizeof(prefix) - 1U + CBM_SHA256_HEX_LEN) {
+        cbm_http_replyf(c, 400, "Cache-Control: no-store\r\n", "%s", "invalid challenge");
+        return;
+    }
+    memcpy(challenge_hex, req->query + sizeof(prefix) - 1U, CBM_SHA256_HEX_LEN);
+    challenge_hex[CBM_SHA256_HEX_LEN] = '\0';
+    if (!readiness_hex_decode(challenge_hex, challenge)) {
+        cbm_secure_zero(challenge, sizeof(challenge));
+        cbm_http_replyf(c, 400, "Cache-Control: no-store\r\n", "%s", "invalid challenge");
+        return;
+    }
+    uint8_t proof[CBM_SHA256_DIGEST_LEN];
+    char proof_hex[CBM_SHA256_HEX_LEN + 1U];
+    cbm_hmac_sha256(srv->readiness_secret, sizeof(srv->readiness_secret), challenge,
+                    sizeof(challenge), proof);
+    readiness_hex_encode(proof, proof_hex);
+    cbm_http_replyf(c, 200,
+                    "Content-Type: text/plain; charset=utf-8\r\n"
+                    "Cache-Control: no-store\r\n"
+                    "X-Content-Type-Options: nosniff\r\n",
+                    "%s", proof_hex);
+    cbm_secure_zero(challenge, sizeof(challenge));
+    cbm_secure_zero(proof, sizeof(proof));
+    cbm_secure_zero(proof_hex, sizeof(proof_hex));
+}
+
 static bool request_passes_http_security(cbm_http_server_t *srv, cbm_http_conn_t *c,
                                          const cbm_http_req_t *req) {
     if (req->http_minor == 1 && req->host[0] == '\0') {
@@ -1696,6 +1821,14 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
     /* OPTIONS preflight for CORS */
     if (strcmp(req->method, "OPTIONS") == 0) {
         cbm_http_replyf(c, 204, g_cors, "%s", "");
+        return;
+    }
+
+    /* Private-generation proof used only by `daemon start --open`. The
+     * challenge is public; the HMAC key exists only in this daemon's
+     * authenticated application and HTTP server instances. */
+    if (is_get && strcmp(req->path, "/__cbm/ui-readiness") == 0) {
+        handle_ui_readiness(srv, c, req);
         return;
     }
 
@@ -1783,7 +1916,9 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
         if (f) {
             char html_hdrs[1024];
             snprintf(html_hdrs, sizeof(html_hdrs),
-                     "%sContent-Type: text/html\r\nCache-Control: no-cache\r\n" CBM_UI_CSP, g_cors);
+                     "%sContent-Type: text/html; charset=utf-8\r\nCache-Control: no-cache\r\n"
+                     "X-Content-Type-Options: nosniff\r\n" CBM_UI_CSP,
+                     g_cors);
             cbm_http_reply_buf(c, 200, html_hdrs, f->data, (size_t)f->size);
             return;
         }
@@ -1791,7 +1926,7 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
         return;
     }
 
-    /* GET /assets/... → embedded assets, then generic embedded fallback */
+    /* GET /assets/... → exact lookup in the embedded asset table. */
     if (serve_embedded(c, req->path))
         return;
 
@@ -1870,6 +2005,7 @@ bool cbm_http_server_free(cbm_http_server_t *srv) {
     if (!cbm_httpd_close(srv->listener))
         return false;
     cbm_mcp_server_free(srv->mcp);
+    cbm_secure_zero(srv->readiness_secret, sizeof(srv->readiness_secret));
     free(srv);
     return true;
 }
@@ -1985,4 +2121,14 @@ void cbm_http_server_set_project_mutation_guard(cbm_http_server_t *srv,
     srv->mutation_context = begin ? context : NULL;
     cbm_mcp_server_set_project_mutation_guard(srv->mcp, begin, end, begin ? context : NULL);
     cbm_mcp_server_set_project_mutation_try_guard(srv->mcp, begin);
+}
+
+void cbm_http_server_set_readiness_secret(cbm_http_server_t *srv,
+                                          const uint8_t secret[CBM_SHA256_DIGEST_LEN]) {
+    if (!srv || !secret ||
+        atomic_load_explicit(&srv->run_state, memory_order_acquire) != HTTP_RUN_IDLE) {
+        return;
+    }
+    memcpy(srv->readiness_secret, secret, sizeof(srv->readiness_secret));
+    srv->readiness_secret_set = true;
 }

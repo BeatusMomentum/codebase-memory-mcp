@@ -295,6 +295,19 @@ bool cbm_is_test_file(const char *rel_path, CBMLanguage lang) {
     }
     const char *base = path_basename(rel_path);
 
+    /* Directory-based, language-agnostic: a file under a conventional test
+     * directory is a test file regardless of its own basename (e.g.
+     * tests/helpers/fixtures.c, which no per-language suffix/prefix rule
+     * below would otherwise catch). Mirrors the directory set cbm_is_test_path
+     * (src/pipeline/pass_tests.c) already uses for TESTS-edge detection, so
+     * the extraction-time is_test_file flag agrees with it (#1294). */
+    if (strstr(rel_path, "__tests__/") || strstr(rel_path, "/tests/") ||
+        strstr(rel_path, "/test/") || strstr(rel_path, "/spec/") ||
+        has_prefix(rel_path, "tests/") || has_prefix(rel_path, "test/") ||
+        has_prefix(rel_path, "spec/") || has_prefix(rel_path, "__tests__/")) {
+        return true;
+    }
+
     switch (lang) {
     case CBM_LANG_GO:
         return has_suffix(base, "_test.go");
@@ -458,6 +471,19 @@ bool cbm_kind_in_set(TSNode node, const char **types) {
         }
     }
     return kind_in_set_strcmp(node, (const char *const *)types);
+}
+
+bool cbm_is_namespace_scope_kind(CBMLanguage lang, const char *kind) {
+    if (!kind) {
+        return false;
+    }
+    if (lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA) {
+        return strcmp(kind, "namespace_definition") == 0;
+    }
+    if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
+        return strcmp(kind, "internal_module") == 0;
+    }
+    return false;
 }
 
 /* Free the calling thread's node-type bitset cache (the calloc'd `bits` arrays
@@ -1085,7 +1111,8 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
         const char *class_chain = NULL;
         for (TSNode cur = ts_node_parent(func_node); !ts_node_is_null(cur);
              cur = ts_node_parent(cur)) {
-            if (!cbm_kind_in_set(cur, spec->class_node_types)) {
+            if (!cbm_kind_in_set(cur, spec->class_node_types) &&
+                !cbm_is_namespace_scope_kind(lang, ts_node_type(cur))) {
                 continue;
             }
             TSNode class_name = ts_node_child_by_field_name(cur, TS_FIELD("name"));

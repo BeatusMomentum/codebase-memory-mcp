@@ -8,7 +8,8 @@
 #include "compat.h" /* cbm_nanosleep */
 #include "compat_fs.h"
 #include "log.h"
-#include "platform.h" /* cbm_now_ms */
+#include "platform.h"  /* cbm_now_ms */
+#include "sanitized.h" /* CBM_SANITIZED — spawn-retry budget */
 
 #include <stdio.h>
 #include <stdatomic.h>
@@ -24,6 +25,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#ifdef __APPLE__
+#include <spawn.h>
+extern char **environ;
+#endif
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -730,7 +735,8 @@ static int cbm_subprocess_spawn_win(cbm_subprocess_t *process) {
 
     PROCESS_INFORMATION child;
     ZeroMemory(&child, sizeof(child));
-    DWORD flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP;
+    DWORD flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP |
+                  CREATE_NO_WINDOW;
     BOOL created = CreateProcessW(wbin, wcmdline, NULL, NULL, TRUE, flags, NULL, NULL,
                                   &startup.StartupInfo, &child);
     cbm_win_close_spawn_handles(nul, log, attrs, attrs_init);
@@ -877,6 +883,129 @@ static cbm_proc_poll_t cbm_subprocess_poll_win(cbm_subprocess_t *process, cbm_pr
 
 #else /* POSIX */
 
+/* Transient spawn-failure retry (see the EAGAIN note in cbm_posix_spawn_apple):
+ * long enough to ride out a burst of process creation, short enough that a
+ * genuinely exhausted system still fails fast. The budget below is the single
+ * source of truth for both — see cbm_spawn_backoff for the resulting waits.
+ *
+ * A sanitized build needs a wider window than an ordinary one, and only a
+ * sanitized one does.
+ *
+ * The exponential backoff (10/20/40/80/160/320ms, ~0.6s) fixed the ordinary
+ * case. `subprocess_run_spawn_failure` then kept failing on `test-tsan` — twice
+ * on one SHA, on a PR whose diff was a shell contract and a line in test.sh, so
+ * causation was impossible. ThreadSanitizer runs several times slower and holds
+ * far more process state, so the pressure window it creates is simply longer
+ * than 0.6s.
+ *
+ * Raising the budget for everyone would be the wrong fix: an unsanitized
+ * machine that is genuinely out of capacity should still fail fast rather than
+ * hang for seconds. So the extra patience is scoped to the builds that need it,
+ * the same way the daemon announce backstop is (test_daemon_frontend.c). Three
+ * more doublings take the sanitized ceiling to roughly 5s. */
+#if CBM_SANITIZED
+enum { CBM_SPAWN_RETRY = 2, CBM_SPAWN_RETRY_ATTEMPTS = 9 };
+#else
+enum { CBM_SPAWN_RETRY = 2, CBM_SPAWN_RETRY_ATTEMPTS = 6 };
+#endif
+
+/* Exponential backoff, doubling from 10ms: 10, 20, 40, 80, 160, 320 — ~630ms of
+ * total patience on an ordinary build, and three further doublings (640, 1280,
+ * 2560) to roughly 5s on a sanitized one. The waits follow from
+ * CBM_SPAWN_RETRY_ATTEMPTS above and from the per-wait ceiling at
+ * cbm_spawn_backoff, rather than being listed separately here, so changing the
+ * budget cannot leave this description behind.
+ *
+ * The first version waited a flat 3 x 10ms, which was enough for a momentary
+ * dip and NOT enough for the real thing: a CI runner building and testing in
+ * parallel stays process-starved for hundreds of milliseconds at a stretch, and
+ * `subprocess_run_spawn_failure` kept failing with the retry shipped (macos-15-
+ * intel on a release matrix, macos-14 under ThreadSanitizer, which is itself
+ * slow enough to create the pressure). A fixed short delay samples the same
+ * congested instant repeatedly; doubling walks out of it.
+ *
+ * The ceiling is deliberate. ~0.6s is invisible next to spawning a process that
+ * does real work, and a machine still refusing after that is genuinely out of
+ * capacity — at which point failing IS the correct answer, and failing fast
+ * beats hanging. The sanitized ceiling is ~5s for the same reason in reverse:
+ * under instrumentation the starved window really does last that long, and only
+ * a build that already accepts a large slowdown pays for the extra wait. */
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Deterministic EAGAIN injection: see the header. Counts DOWN, so a test asks
+ * for N simulated refusals and the (N+1)th attempt proceeds for real. */
+static int g_force_spawn_eagain = 0;
+void cbm_subprocess_force_spawn_eagain_for_testing(int attempts) {
+    g_force_spawn_eagain = attempts > 0 ? attempts : 0;
+}
+int cbm_subprocess_pending_spawn_eagain_for_testing(void) {
+    return g_force_spawn_eagain;
+}
+static bool cbm_spawn_eagain_injected(void) {
+    if (g_force_spawn_eagain > 0) {
+        g_force_spawn_eagain--;
+        return true;
+    }
+    return false;
+}
+#endif
+
+/* The bound is on a single WAIT, and 2560ms (10ms << 8) is the largest wait
+ * either budget produces today: 10..320 on an ordinary build, 10..2560 on a
+ * sanitized one. So this changes nothing now — it changes what happens next.
+ *
+ * The clamp it replaces bounded `attempt` by CBM_SPAWN_RETRY_ATTEMPTS, which no
+ * caller can reach: both retry loops return before passing the budget, so the
+ * clamp never fired and the comment claiming "the budget is the only bound
+ * needed" described a bound that did not exist. Doubling with nothing to stop
+ * it is the actual risk, and it grows fast — a budget of 12 would make the last
+ * wait ~20s and the total ~41s, which is precisely the "hang instead of fail
+ * fast" the retry was written to avoid. Flattening at the ceiling keeps a
+ * budget increase linear.
+ *
+ * Spelled as a shift so the value cannot overflow `long` on the way to being
+ * clamped. */
+enum { CBM_SPAWN_BACKOFF_BASE_MS = 10, CBM_SPAWN_BACKOFF_MAX_SHIFT = 8 };
+
+static void cbm_spawn_backoff(int attempt) {
+    int shift = attempt < CBM_SPAWN_BACKOFF_MAX_SHIFT ? attempt : CBM_SPAWN_BACKOFF_MAX_SHIFT;
+    long ms = (long)CBM_SPAWN_BACKOFF_BASE_MS << shift;
+    struct timespec delay = {ms / 1000L, (ms % 1000L) * 1000L * 1000L};
+    (void)cbm_nanosleep(&delay, NULL);
+}
+
+/* fork() fails with EAGAIN under the same pressure posix_spawn does, and the
+ * fallback path must not be less robust than the primary one. */
+static pid_t cbm_fork_with_retry(void) {
+    /* CBM_SPAWN_RETRY_ATTEMPTS backoffs means ATTEMPTS+1 tries. Every try goes
+     * through the same branch — including the last — so the injection seam
+     * models production exactly rather than leaving a final unguarded fork() the
+     * tests could never reach. */
+    for (int attempt = 0;; attempt++) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+        if (cbm_spawn_eagain_injected()) {
+            if (attempt >= CBM_SPAWN_RETRY_ATTEMPTS) {
+                errno = EAGAIN;
+                return -1;
+            }
+            cbm_spawn_backoff(attempt);
+            continue;
+        }
+#endif
+        pid_t pid = fork();
+        if (pid >= 0 || (errno != EAGAIN && errno != ENOMEM)) {
+            return pid;
+        }
+        if (attempt >= CBM_SPAWN_RETRY_ATTEMPTS) {
+            errno = EAGAIN;
+            return -1;
+        }
+        cbm_spawn_backoff(attempt);
+    }
+}
+
+/* Used by the fork+exec child. posix_spawn performs the same reset
+ * declaratively via SETSIGDEF + SETSIGMASK, but Apple still forks for the
+ * exec-failure fallback below, so this stays compiled everywhere. */
 static void cbm_posix_reset_child_signals(void) {
     struct sigaction action = {0};
     action.sa_handler = SIG_DFL;
@@ -891,6 +1020,9 @@ static void cbm_posix_reset_child_signals(void) {
     (void)sigprocmask(SIG_SETMASK, &empty, NULL);
 }
 
+/* fork+exec child setup. On Apple this runs ONLY for the exec-failure
+ * fallback (see cbm_posix_spawn_apple), which preserves the documented
+ * "bogus binary => child exits 127" contract across platforms. */
 static void cbm_posix_child_exec(cbm_subprocess_t *process, int input, int output, long max_fd) {
     if (setpgid(0, 0) < 0) {
         _exit(127);
@@ -935,6 +1067,90 @@ static int cbm_posix_fd_at_least_three(int fd) {
     return duplicate;
 }
 
+#ifdef __APPLE__
+/* macOS: spawn instead of fork+exec.
+ *
+ * fork() duplicates the parent's whole address space bookkeeping, and an
+ * ASan-instrumented parent carries an enormous shadow mapping. Past a
+ * footprint threshold the child is killed (jetsam) BEFORE exec replaces the
+ * image, so the call fails with the child already gone (ESRCH on reap) — a
+ * spawn failure that looks like the launched tool crashing. The test suite hit
+ * exactly this: `git init` inside a fixture failed once enough suites had run
+ * ahead of it, and the symptom was an unrelated-looking assertion. The same
+ * hazard is already documented in tests/test_daemon_runtime.c, which switched
+ * to posix_spawn for the same reason.
+ *
+ * posix_spawn never copies the parent address space, so the footprint is
+ * irrelevant. Every guarantee of the fork path is preserved:
+ *   - own process group (SETPGROUP + setpgroup(0)) — the kill-tree contract
+ *   - default signal dispositions and an empty mask (SETSIGDEF/SETSIGMASK)
+ *   - stdin/stdout/stderr wired to the caller's fds (adddup2)
+ *   - every OTHER descriptor closed: CLOEXEC_DEFAULT is Apple's equivalent of
+ *     the child's close-everything loop, and the three dup2'd fds stay open
+ *     because dup2 clears close-on-exec.
+ * posix_spawnp keeps execvp's PATH semantics for a bare tool name. */
+static int cbm_posix_spawn_apple(cbm_subprocess_t *process, int input, int output, pid_t *pid_out) {
+    /* posix_spawn is the PRIMARY path on macOS; fork+exec is only the
+     * exec-class fallback. Injection therefore has to live here too, or a test
+     * on macOS exercises nothing. */
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (cbm_spawn_eagain_injected()) {
+        return CBM_SPAWN_RETRY;
+    }
+#endif
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attr;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        return -1;
+    }
+    if (posix_spawnattr_init(&attr) != 0) {
+        (void)posix_spawn_file_actions_destroy(&actions);
+        return -1;
+    }
+    sigset_t empty_mask;
+    sigset_t all_signals;
+    sigemptyset(&empty_mask);
+    sigfillset(&all_signals);
+    short flags = (short)(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK |
+                          POSIX_SPAWN_CLOEXEC_DEFAULT);
+    bool configured = posix_spawnattr_setflags(&attr, flags) == 0 &&
+                      posix_spawnattr_setpgroup(&attr, 0) == 0 &&
+                      posix_spawnattr_setsigmask(&attr, &empty_mask) == 0 &&
+                      posix_spawnattr_setsigdefault(&attr, &all_signals) == 0 &&
+                      posix_spawn_file_actions_adddup2(&actions, input, STDIN_FILENO) == 0 &&
+                      posix_spawn_file_actions_adddup2(&actions, output, STDOUT_FILENO) == 0 &&
+                      posix_spawn_file_actions_adddup2(&actions, output, STDERR_FILENO) == 0;
+    pid_t pid = -1;
+    int rc =
+        configured ? posix_spawnp(&pid, process->bin, &actions, &attr, process->argv, environ) : -1;
+    (void)posix_spawn_file_actions_destroy(&actions);
+    (void)posix_spawnattr_destroy(&attr);
+    if (configured && rc == 0 && pid > 0) {
+        *pid_out = pid;
+        return 0;
+    }
+    /* posix_spawn reports an unusable binary itself, where fork+exec instead
+     * produces a child that exits 127. Callers (and tests) rely on the latter:
+     * "spawn_failed" means the SPAWN mechanism failed, not that the tool was
+     * missing. Fall back to fork+exec for exec-class errors so macOS and Linux
+     * classify a bogus binary identically; the ASan-fork hazard does not apply
+     * here, since this child exits immediately. */
+    if (configured && (rc == ENOENT || rc == EACCES || rc == ENOEXEC || rc == EISDIR ||
+                       rc == ELOOP || rc == ENAMETOOLONG || rc == ENOTDIR)) {
+        return 1;
+    }
+    /* EAGAIN/ENOMEM are the kernel saying "not right now", not "never": the
+     * process table or a per-user limit is momentarily full. Reporting
+     * spawn_failed for that turns transient load into a user-visible error —
+     * a git or LSP probe failing on a busy laptop for no reason the user can
+     * see or act on. Retry briefly. Everything else stays a hard failure. */
+    if (configured && (rc == EAGAIN || rc == ENOMEM)) {
+        return CBM_SPAWN_RETRY;
+    }
+    return -1;
+}
+#endif
+
 static int cbm_subprocess_spawn_posix(cbm_subprocess_t *process) {
     int input_flags = O_RDONLY;
 #ifdef O_CLOEXEC
@@ -977,7 +1193,35 @@ static int cbm_subprocess_spawn_posix(cbm_subprocess_t *process) {
         max_fd = 65536L;
     }
 
-    pid_t pid = fork();
+    pid_t pid = -1;
+#ifdef __APPLE__
+    int spawn_rc = cbm_posix_spawn_apple(process, input, output, &pid);
+    for (int attempt = 0; spawn_rc == CBM_SPAWN_RETRY && attempt < CBM_SPAWN_RETRY_ATTEMPTS;
+         attempt++) {
+        cbm_spawn_backoff(attempt);
+        spawn_rc = cbm_posix_spawn_apple(process, input, output, &pid);
+    }
+    if (spawn_rc == CBM_SPAWN_RETRY) {
+        spawn_rc = -1; /* still exhausted after backoff: a real failure */
+    }
+    if (spawn_rc < 0) {
+        (void)close(input);
+        (void)close(output);
+        return -1;
+    }
+    if (spawn_rc > 0) { /* exec-class failure: reproduce the fork+exec 127 */
+        pid = cbm_fork_with_retry();
+        if (pid < 0) {
+            (void)close(input);
+            (void)close(output);
+            return -1;
+        }
+        if (pid == 0) {
+            cbm_posix_child_exec(process, input, output, max_fd);
+        }
+    }
+#else
+    pid = cbm_fork_with_retry();
     if (pid < 0) {
         (void)close(input);
         (void)close(output);
@@ -986,6 +1230,7 @@ static int cbm_subprocess_spawn_posix(cbm_subprocess_t *process) {
     if (pid == 0) {
         cbm_posix_child_exec(process, input, output, max_fd);
     }
+#endif
     (void)close(input);
     (void)close(output);
 

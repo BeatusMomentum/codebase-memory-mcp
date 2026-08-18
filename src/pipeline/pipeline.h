@@ -56,8 +56,16 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);
 
-/* Run the full indexing pipeline. Returns 0 on success, -1 on error.
- * Discovers files, extracts, resolves, and dumps to SQLite. */
+/* Run the full indexing pipeline. Discovers files, extracts, resolves, and
+ * dumps to SQLite. Returns 0 on success and non-zero on failure.
+ *
+ * Treating any non-zero as "the run failed" is always correct. Callers that
+ * need to know whether the PREVIOUS generation survived can distinguish the
+ * failures by value: the run publishes by renaming a fully validated staging
+ * database over the destination, so every abort before that rename leaves the
+ * existing database in place. Those codes (CBM_PIPELINE_ABORT_PRESERVE_DB and
+ * CBM_PIPELINE_PERSIST_FAILED) are defined in pipeline_internal.h alongside the
+ * stages that raise them. */
 int cbm_pipeline_run(cbm_pipeline_t *p);
 
 /* Request cancellation of a running pipeline (thread-safe). */
@@ -255,6 +263,14 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
  * Explicit drop-list keeps every lsp_* / import / same-module / qualified match.
  * Pure; unit-tested in test_registry.c. */
 bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const char *strategy);
+
+/* #725: drop a suffix_match CALLS edge when the caller language and the
+ * target file's language disagree. unique_name (candidates == 1) is #1572
+ * and is left alone; same_module / import_map / lsp_* are kept. JS/TS/TSX
+ * are one family so a .ts helper calling a .tsx function is not dropped.
+ * Pure; unit-tested in test_registry.c. */
+bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const char *target_file_path,
+                                              const char *strategy);
 
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);
