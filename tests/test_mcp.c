@@ -162,6 +162,21 @@ typedef struct {
     int merge_base_calls;
 } mcp_command_hook_probe_t;
 
+#ifdef _WIN32
+typedef struct {
+    cbm_mcp_server_t *server;
+    bool cancel_on_call;
+    bool cancel_accepted;
+    int calls;
+    char command[CBM_SZ_4K];
+} mcp_search_command_probe_t;
+
+typedef struct {
+    char path[512];
+    char *saved_cache;
+} mcp_search_cache_t;
+#endif
+
 static bool mcp_quarantine_hook_probe(void *context, const char *step) {
     mcp_quarantine_hook_probe_t *probe = context;
     if (!probe || !step) {
@@ -186,6 +201,45 @@ static bool mcp_command_hook_probe(void *context, const char *command) {
     probe->diff_calls++;
     return true;
 }
+
+#ifdef _WIN32
+static bool mcp_search_command_hook_probe(void *context, const char *command) {
+    mcp_search_command_probe_t *probe = context;
+    if (!probe || !command) {
+        return false;
+    }
+    probe->calls++;
+    snprintf(probe->command, sizeof(probe->command), "%s", command);
+    if (probe->cancel_on_call && probe->server) {
+        probe->cancel_accepted = cbm_mcp_server_cancel_active(probe->server);
+    }
+    return true;
+}
+
+static bool mcp_search_cache_open(mcp_search_cache_t *cache, const char *prefix) {
+    memset(cache, 0, sizeof(*cache));
+    snprintf(cache->path, sizeof(cache->path), "%s/%s-XXXXXX", cbm_tmpdir(), prefix);
+    if (!cbm_mkdtemp(cache->path)) {
+        return false;
+    }
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    cache->saved_cache = saved_cache ? strdup(saved_cache) : NULL;
+    if ((saved_cache && !cache->saved_cache) || cbm_setenv("CBM_CACHE_DIR", cache->path, 1) != 0) {
+        free(cache->saved_cache);
+        cache->saved_cache = NULL;
+        (void)th_rmtree(cache->path);
+        return false;
+    }
+    return true;
+}
+
+static bool mcp_search_cache_close(mcp_search_cache_t *cache) {
+    restore_cache_dir(cache->saved_cache);
+    free(cache->saved_cache);
+    cache->saved_cache = NULL;
+    return th_rmtree(cache->path) == 0;
+}
+#endif
 
 typedef struct {
     const char *name;
@@ -4915,6 +4969,84 @@ TEST(search_code_windows_prefilter_precedes_content_scan) {
     PASS();
 #else
     SKIP_PLATFORM("PowerShell prefilter runs on Windows");
+#endif
+}
+
+TEST(search_code_windows_cancel_cleans_supervised_scan) {
+#ifdef _WIN32
+    mcp_search_cache_t cache;
+    ASSERT_TRUE(mcp_search_cache_open(&cache, "cbm-search-cancel"));
+
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+    mcp_search_command_probe_t probe = {
+        .server = srv,
+        .cancel_on_call = true,
+    };
+    cbm_mcp_server_set_command_test_hook(srv, mcp_search_command_hook_probe, &probe);
+
+    char *response =
+        cbm_mcp_handle_tool(srv, "search_code",
+                            "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\","
+                            "\"file_pattern\":\"*.go\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_TRUE(probe.cancel_accepted);
+    ASSERT_NOT_NULL(strstr(response, "cancelled"));
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+
+    char logs[640];
+    snprintf(logs, sizeof(logs), "%s/logs", cache.path);
+    ASSERT_EQ(mcp_count_directory_entries_with_prefix(logs, ".mcp-command-"), 0);
+
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    ASSERT_TRUE(mcp_search_cache_close(&cache));
+    PASS();
+#else
+    SKIP_PLATFORM("supervised Select-String cancellation runs on Windows");
+#endif
+}
+
+TEST(search_code_windows_output_limit_fails_closed_and_cleans_scan) {
+#ifdef _WIN32
+    mcp_search_cache_t cache;
+    ASSERT_TRUE(mcp_search_cache_open(&cache, "cbm-search-limit"));
+
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_search_output_limit_for_test(srv, 512);
+
+    FILE *source = cbm_fopen(src_path, "ab");
+    ASSERT_NOT_NULL(source);
+    for (int i = 0; i < 256; i++) {
+        ASSERT_GT(fprintf(source, "func HandleRequest%d() error { return nil }\n", i), 0);
+    }
+    ASSERT_EQ(fclose(source), 0);
+
+    char *response =
+        cbm_mcp_handle_tool(srv, "search_code",
+                            "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\","
+                            "\"file_pattern\":\"*.go\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "output exceeded"));
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+
+    char logs[640];
+    snprintf(logs, sizeof(logs), "%s/logs", cache.path);
+    ASSERT_EQ(mcp_count_directory_entries_with_prefix(logs, ".mcp-command-"), 0);
+
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    ASSERT_TRUE(mcp_search_cache_close(&cache));
+    PASS();
+#else
+    SKIP_PLATFORM("supervised Select-String output limit runs on Windows");
 #endif
 }
 
@@ -11249,6 +11381,8 @@ SUITE(mcp) {
     RUN_TEST(search_code_path_filter_matches_nothing);
     RUN_TEST(search_code_file_pattern_prefilter_boundaries);
     RUN_TEST(search_code_windows_prefilter_precedes_content_scan);
+    RUN_TEST(search_code_windows_cancel_cleans_supervised_scan);
+    RUN_TEST(search_code_windows_output_limit_fails_closed_and_cleans_scan);
     RUN_TEST(search_code_windows_scan_pins_utf8_output);
     RUN_TEST(search_code_invalid_regex_errors_issue283);
     RUN_TEST(search_code_literal_pipe_warns_issue282);
