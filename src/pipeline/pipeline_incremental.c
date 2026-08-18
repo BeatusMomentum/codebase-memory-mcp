@@ -15,7 +15,6 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "pipeline/pipeline.h"
 #include <stdio.h>
 #include <time.h>
-#include "pipeline/artifact.h"
 #include "pipeline/lsp_surface.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "sqlite3.h"
@@ -1334,6 +1333,8 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                     cross_registries.c = cbm_c_build_cross_registry(xa, all_defs, all_def_count);
                     cross_registries.cs = cbm_cs_build_cross_registry(xa, all_defs, all_def_count);
                     cross_registries.ts = cbm_ts_build_cross_registry(xa, all_defs, all_def_count);
+                    cross_registries.java =
+                        cbm_java_build_cross_registry(xa, all_defs, all_def_count);
                     registries_arg = &cross_registries;
                 }
             } else {
@@ -1466,7 +1467,7 @@ static int run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_file
  * generation boundary as full indexing. */
 static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
                             atomic_int *cancelled, const cbm_file_hash_t *manifest,
-                            int manifest_count, const char *adr_content, const char *repo_path,
+                            int manifest_count, const char *adr_content,
                             const cbm_coverage_row_t *cov, int cov_count,
                             const cbm_coverage_meta_t *meta_template,
                             const cbm_lsp_surface_row_t *surface_rows, int surface_row_count) {
@@ -1491,11 +1492,6 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
                  itoa_buf((int)elapsed_ms(t)));
     if (rc != 0) {
         return rc;
-    }
-
-    /* Auto-update artifact if one already exists (persistence was enabled previously) */
-    if (repo_path && cbm_artifact_exists(repo_path)) {
-        cbm_artifact_export(db_path, repo_path, project, CBM_ARTIFACT_FAST);
     }
     return 0;
 }
@@ -2362,7 +2358,7 @@ out:
 
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
                                  int file_count, const cbm_file_hash_t *baseline_manifest,
-                                 int baseline_count) {
+                                 int baseline_count, bool force_full_on_mismatch) {
     struct timespec t0;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
     closure_plan_t closure_plan = {0};
@@ -2423,7 +2419,16 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
             incr_test_set_last_route(CBM_INCREMENTAL_ROUTE_NOOP);
 #endif
             cbm_log_info("incremental.noop", "reason", "semantic_manifest_equal");
-            return cbm_pipeline_refresh_artifact(p, db_path);
+            return 0;
+        }
+        if (force_full_on_mismatch) {
+            cbm_store_free_file_hashes(stored, stored_count);
+            cbm_store_close(store);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+            incr_test_set_last_route(CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+#endif
+            cbm_log_info("incremental.force_full", "reason", "mode_downgrade_changed");
+            return CBM_PIPELINE_FORCE_FULL_REINDEX;
         }
         /* Manifest delta. Closure repair recomputes exactly the changed
          * files plus the recorded consumers of any changed SURFACE; every
@@ -2848,9 +2853,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * re-parsed files have no codec output, and publishing a stale row
      * would satisfy a future closure plan with yesterday's surface; an
      * empty table just routes the next incremental to a full rebuild. */
-    int persist_rc = dump_and_persist(
-        existing, db_path, project, cbm_pipeline_cancelled_ptr(p), manifest, manifest_count,
-        saved_adr, cbm_pipeline_repo_path(p), cov, cov_n, &coverage_meta, NULL, 0);
+    int persist_rc =
+        dump_and_persist(existing, db_path, project, cbm_pipeline_cancelled_ptr(p), manifest,
+                         manifest_count, saved_adr, cov, cov_n, &coverage_meta, NULL, 0);
     cbm_pipeline_free_semantic_manifest(manifest, manifest_count);
     free(saved_adr);
     free(cov);

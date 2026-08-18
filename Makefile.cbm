@@ -505,6 +505,7 @@ TEST_FOUNDATION_SRCS = \
     tests/test_workspace.c \
     tests/test_platform.c \
     tests/test_diagnostics.c \
+    tests/test_complexity.c \
     tests/test_dump_verify.c \
     tests/test_subprocess.c \
     tests/test_private_file_lock.c \
@@ -712,9 +713,9 @@ BUILD_DIR = build/c
 # Grammar + tree-sitter runtime: compiled without -Werror (upstream code has warnings)
 GRAMMAR_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC)
 GRAMMAR_CFLAGS_TEST = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
-                      $(SANITIZED_DEFINE) $(SANITIZE)
+                      -DCBM_ENABLE_TEST_SEAMS=1 $(SANITIZED_DEFINE) $(SANITIZE)
 GRAMMAR_CFLAGS_TSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
-                      -DCBM_SANITIZED_BUILD=1 $(TSAN_SANITIZE)
+                      -DCBM_ENABLE_TEST_SEAMS=1 -DCBM_SANITIZED_BUILD=1 $(TSAN_SANITIZE)
 
 # Object files for grammars + ts_runtime + lsp_all + preprocessor
 GRAMMAR_OBJS_TEST = $(patsubst $(CBM_DIR)/%.c,$(BUILD_DIR)/%.o,$(GRAMMAR_SRCS))
@@ -728,7 +729,7 @@ PP_OBJ_TSAN = $(BUILD_DIR)/tsan_preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-par test-repro test-foundation test-tsan test-daemon-smoke cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
+.PHONY: test test-par test-repro test-foundation test-tsan test-daemon-smoke cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-tidy-diff lint-cppcheck lint-format security
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -1101,6 +1102,12 @@ LINT_TEST_SRCS = $(ALL_TEST_SRCS)
 lint-tidy:
 	@echo "=== clang-tidy ==="
 	@$(CLANG_TIDY) --quiet $(LINT_SRCS) -- $(CFLAGS_COMMON) $(SYSROOT_FLAG)
+
+# clang-tidy, scoped to this commit's staged changes only (scripts/lint-tidy-diff.sh).
+# The pre-commit hook runs this instead of the full lint-tidy sweep above, so a
+# clean commit is not blocked by pre-existing findings elsewhere in the tree.
+lint-tidy-diff:
+	@scripts/lint-tidy-diff.sh "$(CLANG_TIDY)" $(LINT_SRCS) -- $(CFLAGS_COMMON) $(SYSROOT_FLAG)
 
 # cppcheck: complementary analysis (config in .cppcheck)
 lint-cppcheck:

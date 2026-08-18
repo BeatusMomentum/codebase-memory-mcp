@@ -350,6 +350,7 @@ jobs:
           VT_EXPECTED_SCAN_SET: binaries/scan-set.tsv
           VT_ASSOCIATIONS: binaries/associations.tsv
           VT_RESULTS_PATH: binaries/vt-results.tsv
+          VT_WITHHELD: binaries/virustotal-withheld.tsv
           MIN_ENGINES: 50
         run: scripts/ci/check-virustotal.sh
 
@@ -362,6 +363,7 @@ jobs:
             binaries/associations.tsv
             binaries/scan-set.tsv
             binaries/vt-results.tsv
+            binaries/virustotal-withheld.tsv
           if-no-files-found: warn
 
       - name: Publish durable public VirusTotal evidence

@@ -89,6 +89,19 @@ int cbm_json_like_upsert_entry_if_unchanged(const char *file_path, const char *c
                                             const char *entry_json, const char *expected_content,
                                             size_t expected_length);
 
+/* Replace ONE member's value inside the entry object at object_path/entry_key,
+ * preserving every other byte of the document (comments, ordering, and any
+ * keys the client added around it). The field-merge primitive for repairing an
+ * annotated entry (#1630): replacing the whole entry would drop the client's
+ * keys. raw_value must be a single complete JSON value; the field must exist
+ * exactly once. Same expected-content contract as the _if_unchanged editors. */
+int cbm_json_like_replace_field_raw_if_unchanged(const char *file_path,
+                                                 const char *const *object_path, size_t path_len,
+                                                 const char *entry_key, const char *field_key,
+                                                 const char *raw_value,
+                                                 const char *expected_content,
+                                                 size_t expected_length);
+
 /* Remove entry_key from the object at object_path. A missing path or entry is
  * a successful no-op. Returns 0 on success and -1 on invalid input or I/O. */
 int cbm_json_like_remove_entry(const char *file_path, const char *const *object_path,
