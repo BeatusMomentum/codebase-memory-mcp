@@ -7914,7 +7914,12 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
              * SYSTEMIC nonzero exit (e.g. a bad arg) produces no recurring
              * suspect → the intersection is empty → give_up (correct). This
              * makes a single pathological file skip-and-continue instead of
-             * aborting the whole chunk. */
+             * aborting the whole chunk.
+             *
+             * Note: A deterministic first-file failure (e.g. worker crashing/exiting
+             * on the very first file every run) will progressively quarantine in-flight
+             * files until reaching the culprit. This is an existing property accepted
+             * by the crash/hang path, accepted here as a considered tradeoff. */
             const char *phase;
             if (last_outcome == CBM_PROC_HANG) {
                 phase = "hang";
