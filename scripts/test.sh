@@ -218,9 +218,6 @@ bash "$ROOT/tests/test_windows_bundle_contract.sh"
 echo "=== Step 0f: tree-sitter runtime Makefile dependencies ==="
 bash "$ROOT/tests/test_makefile_ts_runtime_dependencies.sh"
 
-echo "=== Step 0f2: nomic blob generator contract ==="
-bash "$ROOT/tests/test_nomic_blob_generator_contract.sh"
-
 echo "=== Step 0g: security fuzz harness self-test ==="
 bash "$ROOT/tests/test_security_fuzz_harness.sh"
 
@@ -265,6 +262,9 @@ bash "$ROOT/tests/test_runtime_isolation_contract.sh"
 
 echo "=== Step 0u: shell line-ending contract ==="
 bash "$ROOT/tests/test_shell_line_endings.sh"
+
+echo "=== Step 0v: nomic blob generator contract ==="
+bash "$ROOT/tests/test_nomic_blob_generator_contract.sh"
 
 # Verify compiler supports target arch
 verify_compiler "$CC"
