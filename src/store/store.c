@@ -65,7 +65,7 @@ enum {
     ST_PATH_PROP_LEN = 6,
     ST_HANDLER_PROP_LEN = 9,
     ST_BFS_CTE_ROW_MULTIPLIER = 8,
-    ST_BFS_MAX_CTE_ROWS = 65536,
+    ST_BFS_MAX_CTE_ROWS = 4096,
 };
 
 #define SLEN(s) (sizeof(s) - 1)
