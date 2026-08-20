@@ -472,6 +472,15 @@ TEST(java_enum_dedup_preserves_calls_issue1234) {
     ASSERT(has_def(r, "Enum", "Day"));
     ASSERT(has_def(r, "Method", "isWeekend"));
     ASSERT(has_def(r, "Method", "label"));
+    /* The enum CONSTANTS must survive alongside the methods. Reaching the
+     * methods means descending into enum_body_declarations, and the tempting
+     * way to do that -- redirecting the shared find_class_body -- also makes
+     * the constants unreachable, because they are siblings of that node rather
+     * than children. find_class_member_body exists to descend for members only
+     * and leave find_class_body (which extract_enum_members uses) alone; these
+     * two assertions are what stop that distinction being collapsed again. */
+    ASSERT(has_def(r, "Variable", "MON"));
+    ASSERT(has_def(r, "Variable", "SUN"));
     ASSERT(has_def(r, "Class", "DayUtil"));
     ASSERT(has_def(r, "Method", "describe"));
     ASSERT_EQ(count_defs_with_label(r, "Function"), 0);
