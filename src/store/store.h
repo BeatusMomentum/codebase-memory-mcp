@@ -211,6 +211,8 @@ typedef struct {
     int visited_count;
     cbm_edge_info_t *edges;
     int edge_count;
+    /* True when trail expansion hit its recursive-row safety budget. */
+    bool truncated;
 } cbm_traverse_result_t;
 
 /* ── Schema introspection ───────────────────────────────────────── */

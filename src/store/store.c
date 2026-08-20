@@ -65,7 +65,7 @@ enum {
     ST_PATH_PROP_LEN = 6,
     ST_HANDLER_PROP_LEN = 9,
     ST_BFS_CTE_ROW_MULTIPLIER = 8,
-    ST_BFS_MAX_CTE_ROWS = 4096,
+    ST_BFS_MAX_CTE_ROWS = 65536,
 };
 
 #define SLEN(s) (sizeof(s) - 1)
@@ -4688,6 +4688,20 @@ static int bfs_cte_row_limit(int max_results) {
     return (int)row_budget;
 }
 
+static int bfs_cte_row_limit_for_depth(int max_results, int max_depth) {
+    int base = bfs_cte_row_limit(max_results);
+    /* Reserve rows across the requested depth range.  A result-sized cap can
+     * be exhausted by a wide first hop before any deeper match is generated;
+     * scaling by depth keeps the bounded traversal useful for *N..N queries
+     * while the hard ceiling still protects the SQLite worker. */
+    long depth = max_depth > 0 ? max_depth : ST_INIT_CAP_16;
+    long scaled = (long)base * depth;
+    if (scaled > ST_BFS_MAX_CTE_ROWS) {
+        return ST_BFS_MAX_CTE_ROWS;
+    }
+    return (int)scaled;
+}
+
 static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
                      const char **edge_types, int edge_type_count, int max_depth, int max_results,
                      bool trail, cbm_traverse_result_t *out) {
@@ -4719,7 +4733,7 @@ static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
 
     int cte_row_limit = 0;
     if (trail) {
-        cte_row_limit = bfs_cte_row_limit(max_results);
+        cte_row_limit = bfs_cte_row_limit_for_depth(max_results, max_depth);
         snprintf(sql, sizeof(sql),
                  "WITH RECURSIVE bfs(node_id, hop, edge_path) AS ("
                  "  SELECT %lld, 0, ''"
@@ -4731,13 +4745,19 @@ static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
                  "  JOIN edges e ON %s"
                  "  WHERE e.type IN (%s) AND bfs.hop < %d"
                  "    AND instr(',' || bfs.edge_path || ',', ',' || e.id || ',') = 0"
+                 /* SQLite's recursive queue is breadth-first by default.  A
+                  * bounded trail budget must reach the requested depth before
+                  * a wide shallow layer consumes every row, so prioritize the
+                  * recursive hop (depth-first) while retaining deterministic
+                  * ordering in the outer result query. */
+                 "  ORDER BY 2 DESC"
                  "  LIMIT %d"
                  ")"
                  "SELECT DISTINCT n.id, n.project, n.label, n.name, n.qualified_name, "
                  "n.file_path, n.start_line, n.end_line, n.properties, bfs.hop, "
                  "(SELECT count(*) FROM bfs) "
                  "FROM bfs JOIN nodes n ON n.id = bfs.node_id "
-                 "WHERE bfs.hop > 0 ORDER BY bfs.hop LIMIT %d;",
+                 "WHERE bfs.hop > 0 ORDER BY bfs.hop, n.id LIMIT %d;",
                  (long long)start_id, next_id, join_cond, types_clause, max_depth,
                  cte_row_limit + SKIP_ONE, max_results);
     } else {
@@ -4810,6 +4830,7 @@ static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
     sqlite3_finalize(stmt);
 
     if (trail && cte_rows > cte_row_limit) {
+        out->truncated = true;
         char limit_buf[16];
         snprintf(limit_buf, sizeof(limit_buf), "%d", cte_row_limit);
         cbm_log_warn("cypher.trail_truncated", "cte_rows", limit_buf, "result", "partial");

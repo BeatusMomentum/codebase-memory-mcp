@@ -1040,8 +1040,8 @@ TEST(store_bfs_trail_warns_when_path_rows_are_truncated) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "test", "/tmp/test");
 
-    int64_t ids[14];
-    for (int i = 0; i < 14; i++) {
+    int64_t ids[18];
+    for (int i = 0; i < 18; i++) {
         char name[16];
         snprintf(name, sizeof(name), "node-%d", i);
         cbm_node_t node = {.project = "test",
@@ -1051,8 +1051,8 @@ TEST(store_bfs_trail_warns_when_path_rows_are_truncated) {
                            .file_path = "graph.c"};
         ids[i] = cbm_store_upsert_node(s, &node);
     }
-    for (int source = 0; source < 13; source++) {
-        for (int target = source + 1; target < 14; target++) {
+    for (int source = 0; source < 17; source++) {
+        for (int target = source + 1; target < 18; target++) {
             cbm_edge_t edge = {.project = "test",
                                .source_id = ids[source],
                                .target_id = ids[target],
@@ -1069,6 +1069,7 @@ TEST(store_bfs_trail_warns_when_path_rows_are_truncated) {
     cbm_log_set_sink(NULL);
 
     ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_TRUE(result.truncated);
     ASSERT_TRUE(strstr(trail_log, "cypher.trail_truncated") != NULL);
     ASSERT_TRUE(strstr(trail_log, "result=partial") != NULL);
 

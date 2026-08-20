@@ -1849,6 +1849,46 @@ TEST(cypher_exec_var_length_no_reuse_self_loop) {
     PASS();
 }
 
+TEST(cypher_exec_var_length_truncation_surfaces_warning) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    int64_t ids[18];
+    for (int i = 0; i < 18; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "node-%d", i);
+        cbm_node_t node = {.project = "test",
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = name,
+                           .file_path = "graph.c"};
+        ids[i] = cbm_store_upsert_node(s, &node);
+    }
+    for (int source = 0; source < 17; source++) {
+        for (int target = source + 1; target < 18; target++) {
+            cbm_edge_t edge = {.project = "test",
+                               .source_id = ids[source],
+                               .target_id = ids[target],
+                               .type = "CALLS"};
+            cbm_store_insert_edge(s, &edge);
+        }
+    }
+
+    cbm_cypher_result_t result = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (a:Function {name: \"node-0\"})-[:CALLS*10..10]->"
+                                "(b:Function) RETURN b.name",
+                                "test", 0, &result);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NOT_NULL(result.warning);
+    ASSERT_TRUE(strstr(result.warning, "traversal budget") != NULL);
+    ASSERT_TRUE(result.row_count > 0);
+
+    cbm_cypher_result_free(&result);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_exec_defines_edge) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -4090,6 +4130,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_var_length_explicit_bound_capped);
     RUN_TEST(cypher_exec_variable_length_repeated_node_var_unifies);
     RUN_TEST(cypher_exec_var_length_no_reuse_self_loop);
+    RUN_TEST(cypher_exec_var_length_truncation_surfaces_warning);
     RUN_TEST(cypher_exec_defines_edge);
     RUN_TEST(cypher_exec_no_results);
     RUN_TEST(cypher_exec_where_numeric);
