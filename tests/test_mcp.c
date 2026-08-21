@@ -10048,6 +10048,8 @@ enum {
     IDXPAR_NO_QUARANTINE = 64, /* crasher missing from skipped[] */
     IDXPAR_INNOCENT_HIT = 65,  /* a good file was quarantined/skipped */
     IDXPAR_GOOD_MISSING = 66,  /* good file's Function absent from the store */
+    IDXPAR_NOT_ERROR = 67,     /* systemic failure did not report status error */
+    IDXPAR_OUTCOME_WRONG = 68, /* systemic failure outcome is not exit_nonzero */
 };
 
 #ifndef _WIN32
@@ -10176,13 +10178,24 @@ static int idxpar_systemic_exit_nonzero_give_up_check(const char *repo_dir) {
     cbm_unsetenv("CBM_TEST_EXIT_ON");
 
     if (!resp) {
-        return IDXPAR_OK;
+        return IDXPAR_NULL_RESP;
     }
-    bool gave_up = response_contains_json_fragment(resp, "\"status\":\"gave_up\"") ||
-                   response_contains_json_fragment(resp, "\"status\":\"error\"") ||
-                   response_contains_json_fragment(resp, "\"action\":\"give_up\"");
+    bool is_error = response_contains_json_fragment(resp, "\"status\":\"error\"");
+    bool is_exit_nonzero = response_contains_json_fragment(resp, "\"outcome\":\"exit_nonzero\"");
+    bool innocent_hit =
+        strstr(resp, "idxpar_good_a.py") != NULL || strstr(resp, "idxpar_good_b.py") != NULL;
     free(resp);
-    return gave_up ? IDXPAR_OK : 99;
+
+    if (!is_error) {
+        return IDXPAR_NOT_ERROR;
+    }
+    if (!is_exit_nonzero) {
+        return IDXPAR_OUTCOME_WRONG;
+    }
+    if (innocent_hit) {
+        return IDXPAR_INNOCENT_HIT;
+    }
+    return IDXPAR_OK;
 }
 #endif /* !_WIN32 */
 

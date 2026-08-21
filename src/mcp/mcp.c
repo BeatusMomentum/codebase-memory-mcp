@@ -7756,7 +7756,7 @@ static bool supervisor_suspect_contains(char **s, int n, const char *rel) {
     return false;
 }
 
-/* Append one quarantine entry "rel\tphase\n" (phase = "crash"|"hang") to the
+/* Append one quarantine entry "rel\tphase\n" (phase = "crash"|"hang"|"error") to the
  * quarantine list. The worker's loader parses this back and reports the skip's
  * phase in skipped[]; a bare "rel" line is still tolerated there (defaults crash). */
 static bool supervisor_append_quarantine(const char *path, const char *rel, const char *phase) {
@@ -7790,7 +7790,7 @@ cbm_mcp_supervised_result_disposition_t cbm_mcp_supervised_result_disposition(
  *   - the worker's own response on a clean first run (the common path);
  *   - after a crash/hang, the response from a clean single-threaded RECOVERY run
  *     that quarantines the culprit file(s) — status="indexed" with them listed in
- *     skipped[] as phase="crash"/"hang", and the good files indexed;
+ *     skipped[] as phase="crash"/"hang"/"error", and the good files indexed;
  *   - a best-effort PARTIAL index (one final quarantine-only run) if the recovery
  *     loop cannot converge but at least one file was quarantined;
  *   - a contained-failure response only if even that cannot produce a clean run.
@@ -7839,7 +7839,7 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
      * (for a hang the oldest still-open file IS the stuck one; for a crash
      * it is the longest-running suspect — the best single deterministic
      * pick). A clean run then indexes the good files and reports the
-     * quarantined ones as phase="crash"/"hang" skips via the ordinary
+     * quarantined ones as phase="crash"/"hang"/"error" skips via the ordinary
      * Stage-2 skip plumbing. The old design re-ran SINGLE-THREADED to keep
      * one exact marker; at scale that fell into the sequential crawl, went
      * quiet, was killed as a hang mid-pass, and the stale marker got FOUR
