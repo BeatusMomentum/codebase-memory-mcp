@@ -283,7 +283,7 @@ const char *cbm_get_aider_instructions(void);
 /* ── Pre-tool hook management ─────────────────────────────────── */
 
 /* Upsert a PreToolUse hook in ~/.claude/settings.json for Claude Code.
- * Adds a Grep|Glob matcher that reminds to use MCP tools.
+ * Adds a Grep|Glob|Bash matcher that reminds to use MCP tools.
  * Returns 0 on success. */
 int cbm_upsert_claude_hooks(const char *settings_path);
 
