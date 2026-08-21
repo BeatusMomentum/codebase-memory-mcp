@@ -4750,7 +4750,7 @@ static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
                   * a wide shallow layer consumes every row, so prioritize the
                   * recursive hop (depth-first) while retaining deterministic
                   * ordering in the outer result query. */
-                 "  ORDER BY 2 DESC"
+                 "  ORDER BY 2 DESC, 1 ASC, 3 ASC"
                  "  LIMIT %d"
                  ")"
                  "SELECT DISTINCT n.id, n.project, n.label, n.name, n.qualified_name, "

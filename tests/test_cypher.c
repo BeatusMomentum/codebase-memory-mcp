@@ -1807,6 +1807,8 @@ TEST(cypher_exec_var_length_explicit_bound_capped) {
     PASS();
 }
 
+/* Pin the relationship-trail contract: a self-loop edge cannot be reused
+ * within one variable-length trail, so *2..2 yields no fabricated match. */
 TEST(cypher_exec_var_length_no_reuse_self_loop) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "test", "/tmp/test");
