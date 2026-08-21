@@ -21,6 +21,7 @@
 #include <foundation/constants.h>
 #include <foundation/platform.h>
 #include <mcp/mcp.h>
+#include <pipeline/pipeline.h>
 #include <foundation/yaml.h>
 #include <store/store.h>
 #include <yyjson/yyjson.h>
@@ -8791,6 +8792,44 @@ TEST(cli_hook_augment_context_tracks_search_json_shape) {
     PASS();
 }
 
+/* Exercise the real PreToolUse + Bash route instead of calling only the
+ * tokenizer seam. This pins the event guard and the graph lookup path together.
+ */
+TEST(cli_hook_augment_bash_pretooluse_reaches_augmenter) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    char *project = cbm_project_name_from_path("/tmp/hookproj");
+    ASSERT_NOT_NULL(project);
+    cbm_mcp_server_set_project(srv, project);
+    cbm_store_upsert_project(st, project, "/tmp/hookproj");
+    char qualified_name[256];
+    snprintf(qualified_name, sizeof(qualified_name), "%s.mod.someIndexedSymbol", project);
+    cbm_node_t node = {.project = project,
+                       .label = "Function",
+                       .name = "someIndexedSymbol",
+                       .qualified_name = qualified_name,
+                       .file_path = "mod.py",
+                       .start_line = 1,
+                       .end_line = 4};
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+
+    const char *input = "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\","
+                        "\"cwd\":\"/tmp/hookproj\",\"tool_input\":{"
+                        "\"command\":\"rg -n someIndexedSymbol .\"}}";
+    char *output = cbm_hook_augment_process(srv, input);
+    bool reached = output && strstr(output, "hookSpecificOutput") &&
+                   strstr(output, "someIndexedSymbol") && strstr(output, "mod.py");
+    free(output);
+    cbm_mcp_server_free(srv);
+    free(project);
+
+    if (!reached)
+        FAIL("PreToolUse Bash must reach graph search augmentation");
+    PASS();
+}
+
 TEST(cli_hook_augment_bash_pattern_extractor) {
     char out[256];
 
@@ -10439,7 +10478,7 @@ TEST(cli_upsert_claude_hook_fresh) {
     ASSERT_NOT_NULL(data);
     ASSERT(strstr(data, "PreToolUse") != NULL);
     ASSERT(strstr(data, "PostToolUse") != NULL);
-    ASSERT(strstr(data, "\"Grep|Glob\"") != NULL);
+    ASSERT(strstr(data, "\"Grep|Glob|Bash\"") != NULL);
     ASSERT(strstr(data, "\"Read\"") != NULL);
     ASSERT(strstr(data, "\"Grep|Glob|Read\"") == NULL);
     ASSERT_EQ(test_count_substring(data, "cbm-code-discovery-gate"), 2U);
@@ -10953,7 +10992,7 @@ TEST(cli_upsert_claude_hook_existing) {
 
     const char *data = read_test_file(settingspath);
     ASSERT_NOT_NULL(data);
-    ASSERT(strstr(data, "\"Grep|Glob\"") != NULL);
+    ASSERT(strstr(data, "\"Grep|Glob|Bash\"") != NULL);
     ASSERT(strstr(data, "PostToolUse") != NULL);
     ASSERT(strstr(data, "\"Read\"") != NULL);
     /* Existing hook preserved */
@@ -11034,7 +11073,8 @@ TEST(cli_upsert_claude_hook_replace) {
     const char *data = read_test_file(settingspath);
     ASSERT_NOT_NULL(data);
     ASSERT(strstr(data, "\"Grep|Glob|Read\"") == NULL);
-    ASSERT(strstr(data, "\"Grep|Glob\"") != NULL);
+    ASSERT(strstr(data, "\"Grep|Glob|Bash\"") != NULL);
+    ASSERT(strstr(data, "\"Grep|Glob\"") == NULL);
     ASSERT(strstr(data, "PostToolUse") != NULL);
     ASSERT_EQ(test_count_substring(data, "cbm-code-discovery-gate"), 2U);
 
@@ -11086,7 +11126,8 @@ TEST(cli_remove_claude_hooks) {
 
     const char *data = read_test_file(settingspath);
     ASSERT_NOT_NULL(data);
-    ASSERT(strstr(data, "Grep|Glob|Read") == NULL);
+    ASSERT(strstr(data, "\"Grep|Glob|Bash\"") == NULL);
+    ASSERT(strstr(data, "\"Grep|Glob\"") == NULL);
     ASSERT(strstr(data, "cbm-code-discovery-gate") == NULL);
 
     test_rmdir_r(tmpdir);
@@ -12039,6 +12080,7 @@ SUITE(cli) {
     RUN_TEST(cli_claude_hook_commands_shell_quote_custom_config_dir);
     RUN_TEST(cli_codex_migrates_to_single_hook_representation);
     RUN_TEST(cli_hook_augment_context_tracks_search_json_shape);
+    RUN_TEST(cli_hook_augment_bash_pretooluse_reaches_augmenter);
     RUN_TEST(cli_hook_augment_bash_pattern_extractor);
     RUN_TEST(cli_hook_augment_lifecycle_output_contract);
     RUN_TEST(cli_hook_augment_subagent_tier_router_contract);

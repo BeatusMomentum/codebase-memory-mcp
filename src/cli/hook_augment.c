@@ -13,7 +13,7 @@
  *
  * The underlying query is `search_graph` (pure SQLite, shell-free) — chosen
  * over `search_code` (which shells out to grep|xargs) so the hook stays cheap
- * enough to run before every Grep/Glob.
+ * enough to run before every Grep/Glob/Bash call.
  */
 
 #include "cli/cli.h"
@@ -1079,7 +1079,7 @@ static bool ha_is_env_assign(const char *t) {
 
 typedef enum { HA_BIN_GREP, HA_BIN_RG, HA_BIN_AG, HA_BIN_ACK, HA_BIN_UGREP } ha_bin_t;
 
-static const char *ha_search_bin_val_flags(ha_bin_t bin, bool rtk_grep) {
+static const char *ha_search_bin_val_flags(ha_bin_t bin) {
     switch (bin) {
     case HA_BIN_RG:
         return "ABCmtTgMP";
@@ -1147,7 +1147,7 @@ static bool ha_parse_bash_search_pattern(const char *cmd, char *out, size_t out_
         return false;
     }
 
-    const char *val_flags = ha_search_bin_val_flags(bin, rtk && bin == HA_BIN_GREP);
+    const char *val_flags = ha_search_bin_val_flags(bin);
     const char *pattern = NULL;
     int e_count = 0;
     bool end_of_flags = false;

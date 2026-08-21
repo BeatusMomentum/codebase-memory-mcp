@@ -459,7 +459,7 @@ int cbm_cmd_config(int argc, char **argv);
 
 /* hook-augment: stdin-driven Claude Code PreToolUse augmenter.
  * Reads the hook JSON from stdin and emits hookSpecificOutput.additionalContext
- * with search_graph hits for Grep/Glob calls. NEVER blocks: every failure
+ * with search_graph hits for Grep/Glob/Bash search calls. NEVER blocks: every failure
  * path returns 0 with no stdout output. */
 int cbm_cmd_hook_augment(int argc, char **argv);
 
