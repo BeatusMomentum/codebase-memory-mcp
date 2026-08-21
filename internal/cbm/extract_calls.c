@@ -30,14 +30,29 @@ enum { MIN_PRINTABLE = 0x20 };
 /* Handler arg scan start index (skip first positional). */
 enum { HANDLER_START_IDX = 1 };
 
-/* Look up a module-level string constant by name. */
+/* Look up a module-level string constant by name. URL-builder entries share the
+ * map but are not constants: a bare `thingPath` reference is the function, not
+ * the URL it would build (issue #1009). */
 static const char *lookup_string_constant(const CBMExtractCtx *ctx, const char *name) {
     if (!name || !name[0]) {
         return NULL;
     }
     const CBMStringConstantMap *map = &ctx->string_constants;
     for (int i = 0; i < map->count; i++) {
-        if (strcmp(map->names[i], name) == 0) {
+        if (!map->is_url_builder[i] && strcmp(map->names[i], name) == 0) {
+            return map->values[i];
+        }
+    }
+    return NULL;
+}
+
+static const char *lookup_url_builder(const CBMExtractCtx *ctx, const char *name) {
+    if (!name || !name[0]) {
+        return NULL;
+    }
+    const CBMStringConstantMap *map = &ctx->string_constants;
+    for (int i = 0; i < map->count; i++) {
+        if (map->is_url_builder[i] && strcmp(map->names[i], name) == 0) {
             return map->values[i];
         }
     }
@@ -1868,7 +1883,7 @@ static void extract_call_args(CBMExtractCtx *ctx, TSNode args, CBMCall *call) {
                 if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "identifier") == 0) {
                     char *fname = cbm_node_text(ctx->arena, fn, ctx->source);
                     if (fname) {
-                        ca->value = lookup_string_constant(ctx, fname);
+                        ca->value = lookup_url_builder(ctx, fname);
                     }
                 }
             }
@@ -2105,7 +2120,7 @@ static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args) {
             TSNode fn = ts_node_child_by_field_name(arg, TS_FIELD("function"));
             if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "identifier") == 0) {
                 char *fname = cbm_node_text(ctx->arena, fn, ctx->source);
-                const char *val = fname ? lookup_string_constant(ctx, fname) : NULL;
+                const char *val = fname ? lookup_url_builder(ctx, fname) : NULL;
                 if (val) {
                     return val;
                 }

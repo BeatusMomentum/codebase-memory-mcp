@@ -3427,6 +3427,112 @@ TEST(extract_ts_url_builder_composed_issue1009) {
     PASS();
 }
 
+static bool any_call_arg_resolves_to(CBMFileResult *r, const char *url) {
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->first_string_arg && strcmp(c->first_string_arg, url) == 0) {
+            return true;
+        }
+        for (int a = 0; a < c->arg_count; a++) {
+            if (c->args[a].value && strcmp(c->args[a].value, url) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+TEST(extract_c_url_builder_gated_issue1009) {
+    CBMFileResult *r = extract("static const char *cfg_path(void) {\n"
+                               "  return \"/etc/myapp/conf.d\";\n"
+                               "}\n"
+                               "void init(void) {\n"
+                               "  parse_config(cfg_path());\n"
+                               "}\n",
+                               CBM_LANG_C, "t", "conf.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(any_call_arg_resolves_to(r, "/etc/myapp/conf.d"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* One literal return next to a computed one would attribute the literal to every
+ * call site, including those taking the computed branch. A builder whose returns
+ * are not all URL literals is declined. */
+TEST(extract_ts_url_builder_mixed_returns_issue1009) {
+    CBMFileResult *r = extract("function pathFor(kind: string): string {\n"
+                               "  if (kind === 'user') return '/api/users';\n"
+                               "  return computePath(kind);\n"
+                               "}\n"
+                               "export function load(kind: string) {\n"
+                               "  return apiGet(pathFor(kind));\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "mixed.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(any_call_arg_resolves_to(r, "/api/users"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Two different literal URLs make the call site's route unknowable, so the
+ * builder is tombstoned and lookups miss. */
+TEST(extract_ts_url_builder_ambiguous_issue1009) {
+    CBMFileResult *r = extract("function pathFor(kind: string): string {\n"
+                               "  if (kind === 'user') return '/api/users';\n"
+                               "  return '/api/teams';\n"
+                               "}\n"
+                               "export function load(kind: string) {\n"
+                               "  return apiGet(pathFor(kind));\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "ambiguous.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(any_call_arg_resolves_to(r, "/api/users"));
+    ASSERT_FALSE(any_call_arg_resolves_to(r, "/api/teams"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Handing a builder to a callback position builds no URL. Only a call to it
+ * resolves, so the mapping function does not inherit an HTTP_CALLS edge to the
+ * route. */
+TEST(extract_ts_url_builder_reference_issue1009) {
+    CBMFileResult *r = extract("function thingPath(id: string): string {\n"
+                               "  return `/api/v1/things/${id}`;\n"
+                               "}\n"
+                               "export function loadAll(ids: string[]) {\n"
+                               "  return ids.map(thingPath);\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "reference.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(any_call_arg_resolves_to(r, "/api/v1/things/{}"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A helper returning an ordinary string is not a URL builder, so its call site
+ * gets no resolved string argument. */
+TEST(extract_ts_url_builder_non_url_issue1009) {
+    CBMFileResult *r = extract("function label(): string {\n"
+                               "  return 'plain text';\n"
+                               "}\n"
+                               "export function render() {\n"
+                               "  return send(label());\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "label.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c = find_call_by_callee(r, "send");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NULL(c->first_string_arg);
+    ASSERT_FALSE(any_call_arg_resolves_to(r, "plain text"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Issue #1006: JS/TS template-literal URLs must flatten ${...} substitutions
  * to the canonical "{}" placeholder, both as call arguments (HTTP_CALLS) and
  * as URL-shaped string_refs collected from const/return positions. */
@@ -5845,6 +5951,11 @@ SUITE(extraction) {
     RUN_TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249);
     RUN_TEST(extract_ts_url_builder_issue1009);
     RUN_TEST(extract_ts_url_builder_composed_issue1009);
+    RUN_TEST(extract_c_url_builder_gated_issue1009);
+    RUN_TEST(extract_ts_url_builder_mixed_returns_issue1009);
+    RUN_TEST(extract_ts_url_builder_ambiguous_issue1009);
+    RUN_TEST(extract_ts_url_builder_reference_issue1009);
+    RUN_TEST(extract_ts_url_builder_non_url_issue1009);
     RUN_TEST(extract_java_no_double_class_qn);
     RUN_TEST(extract_go_no_filename_in_module_qn);
     RUN_TEST(extract_large_ts_has_functions_issue213);

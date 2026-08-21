@@ -1122,18 +1122,19 @@ static const char *builder_template_text(CBMExtractCtx *ctx, TSNode node) {
             piece = "{}";
             if (ts_node_named_child_count(c) > 0) {
                 TSNode expr = ts_node_named_child(c, 0);
-                const char *ek = ts_node_type(expr);
-                TSNode name_node = expr;
-                if (strcmp(ek, "call_expression") == 0) {
-                    name_node = ts_node_child_by_field_name(expr, TS_FIELD("function"));
-                }
+                /* `${basePath(id)}` inlines a builder, `${BASE}` a const. A bare
+                 * name never resolves to a builder: that reads the function. */
+                bool want_builder = strcmp(ts_node_type(expr), "call_expression") == 0;
+                TSNode name_node =
+                    want_builder ? ts_node_child_by_field_name(expr, TS_FIELD("function")) : expr;
                 if (!ts_node_is_null(name_node) &&
                     strcmp(ts_node_type(name_node), "identifier") == 0) {
                     char *nm = cbm_node_text(ctx->arena, name_node, ctx->source);
                     if (nm) {
                         const CBMStringConstantMap *map = &ctx->string_constants;
                         for (int mi = 0; mi < map->count; mi++) {
-                            if (map->values[mi] && strcmp(map->names[mi], nm) == 0) {
+                            if (map->values[mi] && map->is_url_builder[mi] == want_builder &&
+                                strcmp(map->names[mi], nm) == 0) {
                                 piece = map->values[mi];
                                 break;
                             }
@@ -1187,9 +1188,15 @@ static const char *url_builder_literal_text(CBMExtractCtx *ctx, TSNode value_nod
     return text;
 }
 
-/* Record `name -> url` in the per-file constant map so call-site resolution
- * (lookup_string_constant) can see it. A builder that returns two DIFFERENT
- * urls is ambiguous: tombstone it with a NULL value so lookups miss. */
+/* A route-shaped URL literal: an absolute path that classifies as a URL. */
+static const char *builder_route_url(CBMExtractCtx *ctx, TSNode value_node) {
+    const char *url = url_builder_literal_text(ctx, value_node);
+    if (!url || url[0] != '/' || cbm_classify_string(url, (int)strlen(url)) != CBM_STRREF_URL) {
+        return NULL;
+    }
+    return url;
+}
+
 static void record_url_builder(CBMExtractCtx *ctx, const char *name, const char *url) {
     if (!name || !name[0] || !url) {
         return;
@@ -1197,7 +1204,7 @@ static void record_url_builder(CBMExtractCtx *ctx, const char *name, const char 
     CBMStringConstantMap *map = &ctx->string_constants;
     for (int i = 0; i < map->count; i++) {
         if (strcmp(map->names[i], name) == 0) {
-            if (map->values[i] && strcmp(map->values[i], url) != 0) {
+            if (map->is_url_builder[i] && map->values[i] && strcmp(map->values[i], url) != 0) {
                 map->values[i] = NULL; /* ambiguous builder */
             }
             return;
@@ -1206,17 +1213,70 @@ static void record_url_builder(CBMExtractCtx *ctx, const char *name, const char 
     if (map->count < CBM_MAX_STRING_CONSTANTS) {
         map->names[map->count] = (char *)name;
         map->values[map->count] = (char *)url;
+        map->is_url_builder[map->count] = true;
         map->count++;
     }
+}
+
+/* Every `return` this function owns yields a route-shaped URL literal. A body
+ * that also returns a computed path (`return computePath(kind)`) would attribute
+ * its one literal to call sites that never produce it, so a mixed builder is
+ * declined rather than guessed. Returns inside a nested function belong to that
+ * function, not to this one. */
+static bool builder_returns_only_urls(CBMExtractCtx *ctx, TSNode func) {
+    TSNode body = ts_node_child_by_field_name(func, TS_FIELD("body"));
+    if (ts_node_is_null(body)) {
+        return false;
+    }
+    bool only_urls = true;
+    TSTreeCursor cursor = ts_tree_cursor_new(body);
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (strcmp(ts_node_type(node), "return_statement") == 0 &&
+            ts_node_eq(cbm_find_enclosing_func(node, ctx->language), func)) {
+            if (ts_node_named_child_count(node) == 0 ||
+                !builder_route_url(ctx, ts_node_named_child(node, 0))) {
+                only_urls = false;
+                break;
+            }
+        }
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            continue;
+        }
+        if (ts_tree_cursor_goto_next_sibling(&cursor)) {
+            continue;
+        }
+        bool found = false;
+        while (ts_tree_cursor_goto_parent(&cursor)) {
+            if (ts_tree_cursor_goto_next_sibling(&cursor)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            break;
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    return only_urls;
 }
 
 /* URL-builder helper pattern (issue #1009): a small function whose return value
  * is a URL-shaped literal, consumed as `client(buildPath(id))`. The literal
  * never appears as a call argument, so first_string_arg resolution cannot see
- * it; record `functionName -> url` in the same per-file constant map used for
- * module-level consts and let the call-site call_expression branch resolve it.
- * Covers `return`-statement bodies and arrow-function expression bodies. */
+ * it; record `functionName -> url` in the per-file constant map and let the
+ * call-site call_expression branch resolve it. Covers `return`-statement bodies
+ * and arrow-function expression bodies.
+ *
+ * JS/TS only. The predicate accepts any absolute pathname, and `return` plus a
+ * string literal is also the shape of every C or Go helper handing back a
+ * filesystem path (`/etc/...`, `/proc/self/...`); recording those would mint a
+ * Route node and an HTTP_CALLS edge in a language that speaks no HTTP. */
 static void handle_url_builders(CBMExtractCtx *ctx, TSNode node, const WalkState *state) {
+    if (ctx->language != CBM_LANG_JAVASCRIPT && ctx->language != CBM_LANG_TYPESCRIPT &&
+        ctx->language != CBM_LANG_TSX) {
+        return;
+    }
     const char *kind = ts_node_type(node);
 
     if (strcmp(kind, "arrow_function") == 0) {
@@ -1224,8 +1284,8 @@ static void handle_url_builders(CBMExtractCtx *ctx, TSNode node, const WalkState
         if (ts_node_is_null(body) || strcmp(ts_node_type(body), "statement_block") == 0) {
             return;
         }
-        const char *url = url_builder_literal_text(ctx, body);
-        if (!url || url[0] != '/' || cbm_classify_string(url, (int)strlen(url)) != CBM_STRREF_URL) {
+        const char *url = builder_route_url(ctx, body);
+        if (!url) {
             return;
         }
         TSNode parent = ts_node_parent(node);
@@ -1247,8 +1307,12 @@ static void handle_url_builders(CBMExtractCtx *ctx, TSNode node, const WalkState
     if (ts_node_named_child_count(node) == 0) {
         return;
     }
-    const char *url = url_builder_literal_text(ctx, ts_node_named_child(node, 0));
-    if (!url || url[0] != '/' || cbm_classify_string(url, (int)strlen(url)) != CBM_STRREF_URL) {
+    const char *url = builder_route_url(ctx, ts_node_named_child(node, 0));
+    if (!url) {
+        return;
+    }
+    TSNode func = cbm_find_enclosing_func(node, ctx->language);
+    if (ts_node_is_null(func) || !builder_returns_only_urls(ctx, func)) {
         return;
     }
     const char *name = strrchr(state->enclosing_func_qn, '.');
