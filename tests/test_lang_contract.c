@@ -24,6 +24,7 @@
 #include <store/store.h>
 #include <pipeline/pipeline.h>
 #include <foundation/log.h>
+#include <sqlite3.h>
 
 #include <string.h>
 #include <stdlib.h>
@@ -457,6 +458,144 @@ TEST(contract_python_relative_import) {
     ASSERT_TRUE(m.calls >= 1);
     ASSERT_TRUE(m.callers >= 1);
     ASSERT_TRUE(m.imports >= 1); /* IMPORTS edge for `from .util import helper` */
+    PASS();
+}
+
+/* Python: relative aliased from-import must CALLS the real def (execute). */
+TEST(contract_python_aliased_from_import_calls) {
+    static const LangFile f[] = {
+        {"gate.py", "def execute(x):\n    return x\n"},
+        {"router.py",
+         "from .gate import execute as bridge_execute\n\n\n"
+         "def submit_task(y):\n    return bridge_execute(y)\n"}};
+    LangProj lp;
+    cbm_store_t *store = lang_index_files(&lp, f, 2);
+    ASSERT_TRUE(store != NULL);
+    cbm_node_t *nodes = NULL;
+    int ncount = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(store, lp.project, "submit_task", &nodes, &ncount),
+              CBM_STORE_OK);
+    ASSERT_TRUE(ncount >= 1);
+    char **callers = NULL;
+    char **callees = NULL;
+    int n_callers = 0;
+    int n_callees = 0;
+    ASSERT_EQ(cbm_store_node_neighbor_names(store, nodes[0].id, 32, &callers, &n_callers, &callees,
+                                            &n_callees),
+              0);
+    int saw_execute = 0;
+    int saw_alias_ghost = 0;
+    for (int i = 0; i < n_callees; i++) {
+        if (callees[i] && strcmp(callees[i], "execute") == 0) {
+            saw_execute = 1;
+        }
+        if (callees[i] && strcmp(callees[i], "bridge_execute") == 0) {
+            saw_alias_ghost = 1;
+        }
+    }
+    for (int i = 0; i < n_callers; i++) {
+        free(callers[i]);
+    }
+    for (int i = 0; i < n_callees; i++) {
+        free(callees[i]);
+    }
+    free(callers);
+    free(callees);
+    cbm_store_free_nodes(nodes, ncount);
+    lang_cleanup(&lp, store);
+    ASSERT_TRUE(saw_execute);
+    ASSERT_FALSE(saw_alias_ghost);
+    PASS();
+}
+
+/* Python: absolute aliased from-import must CALLS the real def (Yui router shape). */
+TEST(contract_python_absolute_aliased_from_import_calls) {
+    static const LangFile f[] = {
+        {"services/satori_bridge/__init__.py", ""},
+        {"services/satori_bridge/gate.py", "def execute(x):\n    return x\n"},
+        {"services/yui_core/__init__.py", ""},
+        {"services/yui_core/router.py",
+         "from services.satori_bridge.gate import execute as bridge_execute\n\n\n"
+         "def submit_task(y):\n    return bridge_execute(y)\n"},
+        {"services/__init__.py", ""}};
+    LangProj lp;
+    cbm_store_t *store = lang_index_files(&lp, f, 5);
+    ASSERT_TRUE(store != NULL);
+    cbm_node_t *nodes = NULL;
+    int ncount = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(store, lp.project, "submit_task", &nodes, &ncount),
+              CBM_STORE_OK);
+    ASSERT_TRUE(ncount >= 1);
+    char **callers = NULL;
+    char **callees = NULL;
+    int n_callers = 0;
+    int n_callees = 0;
+    ASSERT_EQ(cbm_store_node_neighbor_names(store, nodes[0].id, 32, &callers, &n_callers, &callees,
+                                            &n_callees),
+              0);
+    int saw_execute = 0;
+    int saw_alias_ghost = 0;
+    for (int i = 0; i < n_callees; i++) {
+        if (callees[i] && strcmp(callees[i], "execute") == 0) {
+            saw_execute = 1;
+        }
+        if (callees[i] && strcmp(callees[i], "bridge_execute") == 0) {
+            saw_alias_ghost = 1;
+        }
+    }
+    for (int i = 0; i < n_callers; i++) {
+        free(callers[i]);
+    }
+    for (int i = 0; i < n_callees; i++) {
+        free(callees[i]);
+    }
+    free(callers);
+    free(callees);
+    cbm_store_free_nodes(nodes, ncount);
+    lang_cleanup(&lp, store);
+    ASSERT_TRUE(saw_execute);
+    ASSERT_FALSE(saw_alias_ghost);
+    PASS();
+}
+
+/* Python: unresolvable module + alias must emit no CALLS (no invented edge). */
+TEST(contract_python_ghost_module_aliased_from_import_no_calls) {
+    static const LangFile f[] = {
+        {"router.py",
+         "from ghost_module import nope as alias\n\n\n"
+         "def submit_task(y):\n    return alias(y)\n"}};
+    LangProj lp;
+    cbm_store_t *store = lang_index_files(&lp, f, 1);
+    ASSERT_TRUE(store != NULL);
+    cbm_node_t *nodes = NULL;
+    int ncount = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(store, lp.project, "submit_task", &nodes, &ncount),
+              CBM_STORE_OK);
+    ASSERT_TRUE(ncount >= 1);
+    char **callers = NULL;
+    char **callees = NULL;
+    int n_callers = 0;
+    int n_callees = 0;
+    ASSERT_EQ(cbm_store_node_neighbor_names(store, nodes[0].id, 32, &callers, &n_callers, &callees,
+                                            &n_callees),
+              0);
+    int saw_any_callee = 0;
+    for (int i = 0; i < n_callees; i++) {
+        if (callees[i] && callees[i][0]) {
+            saw_any_callee = 1;
+        }
+    }
+    for (int i = 0; i < n_callers; i++) {
+        free(callers[i]);
+    }
+    for (int i = 0; i < n_callees; i++) {
+        free(callees[i]);
+    }
+    free(callers);
+    free(callees);
+    cbm_store_free_nodes(nodes, ncount);
+    lang_cleanup(&lp, store);
+    ASSERT_FALSE(saw_any_callee);
     PASS();
 }
 
@@ -1518,7 +1657,9 @@ TEST(contract_edge_parallel_service_edges) {
         {"gql.py", "def gql(query_string):\n    return query_string\n"},
         {"client.py",
          "from gql import gql\n\n\ndef fetch_user():\n"
-         "    return gql(\"query GetUser { user { id name } }\")\n\n\n"
+         /* The embedded double quote survives extraction from this single-quoted
+          * Python string and breaks GRAPHQL_CALLS JSON unless operation is escaped. */
+         "    return gql('query GetUser { user(name: \"quoted\") { id name } }')\n\n\n"
          "def create_user():\n"
          "    return gql(\"mutation CreateUser { addUser(name: \\\"x\\\") { id } }\")\n"},
         /* TRPC_CALLS: local createTRPCProxyClient (same-module resolution). */
@@ -1559,6 +1700,19 @@ TEST(contract_edge_parallel_service_edges) {
     int grpc = store ? cbm_store_count_edges_by_type(store, lp.project, "GRPC_CALLS") : -1;
     int trpc = store ? cbm_store_count_edges_by_type(store, lp.project, "TRPC_CALLS") : -1;
     int infra = store ? cbm_store_count_edges_by_type(store, lp.project, "INFRA_MAPS") : -1;
+    int invalid_props = -1;
+    if (store) {
+        sqlite3_stmt *stmt = NULL;
+        sqlite3 *db = cbm_store_get_db(store);
+        if (db && sqlite3_prepare_v2(db,
+                                    "SELECT count(*) FROM edges WHERE properties IS NOT NULL "
+                                    "AND properties != '' AND json_valid(properties)=0;",
+                                    -1, &stmt, NULL) == SQLITE_OK &&
+            sqlite3_step(stmt) == SQLITE_ROW) {
+            invalid_props = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+    }
     if (graphql < 1 || grpc < 1 || trpc < 1 || infra < 1) {
         fprintf(stderr,
                 "  [EDGE] parallel-service: GRAPHQL_CALLS=%d GRPC_CALLS=%d TRPC_CALLS=%d "
@@ -1571,6 +1725,7 @@ TEST(contract_edge_parallel_service_edges) {
     ASSERT_TRUE(grpc >= 1);
     ASSERT_TRUE(trpc >= 1);
     ASSERT_TRUE(infra >= 1);
+    ASSERT_EQ(invalid_props, 0);
     PASS();
 }
 
@@ -1648,6 +1803,9 @@ SUITE(lang_contract) {
     RUN_TEST(contract_java_methods);
     RUN_TEST(contract_kotlin_methods);
     RUN_TEST(contract_python_relative_import);
+    RUN_TEST(contract_python_aliased_from_import_calls);
+    RUN_TEST(contract_python_absolute_aliased_from_import_calls);
+    RUN_TEST(contract_python_ghost_module_aliased_from_import_no_calls);
     RUN_TEST(contract_typescript_relative_import);
 
     /* Graph-level breadth across all grammars (P4). */

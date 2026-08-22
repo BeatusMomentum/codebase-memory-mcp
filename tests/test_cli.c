@@ -52,6 +52,9 @@ int cbm_cli_checksum_manifest_digest(const char *manifest_path, const char *arch
 void cbm_cli_set_activation_cleanup_failure_for_test(bool enabled);
 int cbm_cli_activation_abort_cleanup_probe_for_test(void);
 bool cbm_cli_activation_test_ops_installed(void);
+int cbm_cli_build_yaml_stdio_mcp_block_for_test(const char *binary_path, bool goose_schema,
+                                                char *block, size_t block_size);
+bool cbm_cli_stdin_allowed_for_schema_for_test(const char *schema_str);
 
 TEST(cli_progress_visibility_policy) {
     ASSERT_TRUE(cbm_cli_progress_enabled(true, false));
@@ -2934,6 +2937,140 @@ TEST(cli_junie_mcp_repairs_all_known_previous_aliases_atomically) {
     ASSERT(strstr(data, "--tool-profile=scout") != NULL);
     ASSERT(strstr(data, "--tool-profile=analysis") != NULL);
 
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_goose_block_carries_required_name_issue1675) {
+    /* goose's ExtensionConfig::Stdio declares `name` as a required serde field
+     * with no default, and its loader silently drops entries that fail to
+     * deserialize — an entry without `name:` installs "successfully" and is
+     * then invisible in goose. The block is the compatibility contract. */
+    char block[512];
+    ASSERT_EQ(cbm_cli_build_yaml_stdio_mcp_block_for_test("/opt/codebase-memory-mcp", true, block,
+                                                          sizeof(block)),
+              0);
+    ASSERT(strstr(block, "name: codebase-memory-mcp\n") != NULL);
+    ASSERT(strstr(block, "type: stdio\n") != NULL);
+    ASSERT(strstr(block, "enabled: true\n") != NULL);
+
+    /* The non-goose YAML schema (command-only) must stay name-free. */
+    ASSERT_EQ(cbm_cli_build_yaml_stdio_mcp_block_for_test("/opt/codebase-memory-mcp", false, block,
+                                                          sizeof(block)),
+              0);
+    ASSERT(strstr(block, "name:") == NULL);
+    PASS();
+}
+
+TEST(cli_editor_mcp_field_repairs_annotated_entry_via_previous_issue1630) {
+    /* The relocating-update flow is the AUTHORIZED repair channel: the entry
+     * still names the previous managed binary and the client annotated it, so
+     * a wholesale rewrite would drop those keys. Only the command member may
+     * change; comments and client keys survive byte-for-byte. */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-oc-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char configpath[512];
+    snprintf(configpath, sizeof(configpath), "%s/.claude.json", tmpdir);
+    write_test_file(configpath, "{\n"
+                                "  // user config\n"
+                                "  \"mcpServers\": {\n"
+                                "    \"codebase-memory-mcp\": {\n"
+                                "      \"command\": \"/old/place/codebase-memory-mcp\",\n"
+                                "      \"enabled\": true,\n"
+                                "      \"timeout\": 5\n"
+                                "    },\n"
+                                "  },\n"
+                                "}\n");
+    ASSERT_EQ(cbm_install_editor_mcp_with_previous_for_testing(
+                  "/opt/codebase-memory-mcp", "/old/place/codebase-memory-mcp", configpath),
+              0);
+    const char *data = read_test_file(configpath);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "\"command\": \"/opt/codebase-memory-mcp\"") != NULL);
+    ASSERT(strstr(data, "/old/place/") == NULL);
+    ASSERT(strstr(data, "\"enabled\": true") != NULL);
+    ASSERT(strstr(data, "\"timeout\": 5") != NULL);
+    ASSERT(strstr(data, "// user config") != NULL);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_opencode_moved_entry_without_authority_refuses_issue1630) {
+    /* POSIX never trusts a config-supplied path — with no previous-managed
+     * identity and no dead-path proof, a moved-looking entry is preserved
+     * byte-for-byte and install fails loudly for the user to inspect. */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-oc-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char configpath[512];
+    snprintf(configpath, sizeof(configpath), "%s/opencode.jsonc", tmpdir);
+#ifdef _WIN32
+    /* A conclusively-missing fixed-drive path authorizes the repair; a
+     * POSIX-shaped or non-local path can never be proven absent (PATHEXT /
+     * remote rules) and stays refused. */
+    const char *initial = "{\n"
+                          "  \"mcp\": {\n"
+                          "    \"codebase-memory-mcp\": {\n"
+                          "      \"command\": "
+                          "[\"C:\\\\cbm-definitely-missing\\\\codebase-memory-mcp.exe\"],\n"
+                          "      \"type\": \"local\"\n"
+                          "    }\n"
+                          "  }\n"
+                          "}\n";
+    write_test_file(configpath, initial);
+    ASSERT_EQ(cbm_upsert_opencode_mcp("/opt/codebase-memory-mcp", configpath), 0);
+#else
+    const char *initial = "{\n"
+                          "  \"mcp\": {\n"
+                          "    \"codebase-memory-mcp\": {\n"
+                          "      \"command\": [\"/old/place/codebase-memory-mcp\"],\n"
+                          "      \"type\": \"local\"\n"
+                          "    }\n"
+                          "  }\n"
+                          "}\n";
+    write_test_file(configpath, initial);
+    ASSERT(cbm_upsert_opencode_mcp("/opt/codebase-memory-mcp", configpath) != 0);
+    const char *data = read_test_file(configpath);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "/old/place/") != NULL);
+#endif
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_opencode_owns_backslash_command_issue1582) {
+    /* gotspatel's live file: the entry stores the Windows path with
+     * backslashes while the installer compares its own path with forward
+     * slashes — the same file, refused over the separator spelling. Ownership
+     * comparison must be separator-insensitive. */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-oc-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char configpath[512];
+    snprintf(configpath, sizeof(configpath), "%s/opencode.json", tmpdir);
+    const char *initial = "{\n"
+                          "  \"mcp\": {\n"
+                          "    \"codebase-memory-mcp\": {\n"
+                          "      \"enabled\": true,\n"
+                          "      \"type\": \"local\",\n"
+                          "      \"command\": [\"C:\\\\Users\\\\Admin\\\\Programs\\\\"
+                          "codebase-memory-mcp\\\\codebase-memory-mcp.exe\"]\n"
+                          "    }\n"
+                          "  }\n"
+                          "}\n";
+    write_test_file(configpath, initial);
+    ASSERT_EQ(
+        cbm_upsert_opencode_mcp(
+            "C:/Users/Admin/Programs/codebase-memory-mcp/codebase-memory-mcp.exe", configpath),
+        0);
+    const char *data = read_test_file(configpath);
+    ASSERT_NOT_NULL(data);
+    /* Already satisfied: the annotated entry names this binary — preserved. */
+    ASSERT(strcmp(data, initial) == 0);
     test_rmdir_r(tmpdir);
     PASS();
 }
@@ -7415,6 +7552,121 @@ TEST(cli_opencode_prefers_existing_jsonc_config_discussion1560) {
     PASS();
 }
 
+/* #1630: OpenCode writes `"enabled": true` beside our `command` and `type`, so
+ * an entry we wrote ourselves carries three keys. Our ownership check demanded
+ * an exact key set, classified our own entry as foreign, and refused the whole
+ * install. Confirmed on Linux (#1630) and Windows (#1582) with two independent
+ * configs in which EVERY MCP server carried the key.
+ *
+ * The entry below is the reporters' actual shape. It already says what we would
+ * say, so the correct outcome is success WITHOUT a write - rewriting it would
+ * drop `enabled`, turning a visible refusal into silent config loss. */
+TEST(cli_opencode_accepts_entry_annotated_with_enabled_issue1630) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-opencode-enabled-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char config_path[512];
+    snprintf(config_path, sizeof(config_path), "%s/opencode.json", tmpdir);
+    const char *original = "{\n"
+                           "  \"$schema\": \"https://opencode.ai/config.json\",\n"
+                           "  \"mcp\": {\n"
+                           "    \"codebase-memory-mcp\": {\n"
+                           "      \"enabled\": true,\n"
+                           "      \"type\": \"local\",\n"
+                           "      \"command\": [\n"
+                           "        \"/usr/local/bin/codebase-memory-mcp\"\n"
+                           "      ]\n"
+                           "    }\n"
+                           "  }\n"
+                           "}\n";
+    write_test_file(config_path, original);
+
+    int rc = cbm_upsert_opencode_mcp("/usr/local/bin/codebase-memory-mcp", config_path);
+
+    char *after = read_test_file_alloc(config_path);
+    bool preserved = after && strstr(after, "\"enabled\": true") != NULL;
+    bool unchanged = after && strcmp(after, original) == 0;
+    free(after);
+    test_rmdir_r(tmpdir);
+    if (rc != 0)
+        FAIL("an entry annotated with enabled must be accepted, not refused");
+    if (!preserved)
+        FAIL("the client's enabled key must survive");
+    if (!unchanged)
+        FAIL("an already-correct entry must not be rewritten at all");
+    PASS();
+}
+
+/* The other direction: an entry whose command points at a DIFFERENT binary is
+ * genuinely foreign and must still be refused, extra keys or not. Without this
+ * the change above would be a blanket loosening. */
+TEST(cli_opencode_still_refuses_foreign_command_issue1630) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-opencode-foreign-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char config_path[512];
+    snprintf(config_path, sizeof(config_path), "%s/opencode.json", tmpdir);
+    const char *original = "{\n"
+                           "  \"mcp\": {\n"
+                           "    \"codebase-memory-mcp\": {\n"
+                           "      \"enabled\": true,\n"
+                           "      \"type\": \"local\",\n"
+                           "      \"command\": [\n"
+                           "        \"/opt/somebody-elses/binary\"\n"
+                           "      ]\n"
+                           "    }\n"
+                           "  }\n"
+                           "}\n";
+    write_test_file(config_path, original);
+
+    int rc = cbm_upsert_opencode_mcp("/usr/local/bin/codebase-memory-mcp", config_path);
+
+    char *after = read_test_file_alloc(config_path);
+    bool unchanged = after && strcmp(after, original) == 0;
+    free(after);
+    test_rmdir_r(tmpdir);
+    if (rc == 0)
+        FAIL("an entry pointing at a foreign binary must still be refused");
+    if (!unchanged)
+        FAIL("a refused entry must be left byte-identical");
+    PASS();
+}
+
+/* #1038: `uninstall --help` performed a REAL uninstall - it removed the binary
+ * and every agent configuration. The top-level dispatcher matches the
+ * subcommand at argv[1] and forwards the rest, so its own --help check never
+ * saw argv[2], and nothing downstream looked.
+ *
+ * --help is the flag someone types precisely BECAUSE they are unsure what a
+ * command does; it must never be the thing that destroys their install. */
+TEST(cli_uninstall_help_does_not_uninstall_issue1038) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-uninstall-help-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char bin_dir[512];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/bin", tmpdir);
+    test_mkdirp(bin_dir);
+    char binary[640];
+    snprintf(binary, sizeof(binary), "%s/codebase-memory-mcp", bin_dir);
+    write_test_file(binary, "#!/bin/sh\nexit 0\n");
+
+    char dir_arg[640];
+    snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", bin_dir);
+    char *argv_help[] = {(char *)"uninstall", dir_arg, (char *)"--help"};
+    int rc = cbm_cmd_uninstall(3, argv_help);
+
+    bool binary_survived = access(binary, F_OK) == 0;
+    test_rmdir_r(tmpdir);
+    if (rc != 0)
+        FAIL("uninstall --help must succeed");
+    if (!binary_survived)
+        FAIL("uninstall --help must NOT remove the installed binary");
+    PASS();
+}
+
 TEST(cli_opencode_config_dir_detects_without_retargeting_global_json) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-opencode-dir-XXXXXX");
@@ -9198,6 +9450,89 @@ TEST(cli_codex_migrates_to_single_hook_representation) {
     PASS();
 }
 
+#ifndef _WIN32
+TEST(cli_codex_preflight_reports_heading_and_reason) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-preflight-reason-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char codex_dir[512];
+    char config_path[640];
+    char agents_path[640];
+    snprintf(codex_dir, sizeof(codex_dir), "%s/.codex", tmpdir);
+    snprintf(config_path, sizeof(config_path), "%s/config.toml", codex_dir);
+    snprintf(agents_path, sizeof(agents_path), "%s/AGENTS.md", codex_dir);
+    if (test_mkdirp(codex_dir) != 0) {
+        test_rmdir_r(tmpdir);
+        FAIL("failed to create Codex preflight fixture directory");
+    }
+    const char *ambiguous =
+        "[hooks]\nSessionStart = [{ matcher = 'startup|resume|clear|compact', hooks = ["
+        "{ type = 'command', command = 'codebase-memory-mcp hook-augment' }, "
+        "{ type = 'command', command = 'foreign' }] }]\n";
+    if (write_test_file(config_path, ambiguous) != 0) {
+        test_rmdir_r(tmpdir);
+        FAIL("failed to write Codex preflight fixture config");
+    }
+
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    char *saved_codex = save_test_env("CODEX_HOME");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_unsetenv("CODEX_HOME");
+
+    FILE *capture = tmpfile();
+    int saved_stdout = capture ? dup(STDOUT_FILENO) : -1;
+    int saved_stderr = capture ? dup(STDERR_FILENO) : -1;
+    bool redirected = false;
+    int install_rc = -1;
+    if (capture && saved_stdout >= 0 && saved_stderr >= 0) {
+        fflush(NULL);
+        redirected =
+            dup2(fileno(capture), STDOUT_FILENO) >= 0 && dup2(fileno(capture), STDERR_FILENO) >= 0;
+        if (redirected) {
+            install_rc =
+                cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+        }
+        fflush(NULL);
+        (void)dup2(saved_stdout, STDOUT_FILENO);
+        (void)dup2(saved_stderr, STDERR_FILENO);
+    }
+    if (saved_stdout >= 0) {
+        close(saved_stdout);
+    }
+    if (saved_stderr >= 0) {
+        close(saved_stderr);
+    }
+
+    char output[8192] = {0};
+    if (capture) {
+        rewind(capture);
+        size_t count = fread(output, 1, sizeof(output) - 1U, capture);
+        output[count] = '\0';
+        fclose(capture);
+    }
+    char *after = read_test_file_alloc(config_path);
+    struct stat state;
+    bool unchanged = after && strcmp(after, ambiguous) == 0 && stat(agents_path, &state) != 0;
+    bool diagnostic =
+        strstr(output, "Codex CLI:\nerror: agent_config agent=Codex CLI op=hook_preflight path=") !=
+            NULL &&
+        strstr(output, "reason=ambiguous_hook_ownership") != NULL;
+    free(after);
+
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("CODEX_HOME", saved_codex);
+    test_rmdir_r(tmpdir);
+    if (!redirected || install_rc == 0 || !unchanged || !diagnostic)
+        FAIL("Codex preflight refusal must retain its heading, reason, and fail-closed state");
+    PASS();
+}
+#endif
+
 /* The PreToolUse augmenter parses search_graph's format:"json" payload to
  * build additionalContext. This test feeds it the REAL envelope from a live
  * in-memory server, so any drift between the response shape and the parser
@@ -10278,7 +10613,7 @@ TEST(cli_upsert_codex_mcp_fresh) {
      * subprocess. Without CBM_CACHE_DIR the spawned server uses the DEFAULT
      * cache while the daemon uses the configured one, the two disagree, and the
      * handshake closes — Codex then shows no cbm tools at all. */
-    ASSERT(strstr(data, "env_vars = [\"CBM_CACHE_DIR\"]") != NULL);
+    ASSERT(strstr(data, "env_vars = [\"CBM_CACHE_DIR\", \"CBM_RUNTIME_DIR\"]") != NULL);
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -12110,6 +12445,67 @@ TEST(cli_print_tool_help_issue680) {
     PASS();
 }
 
+/* #1359: `cli <tool>` with no argument-bearing token used to slurp stdin to EOF
+ * for ANY non-terminal stdin. The ordinary automation caller never sends that
+ * EOF — Node's child_process.spawn defaults to stdio:['pipe','pipe','pipe'] and
+ * the parent must call child.stdin.end() explicitly — so `cli list_projects`
+ * parked in fread(0) with no writer and never returned (the reporter's script
+ * was still stuck fourteen minutes later). list_projects declares no schema
+ * properties, so stdin could never have carried anything it accepts: the read
+ * was pure deadlock. Gate the read on the tool actually declaring arguments. */
+TEST(cli_zero_argument_tool_never_reads_stdin_issue1359) {
+    /* #1359's deadlock class: a tool whose schema declares no properties must
+     * never read stdin (nothing it could carry; the read is pure deadlock).
+     * Since #1181 no SHIPPED tool is zero-argument anymore — list_projects,
+     * the original example, now declares pagination properties — so the
+     * zero-argument branch is exercised directly through the schema seam,
+     * and list_projects asserts its NEW truth. */
+    ASSERT_FALSE(
+        cbm_cli_stdin_allowed_for_schema_for_test("{\"type\":\"object\",\"properties\":{}}"));
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test("{\"type\":\"object\"}"));
+    ASSERT_TRUE(cbm_cli_stdin_allowed_for_schema_for_test(
+        "{\"type\":\"object\",\"properties\":{\"p\":{\"type\":\"string\"}}}"));
+
+    /* list_projects now takes piped arguments (offset/limit/include_details);
+     * the TTY guard still refuses regardless of schema. */
+    ASSERT_TRUE(cbm_cli_args_from_stdin_allowed("list_projects", false));
+    ASSERT_FALSE(cbm_cli_args_from_stdin_allowed("list_projects", true));
+    PASS();
+}
+
+/* The gate must track the advertised input_schema for the WHOLE tool table, not
+ * carry a special case for list_projects: a future zero-argument tool would
+ * otherwise reintroduce #1359 silently. Expectation is derived independently
+ * from the schema the MCP tools/list publishes. */
+TEST(cli_stdin_args_gate_tracks_tool_schema_issue1359) {
+    int zero_argument_tools = 0;
+    for (int i = 0; i < cbm_mcp_tool_count(); i++) {
+        const char *name = cbm_mcp_tool_name(i);
+        ASSERT_NOT_NULL(name);
+        const char *schema = cbm_mcp_tool_input_schema(name);
+        ASSERT_NOT_NULL(schema);
+
+        yyjson_doc *doc = yyjson_read(schema, strlen(schema), 0);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *props = yyjson_obj_get(yyjson_doc_get_root(doc), "properties");
+        bool declares_properties = props && yyjson_is_obj(props) && yyjson_obj_size(props) > 0;
+        yyjson_doc_free(doc);
+
+        if (!declares_properties) {
+            zero_argument_tools++;
+        }
+        ASSERT_EQ(cbm_cli_args_from_stdin_allowed(name, false), declares_properties);
+        ASSERT_FALSE(cbm_cli_args_from_stdin_allowed(name, true));
+    }
+    /* Since #1181 every shipped tool declares properties, so the sweep's
+     * zero-argument branch can be empty here — that branch is pinned directly
+     * against the schema seam in the test above, which survives the registry
+     * having no zero-argument example. The sweep still proves schema↔gate
+     * parity for every tool that exists. */
+    (void)zero_argument_tools;
+    PASS();
+}
+
 /* The self-update path verifies a downloaded archive against a published
  * checksum. That check is only meaningful if the digest is actually computed —
  * a broken hash command (it once invoked `shasum -a CBM_SZ_256`, an invalid
@@ -12464,7 +12860,61 @@ TEST(cli_windows_update_hands_off_to_install_script) {
  *  Suite definition
  * ═══════════════════════════════════════════════════════════════════ */
 
+/* #1632: `update` derives the installer command from the BINARY's directory,
+ * which is not the same question as "is the installer there". A binary in
+ * ~/.local/bin with no install.sh beside it still produced:
+ *
+ *     bash "/home/<user>/.local/bin/install.sh"
+ *     /usr/bin/bash: .../install.sh: No such file or directory
+ *
+ * reported on discussion #1560 by a user already three releases deep in install
+ * trouble. `update` exists to tell someone how to proceed; ending on a command
+ * that cannot run is the one outcome it must not produce. */
+TEST(cli_update_only_names_an_installer_that_exists_issue1632) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-installer-probe-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+#ifdef _WIN32
+    const char *installer = "install.ps1";
+#else
+    const char *installer = "install.sh";
+#endif
+
+    /* A directory holding the binary but no installer must not be advertised. */
+    bool absent_is_refused = !cbm_cli_installer_beside_binary(tmpdir);
+
+    char script[512];
+    snprintf(script, sizeof(script), "%s/%s", tmpdir, installer);
+    write_test_file(script, "#!/bin/sh\nexit 0\n");
+    bool present_is_accepted = cbm_cli_installer_beside_binary(tmpdir);
+
+    /* A directory of that name must not count: `bash <dir>` is not a command. */
+    char decoy[512];
+    snprintf(decoy, sizeof(decoy), "%s/decoy", tmpdir);
+    test_mkdirp(decoy);
+    char decoy_installer[640];
+    snprintf(decoy_installer, sizeof(decoy_installer), "%s/%s", decoy, installer);
+    test_mkdirp(decoy_installer);
+    bool directory_is_refused = !cbm_cli_installer_beside_binary(decoy);
+
+    bool empty_is_refused = !cbm_cli_installer_beside_binary("");
+    test_rmdir_r(tmpdir);
+
+    if (!absent_is_refused)
+        FAIL("a directory with no installer must not be named as one");
+    if (!present_is_accepted)
+        FAIL("an installer that is present must be named");
+    if (!directory_is_refused)
+        FAIL("a DIRECTORY named install.sh is not a runnable installer");
+    if (!empty_is_refused)
+        FAIL("an empty directory string must be refused");
+    PASS();
+}
+
 SUITE(cli) {
+    RUN_TEST(cli_update_only_names_an_installer_that_exists_issue1632);
     RUN_TEST(cli_progress_visibility_policy);
     RUN_TEST(cli_raw_mcp_result_preserves_tool_error_status);
     RUN_TEST(cli_maintenance_cancellation_forces_failure_status);
@@ -12559,6 +13009,10 @@ SUITE(cli) {
     RUN_TEST(cli_editor_mcp_uninstall);
     RUN_TEST(cli_junie_mcp_install_issue651);
     RUN_TEST(cli_junie_mcp_repairs_all_known_previous_aliases_atomically);
+    RUN_TEST(cli_goose_block_carries_required_name_issue1675);
+    RUN_TEST(cli_editor_mcp_field_repairs_annotated_entry_via_previous_issue1630);
+    RUN_TEST(cli_opencode_moved_entry_without_authority_refuses_issue1630);
+    RUN_TEST(cli_opencode_owns_backslash_command_issue1582);
     RUN_TEST(cli_gemini_mcp_install);
     RUN_TEST(cli_openclaw_mcp_install_uses_nested_servers);
     RUN_TEST(cli_openclaw_mcp_preserves_existing_config);
@@ -12669,6 +13123,9 @@ SUITE(cli) {
     RUN_TEST(cli_antigravity_plan_uses_documented_global_files);
     RUN_TEST(cli_opencode_honors_custom_config);
     RUN_TEST(cli_opencode_prefers_existing_jsonc_config_discussion1560);
+    RUN_TEST(cli_opencode_accepts_entry_annotated_with_enabled_issue1630);
+    RUN_TEST(cli_opencode_still_refuses_foreign_command_issue1630);
+    RUN_TEST(cli_uninstall_help_does_not_uninstall_issue1038);
     RUN_TEST(cli_opencode_config_dir_detects_without_retargeting_global_json);
     RUN_TEST(cli_kiro_and_hermes_homes_are_honored);
     RUN_TEST(cli_detect_agents_finds_official_kiro_cli_executable);
@@ -12704,6 +13161,9 @@ SUITE(cli) {
     RUN_TEST(cli_claude_hook_scripts_shell_quote_binary_path);
     RUN_TEST(cli_claude_hook_commands_shell_quote_custom_config_dir);
     RUN_TEST(cli_codex_migrates_to_single_hook_representation);
+#ifndef _WIN32
+    RUN_TEST(cli_codex_preflight_reports_heading_and_reason);
+#endif
     RUN_TEST(cli_hook_augment_context_tracks_search_json_shape);
     RUN_TEST(cli_hook_augment_lifecycle_output_contract);
     RUN_TEST(cli_hook_augment_subagent_tier_router_contract);
@@ -12827,4 +13287,8 @@ SUITE(cli) {
     RUN_TEST(cli_build_args_json_key_equals_value_issue680);
     RUN_TEST(cli_build_args_json_bad_positional_errors_issue680);
     RUN_TEST(cli_print_tool_help_issue680);
+
+    /* Stdin argument gate (#1359) */
+    RUN_TEST(cli_zero_argument_tool_never_reads_stdin_issue1359);
+    RUN_TEST(cli_stdin_args_gate_tracks_tool_schema_issue1359);
 }

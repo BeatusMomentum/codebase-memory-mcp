@@ -688,9 +688,12 @@ TEST(cypher_exec_optional_saturated_does_not_fabricate_no_match) {
     /* 3 Function nodes → scan_count = 3; max_rows = 3 → bind_cap = 3 and
      * max_new = 30. A alone exceeds that, so B and C are reached with the
      * budget already spent — the regime that produced the fabrication. */
-    cbm_node_t a = {.project = "test", .label = "Function", .name = "A", .qualified_name = "test.A"};
-    cbm_node_t b = {.project = "test", .label = "Function", .name = "B", .qualified_name = "test.B"};
-    cbm_node_t c = {.project = "test", .label = "Function", .name = "C", .qualified_name = "test.C"};
+    cbm_node_t a = {
+        .project = "test", .label = "Function", .name = "A", .qualified_name = "test.A"};
+    cbm_node_t b = {
+        .project = "test", .label = "Function", .name = "B", .qualified_name = "test.B"};
+    cbm_node_t c = {
+        .project = "test", .label = "Function", .name = "C", .qualified_name = "test.C"};
     int64_t a_id = cbm_store_upsert_node(s, &a);
     (void)cbm_store_upsert_node(s, &b); /* B: no outgoing CALLS at all */
     int64_t c_id = cbm_store_upsert_node(s, &c);
@@ -965,9 +968,9 @@ TEST(cypher_exec_bound_terminal_saturation_no_false_deadcode) {
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(r.col_count, 2);
 
-    bool hub_expanded = false;      /* sanity: the buffer really did fill from a hub */
+    bool hub_expanded = false;       /* sanity: the buffer really did fill from a hub */
     bool hub_false_deadcode = false; /* the bug: a hub with callers invented as dead */
-    bool leaf_deadcode = false;     /* the lossless property: genuine dead code kept */
+    bool leaf_deadcode = false;      /* the lossless property: genuine dead code kept */
     for (int i = 0; i < r.row_count; i++) {
         const char *f = r.rows[i][0];
         const char *c = r.rows[i][1];
@@ -1001,6 +1004,113 @@ TEST(cypher_exec_where_eq) {
     ASSERT_EQ(r.row_count, 1);
 
     cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* #1196: max_rows limits projected results, not the source-node candidates
+ * considered before WHERE. The old unlabeled scan searched only
+ * 10 * max_rows nodes, so a valid match later in search order disappeared. */
+TEST(cypher_exec_unlabeled_where_beyond_result_limit_issue1196) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    for (int i = 0; i < 11; i++) {
+        char name[32];
+        char qn[64];
+        snprintf(name, sizeof(name), "early_%02d", i);
+        snprintf(qn, sizeof(qn), "test.%s", name);
+        cbm_node_t distractor = {.project = "test",
+                                 .label = "Function",
+                                 .name = name,
+                                 .qualified_name = qn,
+                                 .file_path = "early.py"};
+        ASSERT_GT(cbm_store_upsert_node(s, &distractor), 0);
+    }
+
+    cbm_node_t late = {.project = "test",
+                       .label = "Function",
+                       .name = "zz_late_match",
+                       .qualified_name = "test.zz_late_match",
+                       .file_path = "late.py"};
+    ASSERT_GT(cbm_store_upsert_node(s, &late), 0);
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (n) WHERE n.name = \"zz_late_match\" RETURN n.name",
+                                "test", 1, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "zz_late_match");
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* #1196 (second mechanism): relationship expansion capped this hop's TOTAL
+ * output at bind_cap*10, so edges past the cap were silently dropped BEFORE
+ * WHERE and aggregation — a count() then reported the scanned prefix as if
+ * it were a fact (field-measured: 9,360 of 13,691 DEFINES with a labeled
+ * source and --max-rows 1000). max_rows is an OUTPUT-row limit (projection
+ * already enforces it); expansion must see every matched edge. Fixture: 2
+ * labeled sources with 30 edges each; max_rows=2 makes the old cap 20. */
+TEST(cypher_exec_aggregate_sees_all_edges_beyond_expansion_cap_issue1196) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    int64_t src_ids[2];
+    for (int i = 0; i < 2; i++) {
+        char name[32];
+        char qn[64];
+        snprintf(name, sizeof(name), "file_%d", i);
+        snprintf(qn, sizeof(qn), "test.%s", name);
+        cbm_node_t src = {.project = "test",
+                          .label = "File",
+                          .name = name,
+                          .qualified_name = qn,
+                          .file_path = name};
+        src_ids[i] = cbm_store_upsert_node(s, &src);
+        ASSERT_GT(src_ids[i], 0);
+    }
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < 30; j++) {
+            char name[32];
+            char qn[64];
+            snprintf(name, sizeof(name), "def_%d_%02d", i, j);
+            snprintf(qn, sizeof(qn), "test.%s", name);
+            cbm_node_t target = {.project = "test",
+                                 .label = "Function",
+                                 .name = name,
+                                 .qualified_name = qn,
+                                 .file_path = "defs.py"};
+            int64_t tid = cbm_store_upsert_node(s, &target);
+            ASSERT_GT(tid, 0);
+            cbm_edge_t e = {
+                .project = "test", .source_id = src_ids[i], .target_id = tid, .type = "DEFINES"};
+            cbm_store_insert_edge(s, &e);
+        }
+    }
+
+    /* Aggregate: one output row, so max_rows=2 never limits the OUTPUT —
+     * only the (buggy) expansion. Ground truth: 60 edges. */
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (a:File)-[rel]->(b) RETURN count(rel)", "test", 2, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "60");
+    cbm_cypher_result_free(&r);
+
+    /* The list form must saturate at the output limit, not at the scan:
+     * max_rows=25 returns exactly 25 rows (old cap: bind_cap=25 -> 250,
+     * fine here — but max_rows=2 must return 2 rows, not 2-of-20-scanned). */
+    cbm_cypher_result_t r2 = {0};
+    rc = cbm_cypher_execute(s, "MATCH (a:File)-[rel]->(b) RETURN b.name", "test", 2, &r2);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r2.row_count, 2);
+    cbm_cypher_result_free(&r2);
+
     cbm_store_close(s);
     PASS();
 }
@@ -1599,6 +1709,22 @@ TEST(cypher_exec_variable_length) {
     ASSERT_EQ(rc, 0);
     /* Should find: ValidateOrder (1 hop), SubmitOrder (2 hops), LogError (1 hop) */
     ASSERT_GTE(r.row_count, 3);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_variable_length_repeated_node_var_unifies) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function)-[:CALLS*1..2]->(f:Function) "
+                                "RETURN f.name",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 0);
 
     cbm_cypher_result_free(&r);
     cbm_store_close(s);
@@ -2890,11 +3016,10 @@ TEST(cypher_exec_multikey_order_by_keeps_limit_issue1334) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
     /* start_lines: HandleOrder=10, ValidateOrder=5, SubmitOrder=0, LogError=0 */
-    int rc = cbm_cypher_execute(
-        s,
-        "MATCH (f:Function) RETURN f.name, f.start_line "
-        "ORDER BY f.start_line DESC, f.name ASC LIMIT 2",
-        "test", 0, &r);
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) RETURN f.name, f.start_line "
+                                "ORDER BY f.start_line DESC, f.name ASC LIMIT 2",
+                                "test", 0, &r);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(r.row_count, 2);
     ASSERT_STR_EQ(r.rows[0][0], "HandleOrder");
@@ -2910,11 +3035,10 @@ TEST(cypher_exec_multikey_order_by_tiebreak_issue1334) {
     cbm_cypher_result_t r = {0};
     /* start_line ASC puts the two 0-line functions first; name DESC breaks the
      * tie: SubmitOrder before LogError. */
-    int rc = cbm_cypher_execute(
-        s,
-        "MATCH (f:Function) RETURN f.name, f.start_line "
-        "ORDER BY f.start_line ASC, f.name DESC LIMIT 2",
-        "test", 0, &r);
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) RETURN f.name, f.start_line "
+                                "ORDER BY f.start_line ASC, f.name DESC LIMIT 2",
+                                "test", 0, &r);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(r.row_count, 2);
     ASSERT_STR_EQ(r.rows[0][0], "SubmitOrder");
@@ -3239,8 +3363,7 @@ TEST(cypher_issue1111_with_type_count_group) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
     int rc = cbm_cypher_execute(
-        s,
-        "MATCH (a)-[r]->(b) WITH type(r) AS t, count(*) AS n RETURN t, n ORDER BY n DESC",
+        s, "MATCH (a)-[r]->(b) WITH type(r) AS t, count(*) AS n RETURN t, n ORDER BY n DESC",
         "test", 0, &r);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(r.row_count, 2);
@@ -3881,6 +4004,8 @@ SUITE(cypher) {
     RUN_TEST(cypher_issue252_tointeger);
     RUN_TEST(cypher_issue305_count_star_alias);
     RUN_TEST(cypher_exec_where_eq);
+    RUN_TEST(cypher_exec_unlabeled_where_beyond_result_limit_issue1196);
+    RUN_TEST(cypher_exec_aggregate_sees_all_edges_beyond_expansion_cap_issue1196);
     RUN_TEST(cypher_exec_varlength_path_semantics_issue797);
     RUN_TEST(cypher_exec_where_coalesce_issue874);
     RUN_TEST(cypher_exec_where_regex);
@@ -3910,6 +4035,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_limit);
     RUN_TEST(cypher_exec_order_by);
     RUN_TEST(cypher_exec_variable_length);
+    RUN_TEST(cypher_exec_variable_length_repeated_node_var_unifies);
     RUN_TEST(cypher_exec_var_length_explicit_bound_capped);
     RUN_TEST(cypher_exec_defines_edge);
     RUN_TEST(cypher_exec_no_results);

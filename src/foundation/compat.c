@@ -6,6 +6,7 @@
  */
 #include "foundation/compat.h"
 #include "foundation/constants.h"
+#include "foundation/secure_random.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -114,52 +115,80 @@ static bool win_mkdtemp_private_create(const char *path) {
 }
 
 char *cbm_mkdtemp(char *tmpl) {
-    /* Build path in static buffer, then copy back to caller.
-     * Callers must provide buffers >= CBM_SZ_256 bytes (all test code does). */
-    static char buf[CBM_SZ_512];
+    /* Per-call storage is required: daemon sessions invoke mkdtemp concurrently.
+     * A process-global buffer lets one request overwrite another request's path
+     * between expansion, creation, and the copy back to its caller. */
+    char buf[CBM_SZ_512];
+    int written;
     if (strncmp(tmpl, "/tmp/", 5) == 0) {
         const char *tmp = getenv("TEMP");
         if (!tmp)
             tmp = getenv("TMP");
         if (!tmp)
             tmp = ".";
-        snprintf(buf, sizeof(buf), "%s\\%s", tmp, tmpl + 5);
+        written = snprintf(buf, sizeof(buf), "%s\\%s", tmp, tmpl + 5);
     } else {
-        snprintf(buf, sizeof(buf), "%s", tmpl);
+        written = snprintf(buf, sizeof(buf), "%s", tmpl);
     }
-    /* Wide-API template expansion: the ANSI CRT interprets the UTF-8 bytes of
-     * non-ASCII cache/temp components in the local codepage and fails. */
-    wchar_t *wide_template = cbm_utf8_to_wide(buf);
-    if (!wide_template || !_wmktemp(wide_template)) {
-        free(wide_template);
+    if (written < 0 || (size_t)written >= sizeof(buf)) {
+        errno = ENAMETOOLONG;
         return NULL;
     }
-    char *expanded = cbm_wide_to_utf8(wide_template);
-    free(wide_template);
-    if (!expanded || strlen(expanded) >= sizeof(buf)) {
-        free(expanded);
+
+    size_t length = strlen(buf);
+    if (length < 6 || strcmp(buf + length - 6, "XXXXXX") != 0) {
+        errno = EINVAL;
         return NULL;
     }
-    strcpy(buf, expanded);
-    free(expanded);
-    if (!win_mkdtemp_private_create(buf)) {
-        /* One-time note: every private-namespace validation downstream
-         * depends on the explicit descriptor, so a silent fallback turns
-         * into unexplained owner/DACL refusals far from this call site. */
-        static bool fallback_reported;
+
+    static const char alphabet[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    bool created = false;
+    for (int attempt = 0; attempt < 128; attempt++) {
+        unsigned char random_suffix[6];
+        if (!cbm_secure_random(random_suffix, sizeof(random_suffix))) {
+            errno = EIO;
+            return NULL;
+        }
+        for (size_t index = 0; index < sizeof(random_suffix); index++) {
+            buf[length - sizeof(random_suffix) + index] =
+                alphabet[random_suffix[index] % (sizeof(alphabet) - 1)];
+        }
+
+        if (win_mkdtemp_private_create(buf)) {
+            created = true;
+            break;
+        }
+
+        /* Keep the existing compatibility fallback when an explicit private
+         * descriptor is unavailable. A name collision is retried; any other
+         * filesystem refusal is returned to the caller immediately. */
         DWORD create_error = GetLastError();
         wchar_t *wide_directory = cbm_utf8_to_wide(buf);
+        errno = 0;
         int mkdir_result = wide_directory ? _wmkdir(wide_directory) : -1;
+        int mkdir_error = errno;
         free(wide_directory);
-        if (mkdir_result != 0)
-            return NULL;
-        if (!fallback_reported) {
-            fallback_reported = true;
-            (void)fprintf(stderr,
-                          "warning: private temp-directory descriptor unavailable "
-                          "(os %lu); using default directory security\n",
-                          (unsigned long)create_error);
+        if (mkdir_result == 0) {
+            static volatile LONG fallback_reported;
+            if (InterlockedCompareExchange(&fallback_reported, 1, 0) == 0) {
+                (void)fprintf(stderr,
+                              "warning: private temp-directory descriptor unavailable "
+                              "(os %lu); using default directory security\n",
+                              (unsigned long)create_error);
+            }
+            created = true;
+            break;
         }
+        if (create_error == ERROR_ALREADY_EXISTS || create_error == ERROR_FILE_EXISTS ||
+            mkdir_error == EEXIST) {
+            continue;
+        }
+        errno = mkdir_error != 0 ? mkdir_error : EACCES;
+        return NULL;
+    }
+    if (!created) {
+        errno = EEXIST;
+        return NULL;
     }
     /* Normalize to forward slashes. Callers embed this path in JSON repo_path
      * (where "\t"/"\a" are invalid escapes → index fails) and pass it to git -C.

@@ -657,7 +657,7 @@ int cbm_scan_project_env_urls_excluded(const char *root_path, cbm_env_binding_t 
  * files, merges into disk DB. Returns 0 on success. */
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
                                  int file_count, const cbm_file_hash_t *baseline_manifest,
-                                 int baseline_count);
+                                 int baseline_count, bool force_full_on_mismatch);
 
 /* Exact semantic inputs for no-op/forced-full routing. The manifest contains
  * every discovered source plus repository controls actually consumed by
@@ -752,11 +752,6 @@ int cbm_delta_patch(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf, i
                     const cbm_delta_saved_edge_t *snapshot, int snapshot_count);
 /* discard helper shared with the delta executor (unlink stage + sidecars). */
 void cbm_pipeline_discard_stage(const char *stage_path);
-/* The SQLite generation is authoritative. An explicitly requested artifact is
- * part of the caller-visible operation and its export error is returned;
- * automatic refresh of an already-existing artifact remains best-effort. */
-int cbm_pipeline_refresh_artifact(cbm_pipeline_t *p, const char *db_path);
-
 /* Hand the pipeline the per-file LSP-surface rows serialized at the
  * collect_all_defs seam (the only moment the result cache is alive).
  * Takes ownership; dump_and_persist_hashes writes them into the staging

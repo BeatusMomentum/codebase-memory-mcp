@@ -386,6 +386,28 @@ TEST(resolve_import_map_bare_alias) {
     PASS();
 }
 
+/* Adversarial pin: when import_map already stores the def QN under the alias
+ * key, bare alias call must CALLS→def (not invent …M.bridge_execute). Behavior
+ * already on main via #875/#979; this locks the Yui G1 shape. */
+TEST(resolve_import_map_aliased_from_import) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "execute", "proj.services.satori_bridge.gate.execute", "Function");
+    /* Alias ghost must not win if somehow registered. */
+    cbm_registry_add(r, "bridge_execute", "proj.services.satori_bridge.gate.bridge_execute",
+                     "Function");
+
+    const char *keys[] = {"bridge_execute"};
+    const char *vals[] = {"proj.services.satori_bridge.gate.execute"};
+
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "bridge_execute", "proj.services.yui_core.router", keys, vals, 1);
+    ASSERT_STR_EQ(res.qualified_name, "proj.services.satori_bridge.gate.execute");
+    ASSERT_STR_EQ(res.strategy, "import_map");
+
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(resolve_unique_name) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add(r, "UniqueFunc", "proj.deep.path.UniqueFunc", "Function");
@@ -761,6 +783,34 @@ TEST(perl_suppress_keeps_high_confidence_and_genuine_calls) {
     PASS();
 }
 
+TEST(cross_language_suffix_match_drops_py_vs_js) {
+    /* #725: two same-named symbols in different languages. suffix_match is the
+     * strategy that collapses them; unique_name is #1572 and must stay. */
+    ASSERT_TRUE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "web/src/pages/Editor.js",
+                                                         "suffix_match"));
+    ASSERT_TRUE(cbm_suppress_cross_language_suffix_match(CBM_LANG_JAVASCRIPT, "store.py",
+                                                         "suffix_match"));
+    ASSERT_TRUE(cbm_suppress_cross_language_suffix_match(CBM_LANG_BASH, "cli/main.py",
+                                                         "suffix_match"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "store.py",
+                                                          "suffix_match"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "web/src/pages/Editor.js",
+                                                          "unique_name"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "web/src/pages/Editor.js",
+                                                          "same_module"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "web/src/pages/Editor.js",
+                                                          "import_map"));
+    /* JS/TS/TSX are one family. */
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_JAVASCRIPT, "lib/util.ts",
+                                                          "suffix_match"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_TYPESCRIPT, "ui/Panel.tsx",
+                                                          "suffix_match"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, NULL, "suffix_match"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_COUNT, "store.py",
+                                                          "suffix_match"));
+    PASS();
+}
+
 TEST(tsjs_suppress_drops_weak_method_matches) {
     /* #592/#606: a TS/JS member call whose receiver the LSP could not type, that
      * landed via a WEAK short-name strategy, is generic-resolver noise → drop.
@@ -860,6 +910,7 @@ SUITE(registry) {
     RUN_TEST(resolve_import_map);
     RUN_TEST(resolve_import_map_bare_function);
     RUN_TEST(resolve_import_map_bare_alias);
+    RUN_TEST(resolve_import_map_aliased_from_import);
     RUN_TEST(resolve_import_map_alias_with_suffix_hits_method);
     RUN_TEST(resolve_unique_name);
     RUN_TEST(resolve_unresolved);
@@ -893,6 +944,7 @@ SUITE(registry) {
     RUN_TEST(perl_builtin_set_rejects_project_subs);
     RUN_TEST(perl_suppress_drops_weak_builtin_and_method_matches);
     RUN_TEST(perl_suppress_keeps_high_confidence_and_genuine_calls);
+    RUN_TEST(cross_language_suffix_match_drops_py_vs_js);
     RUN_TEST(tsjs_suppress_drops_weak_method_matches);
     RUN_TEST(tsjs_suppress_keeps_high_confidence_and_non_methods);
 }

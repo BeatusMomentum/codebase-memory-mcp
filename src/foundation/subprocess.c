@@ -8,7 +8,8 @@
 #include "compat.h" /* cbm_nanosleep */
 #include "compat_fs.h"
 #include "log.h"
-#include "platform.h" /* cbm_now_ms */
+#include "platform.h"  /* cbm_now_ms */
+#include "sanitized.h" /* CBM_SANITIZED — spawn-retry budget */
 
 #include <stdio.h>
 #include <stdatomic.h>
@@ -902,8 +903,7 @@ static cbm_proc_poll_t cbm_subprocess_poll_win(cbm_subprocess_t *process, cbm_pr
  * hang for seconds. So the extra patience is scoped to the builds that need it,
  * the same way the daemon announce backstop is (test_daemon_frontend.c). Three
  * more doublings take the sanitized ceiling to roughly 5s. */
-#if defined(CBM_SANITIZED_BUILD) || defined(__SANITIZE_ADDRESS__) || \
-    defined(__SANITIZE_MEMORY__) || defined(__SANITIZE_THREAD__)
+#if CBM_SANITIZED
 enum { CBM_SPAWN_RETRY = 2, CBM_SPAWN_RETRY_ATTEMPTS = 9 };
 #else
 enum { CBM_SPAWN_RETRY = 2, CBM_SPAWN_RETRY_ATTEMPTS = 6 };
@@ -912,8 +912,9 @@ enum { CBM_SPAWN_RETRY = 2, CBM_SPAWN_RETRY_ATTEMPTS = 6 };
 /* Exponential backoff, doubling from 10ms: 10, 20, 40, 80, 160, 320 — ~630ms of
  * total patience on an ordinary build, and three further doublings (640, 1280,
  * 2560) to roughly 5s on a sanitized one. The waits follow from
- * CBM_SPAWN_RETRY_ATTEMPTS above rather than being listed separately here, so
- * changing the budget cannot leave this description behind.
+ * CBM_SPAWN_RETRY_ATTEMPTS above and from the per-wait ceiling at
+ * cbm_spawn_backoff, rather than being listed separately here, so changing the
+ * budget cannot leave this description behind.
  *
  * The first version waited a flat 3 x 10ms, which was enough for a momentary
  * dip and NOT enough for the real thing: a CI runner building and testing in
@@ -948,13 +949,26 @@ static bool cbm_spawn_eagain_injected(void) {
 }
 #endif
 
+/* The bound is on a single WAIT, and 2560ms (10ms << 8) is the largest wait
+ * either budget produces today: 10..320 on an ordinary build, 10..2560 on a
+ * sanitized one. So this changes nothing now — it changes what happens next.
+ *
+ * The clamp it replaces bounded `attempt` by CBM_SPAWN_RETRY_ATTEMPTS, which no
+ * caller can reach: both retry loops return before passing the budget, so the
+ * clamp never fired and the comment claiming "the budget is the only bound
+ * needed" described a bound that did not exist. Doubling with nothing to stop
+ * it is the actual risk, and it grows fast — a budget of 12 would make the last
+ * wait ~20s and the total ~41s, which is precisely the "hang instead of fail
+ * fast" the retry was written to avoid. Flattening at the ceiling keeps a
+ * budget increase linear.
+ *
+ * Spelled as a shift so the value cannot overflow `long` on the way to being
+ * clamped. */
+enum { CBM_SPAWN_BACKOFF_BASE_MS = 10, CBM_SPAWN_BACKOFF_MAX_SHIFT = 8 };
+
 static void cbm_spawn_backoff(int attempt) {
-    /* Cap the shift at the budget, not at a constant: with the sanitized budget
-     * of 9 a hard-coded 6 would flatten the last three waits to 320ms each
-     * instead of continuing to double. The budget is the only bound needed —
-     * callers never exceed it, and a second clamp would be dead code. */
-    int shift = attempt < CBM_SPAWN_RETRY_ATTEMPTS ? attempt : CBM_SPAWN_RETRY_ATTEMPTS;
-    long ms = 10L << shift;
+    int shift = attempt < CBM_SPAWN_BACKOFF_MAX_SHIFT ? attempt : CBM_SPAWN_BACKOFF_MAX_SHIFT;
+    long ms = (long)CBM_SPAWN_BACKOFF_BASE_MS << shift;
     struct timespec delay = {ms / 1000L, (ms % 1000L) * 1000L * 1000L};
     (void)cbm_nanosleep(&delay, NULL);
 }

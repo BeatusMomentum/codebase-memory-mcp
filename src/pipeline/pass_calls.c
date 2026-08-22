@@ -114,20 +114,23 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
     *out_vals = NULL;
     *out_count = 0;
 
-    /* Fast path: build from cached extraction result (no JSON parsing) */
+    /* Fast path: build from cached extraction via the same resolver used for
+     * IMPORTS edges. Do NOT use cbm_pipeline_fqn_module(module_path) — Python
+     * from-imports store "pkg.symbol" (and aliases) in module_path, which is
+     * not a filesystem rel-path and misses the def node. */
     if (result && result->imports.count > 0) {
         const char **keys = calloc((size_t)result->imports.count, sizeof(const char *));
         const char **vals = calloc((size_t)result->imports.count, sizeof(const char *));
         int count = 0;
+        char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel_path, "__file__");
 
         for (int i = 0; i < result->imports.count; i++) {
             const CBMImport *imp = &result->imports.items[i];
             if (!imp->local_name || !imp->local_name[0] || !imp->module_path) {
                 continue;
             }
-            char *target_qn = cbm_pipeline_fqn_module(ctx->project_name, imp->module_path);
-            const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
-            free(target_qn);
+            const cbm_gbuf_node_t *target =
+                cbm_pipeline_resolve_import_node(ctx, rel_path, file_qn, imp, NULL);
             if (!target) {
                 continue;
             }
@@ -135,11 +138,18 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
             vals[count] = target->qualified_name; /* borrowed from gbuf */
             count++;
         }
+        free(file_qn);
 
-        *out_keys = keys;
-        *out_vals = vals;
-        *out_count = count;
-        return 0;
+        if (count > 0) {
+            *out_keys = keys;
+            *out_vals = vals;
+            *out_count = count;
+            return 0;
+        }
+        free((void *)keys);
+        free((void *)vals);
+        /* Fall through to IMPORTS-edge scan when extraction paths did not
+         * resolve (should be rare once resolve_import_node is used). */
     }
 
     /* Slow path: scan graph buffer IMPORTS edges + parse JSON properties */
@@ -633,6 +643,12 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
 
     const cbm_gbuf_node_t *target_node = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
     if (!target_node || source_node->id == target_node->id) {
+        return 0;
+    }
+    /* #725: suffix_match is language-agnostic and will attach a Python
+     * Store.commit() call to a JS function named commit (or a Bash main
+     * to a Python main). Drop that weak cross-language edge. */
+    if (cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
         return 0;
     }
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,
