@@ -946,6 +946,30 @@ const char *cbm_mcp_tool_name(int index) {
     return TOOLS[index].name;
 }
 
+const char *cbm_mcp_tool_title(const char *tool_name) {
+    if (!tool_name) {
+        return NULL;
+    }
+    for (int i = 0; i < TOOL_COUNT; i++) {
+        if (strcmp(TOOLS[i].name, tool_name) == 0) {
+            return TOOLS[i].title;
+        }
+    }
+    return NULL;
+}
+
+const char *cbm_mcp_tool_description(const char *tool_name) {
+    if (!tool_name) {
+        return NULL;
+    }
+    for (int i = 0; i < TOOL_COUNT; i++) {
+        if (strcmp(TOOLS[i].name, tool_name) == 0) {
+            return TOOLS[i].description;
+        }
+    }
+    return NULL;
+}
+
 /* Render the top-level --help "Tools:" block from the registry tools/list
  * serves. The list used to be hand-maintained in the help text and drifted
  * when check_index_coverage was added (#1361); deriving it here makes that
@@ -3017,6 +3041,9 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         "        - CASE WHEN n.label IN ('Function','Method') THEN 10.0 "
         "               WHEN n.label = 'Route' THEN 8.0 "
         "               WHEN n.label IN (" CBM_SQL_TYPE_LIKE_LABELS ") THEN 5.0 "
+        /* Relations rank with the type tier: a table IS the schema container
+         * a data question is looking for (findability-first). */
+        "               WHEN n.label IN (" CBM_SQL_RELATION_LABELS ") THEN 5.0 "
         "               ELSE 0.0 END) AS rank "
         "FROM ("
         "    SELECT rowid, bm25(nodes_fts) AS base_rank"
