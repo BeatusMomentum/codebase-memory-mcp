@@ -2,6 +2,16 @@
  * @file ArkTS (HarmonyOS/OpenHarmony .ets) grammar for tree-sitter
  * @license MIT
  *
+ * Copyright (c) 2017 Max Brunsfeld            (tree-sitter-typescript, forked below)
+ * Copyright (c) 2014 Max Brunsfeld            (tree-sitter-javascript base)
+ * Copyright (c) 2026 DeusData                 (ArkTS/ArkUI additions in this file)
+ *
+ * The VENDORED parser ships upstream's MIT LICENSE byte-identical, because that
+ * is what MIT requires of a derivative and what lets the provenance audit verify
+ * it against upstream instead of trusting a note. The copyright for our own
+ * additions is stated HERE, with the source, and in THIRD_PARTY.md, which ships
+ * inside the release archives.
+ *
  * First-party DERIVATIVE grammar: a fork of tree-sitter-typescript's
  * `typescript` dialect (no JSX), extended with the ArkTS/ArkUI syntax that
  * plain TypeScript cannot parse.
