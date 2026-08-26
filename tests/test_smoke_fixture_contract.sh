@@ -69,6 +69,44 @@ require(
     "smoke-local.sh must not reserve/release a port or launch a separate http.server",
 )
 
+# Every environment variable the CLI honours ahead of $HOME. A fixture that
+# redirects only HOME still resolves these to the developer's real config, so
+# both the shell fixtures and the C runner must neutralize the whole set.
+CLIENT_HOME_OVERRIDES = (
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
+    "KIRO_HOME",
+    "HERMES_HOME",
+    "QWEN_HOME",
+    "CLINE_DATA_DIR",
+    "OPENCLAW_HOME",
+    "OPENCLAW_STATE_DIR",
+    "OPENCLAW_PROFILE",
+    "OPENCLAW_CONFIG_PATH",
+    "OPENCLAW_WORKSPACE_DIR",
+    "OPENCODE_CONFIG",
+    "OPENCODE_CONFIG_DIR",
+    "COPILOT_HOME",
+    "CRUSH_GLOBAL_CONFIG",
+    "VIBE_HOME",
+    "GLAB_CONFIG_DIR",
+    "KIMI_CODE_HOME",
+    "CBM_CONTINUE_CONFIG_PATH",
+    "CBM_TRAE_CONFIG_PATH",
+    "CBM_ROO_CONFIG_PATH",
+    "CBM_CODY_CONFIG_PATH",
+)
+
+# The C suite exercises the same install/uninstall paths as the shell fixtures,
+# so it needs the same neutralization — otherwise a green run on a developer
+# machine only proves the ambient config happened to be writable.
+test_main = read("tests/test_main.c")
+for variable in CLIENT_HOME_OVERRIDES:
+    require(
+        f'"{variable}"' in test_main,
+        f"tests/test_main.c must neutralize ambient {variable}",
+    )
+
 for relative, source in (
     ("scripts/smoke-local.sh", smoke_local),
     ("test-infrastructure/vm/vm-smoke.sh", vm_smoke),
@@ -89,31 +127,7 @@ for relative, source in (
         'wait "$SERVER_PID"' in source,
         f"{relative} cleanup must reap the fixture-server process",
     )
-    for variable in (
-        "CLAUDE_CONFIG_DIR",
-        "CODEX_HOME",
-        "KIRO_HOME",
-        "HERMES_HOME",
-        "QWEN_HOME",
-        "CLINE_DATA_DIR",
-        "OPENCLAW_HOME",
-        "OPENCLAW_STATE_DIR",
-        "OPENCLAW_PROFILE",
-        "OPENCLAW_CONFIG_PATH",
-        "OPENCLAW_WORKSPACE_DIR",
-        "OPENCODE_CONFIG",
-        "OPENCODE_CONFIG_DIR",
-        "COPILOT_HOME",
-        "CRUSH_GLOBAL_CONFIG",
-        "VIBE_HOME",
-        "GLAB_CONFIG_DIR",
-        "KIMI_CODE_HOME",
-        "CBM_CONTINUE_CONFIG_PATH",
-        "CBM_TRAE_CONFIG_PATH",
-        "CBM_ROO_CONFIG_PATH",
-        "CBM_CODY_CONFIG_PATH",
-        "CBM_TEST_WINDOWS_USER_PATH_RUN_ID",
-    ):
+    for variable in CLIENT_HOME_OVERRIDES + ("CBM_TEST_WINDOWS_USER_PATH_RUN_ID",):
         require(
             f"-u {variable}" in source,
             f"{relative} must neutralize ambient {variable}",
@@ -137,15 +151,33 @@ for relative, source in (
 # Unix fixtures mirror the release archive surface and Linux update aliases.
 for name in ("LICENSE", "install.sh", "THIRD_PARTY_NOTICES.md"):
     require(name in smoke_local, f"smoke-local.sh archive must include {name}")
+install_script = read("install.sh")
 require(
-    "codebase-memory-mcp${SUFFIX}-${OS}-${ARCH}.tar.gz" in smoke_local
-    and "codebase-memory-mcp-${OS}-${ARCH}.tar.gz" in smoke_local,
-    "smoke-local.sh must create the selected variant and standard alias",
+    'tar --no-same-owner -xzf "$DLDIR/$ARCHIVE" -C "$DLDIR"' in install_script,
+    "install.sh must not preserve release-builder ownership when extracting tar archives",
 )
 require(
-    "codebase-memory-mcp${SUFFIX}-${OS}-${ARCH}-portable.tar.gz" in smoke_local
-    and "codebase-memory-mcp-${OS}-${ARCH}-portable.tar.gz" in smoke_local,
-    "smoke-local.sh must create Linux portable selected-variant and standard aliases",
+    all(
+        needle in install_script
+        for needle in (
+            "ARCHIVE_MEMBER_COUNT",
+            "release archive contains unexpected member",
+            "release archive does not match the exact member set",
+            'for extracted_member in "$ARCHIVE_BINARY" LICENSE "$ARCHIVE_INSTALLER"',
+        )
+    )
+    and "cbm-integrations.json" not in install_script,
+    "install.sh must validate and accept the exact four-member release archive layout",
+)
+# One composition ships, so there is one archive name and no variant alias.
+require(
+    "codebase-memory-mcp-${OS}-${ARCH}.tar.gz" in smoke_local
+    and "${SUFFIX}" not in smoke_local,
+    "smoke-local.sh must create the single canonical archive with no variant alias",
+)
+require(
+    "codebase-memory-mcp-${OS}-${ARCH}-portable.tar.gz" in smoke_local,
+    "smoke-local.sh must create the Linux portable update alias",
 )
 require(
     'CBM_CACHE_DIR="$WORK_DIR/cache"' in smoke_local
@@ -311,9 +343,25 @@ require(
     and "& $args[1]" not in smoke_test,
     "Windows Phase 13 must execute install.ps1 directly with native paths",
 )
+# A count cannot tell "we still have four curls" from "every curl is safe" — it
+# passed while a loopback UI probe carried no --noproxy at all, which is the
+# exact failure this rule exists to prevent (an ambient http_proxy makes a
+# 127.0.0.1 request leave the machine). Assert the property on every invocation
+# instead, so adding or removing a curl cannot silently satisfy the rule.
+unproxied_curls = [
+    line.strip()
+    for line in smoke_test.splitlines()
+    # An invocation starts a command: line start, or after ; & | ( or `if`/`then`
+    # etc. Mentions inside echo/comment strings are not invocations.
+    if re.search(r"(?:^|[;&|(]|\b(?:if|then|else|do|not)\s)\s*curl\s", line)
+    and not line.lstrip().startswith("#")
+    and not re.search(r"echo\s", line.split("curl")[0])
+    and "--noproxy" not in line
+]
 require(
-    smoke_test.count("--noproxy '*'") >= 4,
-    "all loopback release-fixture curl requests must bypass ambient proxies",
+    not unproxied_curls,
+    "every curl in the smoke fixture must bypass ambient proxies (--noproxy '*'): "
+    + "; ".join(unproxied_curls[:3]),
 )
 require(
     "/tmp/cbm-curl12a.err" not in smoke_test

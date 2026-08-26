@@ -11,6 +11,7 @@
 #include "cli/config_json_like.h"
 #include "cli/config_text_edit.h"
 #include "cli/config_toml_edit.h"
+#include "ui/config.h"
 #include "cli/config_yaml_edit.h"
 #include "daemon/bootstrap.h"
 #include "daemon/ipc.h"
@@ -72,8 +73,6 @@ enum {
     MIN_ARGC_GET = 2,
     AUTO_YES = 1,
     AUTO_NO = -1,
-    VARIANT_A = 1,
-    VARIANT_B = 2,
     OCTAL_BASE = 8,
     CLI_ACTIVATION_DRAIN_TIMEOUT_MS = 15000,
     CLI_ACTIVATION_CONTROL_TIMEOUT_MS = 2000,
@@ -108,6 +107,10 @@ static int cbm_powershell_quote_word(const char *value, char *out, size_t out_si
 #include <stdlib.h>
 #include <string.h>   // strtok_r
 #include <sys/stat.h> // mode_t, S_IXUSR
+#ifdef __FreeBSD__
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#endif
 #include <time.h>
 #include <wchar.h>
 #include <zlib.h> // MAX_WBITS
@@ -154,9 +157,31 @@ int cbm_cli_exit_status_after_maintenance(int exit_status, bool maintenance_canc
     return maintenance_cancelled && exit_status == EXIT_SUCCESS ? EXIT_FAILURE : exit_status;
 }
 
-static const char CLI_ACTIVATION_REFUSED_MESSAGE[] =
+/* #1537. Two very different failures reached this one message: the cohort was
+ * BUSY (real sessions are running — the reader can close them), or the
+ * reservation failed outright (lock I/O, stale coordination state, permissions
+ * — nothing the reader can close, because nothing is running). Reporting both
+ * as "active sessions" sent someone hunting processes that a reboot proved did
+ * not exist.
+ *
+ * The remedy line must also survive the situation it prints in: an install or
+ * a retry after `uninstall` has no cbm on PATH, so "run codebase-memory-mcp
+ * daemon status" was advice the reader could not follow at exactly the moment
+ * they needed it. Each message now names its own condition and stays runnable. */
+static const char CLI_ACTIVATION_BUSY_MESSAGE[] =
     "error: active CBM sessions and operations could not be stopped safely; "
-    "no activation was committed.";
+    "no activation was committed.\n"
+    "error: something is still using CBM. If an editor or agent is running an "
+    "MCP server, close it and retry; 'codebase-memory-mcp daemon status' lists "
+    "the holders when a cbm binary is still installed.";
+static const char CLI_ACTIVATION_REFUSED_MESSAGE[] =
+    "error: activation could not reserve exclusive access; no activation was "
+    "committed.\n"
+    "error: this is NOT a running-session problem — the reservation itself "
+    "failed (coordination lock, leftover state, or permissions). Nothing needs "
+    "to be closed. Check the errors above, and report this with the output of "
+    "'ls -la \"${CBM_CACHE_DIR:-$HOME/.cache/codebase-memory-mcp}\"' if it "
+    "persists.";
 static const char CLI_ACTIVATION_PARTIAL_MESSAGE[] =
     "error: activation stopped after one or more agent configuration or "
     "cleanup operations failed; the published/current executable was kept, "
@@ -205,7 +230,11 @@ static void cli_activation_diagnostic(const cbm_cli_activation_ops_t *ops, const
      * stop/reservation failures, which record no refusal note. */
     char attributed[CBM_SZ_1K];
     const char *note = cbm_activation_transaction_refusal_note();
-    if (diagnostic == CLI_ACTIVATION_REFUSED_MESSAGE && note && note[0]) {
+    /* A recorded refusal is more specific than EITHER generic message, so it
+     * wins over both the busy and the reservation-failure wording. */
+    if ((diagnostic == CLI_ACTIVATION_REFUSED_MESSAGE ||
+         diagnostic == CLI_ACTIVATION_BUSY_MESSAGE) &&
+        note && note[0]) {
         (void)snprintf(attributed, sizeof(attributed),
                        "error: activation was refused by a filesystem safety check before any "
                        "change was made: %s\n"
@@ -214,6 +243,23 @@ static void cli_activation_diagnostic(const cbm_cli_activation_ops_t *ops, const
                        "or use an owner-private directory for --dir/CBM_CACHE_DIR, then retry.",
                        note);
         diagnostic = attributed;
+    } else if (diagnostic == CLI_ACTIVATION_REFUSED_MESSAGE) {
+        /* #1537/#1416: the reservation-failure message told the reader to
+         * "check the errors above" — and nothing was above. The detail that
+         * names the failing component is recorded on the daemon side and was
+         * only ever surfaced by `daemon status`, so the CLI replaced a message
+         * that blamed the wrong thing with one that blamed nothing. Two
+         * reporters were left with no way forward. Print it here. */
+        const char *detail = cbm_daemon_ipc_validation_detail();
+        if (detail && detail[0]) {
+            (void)snprintf(attributed, sizeof(attributed),
+                           "error: activation could not reserve exclusive access; no activation "
+                           "was committed.\n"
+                           "error: this is NOT a running-session problem — nothing needs to be "
+                           "closed. The check that refused was: %s",
+                           detail);
+            diagnostic = attributed;
+        }
     }
     if (ops && ops->visible_diagnostic) {
         ops->visible_diagnostic(ops->context, diagnostic);
@@ -239,7 +285,12 @@ int cbm_cli_activation_guard_with_ops(const cbm_cli_activation_ops_t *ops,
         if (mutation_lease) {
             ops->mutation_lease_release(ops->context, mutation_lease);
         }
-        cli_activation_diagnostic(ops, CLI_ACTIVATION_REFUSED_MESSAGE);
+        /* 0 means the cohort was BUSY: real sessions hold it and closing them
+         * is the remedy. Anything else is the reservation itself failing, and
+         * telling that reader to close sessions sends them after processes
+         * that do not exist (#1537). */
+        cli_activation_diagnostic(ops, reserve_status == 0 ? CLI_ACTIVATION_BUSY_MESSAGE
+                                                           : CLI_ACTIVATION_REFUSED_MESSAGE);
         return CLI_TRUE;
     }
 
@@ -1226,12 +1277,17 @@ int cbm_replace_binary(const char *path, const unsigned char *data, int len, int
 static const char skill_content[] =
     "---\n"
     "name: codebase-memory\n"
-    "description: Use the codebase knowledge graph for structural code queries. "
+    /* #1554: the value contains "Triggers on: " — a colon-space, which YAML
+     * reads as a nested-mapping indicator inside an unquoted scalar. Strict
+     * parsers (js-yaml's load, the frontmatter reader in `npx skills`) reject
+     * the whole file, so the skill silently fails to load rather than loading
+     * wrongly. Quoting the scalar is the fix; the text itself is unchanged. */
+    "description: \"Use the codebase knowledge graph for structural code queries. "
     "Triggers on: explore the codebase, understand the architecture, what functions exist, "
     "show me the structure, who calls this function, what does X call, trace the call chain, "
     "find callers of, show dependencies, impact analysis, dead code, unused functions, "
     "high fan-out, refactor candidates, code quality audit, graph query syntax, "
-    "Cypher query examples, edge types, how to use search_graph.\n"
+    "Cypher query examples, edge types, how to use search_graph.\"\n"
     "---\n"
     "\n"
     "# Codebase Memory — Knowledge Graph Tools\n"
@@ -1616,16 +1672,45 @@ static size_t cbm_json_mcp_ownership_fields(cbm_json_mcp_schema_t schema, const 
  * populated from config content. */
 static CBM_TLS const char *g_previous_managed_mcp_command = NULL;
 
+/* Path-shape-insensitive equality for OUR OWN binary path (#1582): clients
+ * and installers spell the same Windows file with different separators (the
+ * entry stores `C:\...\cbm.exe`, the installer compares `C:/.../cbm.exe`),
+ * and Windows filesystems are case-insensitive. Separators always compare
+ * equal; case only folds on Windows. POSIX byte-exactness otherwise holds. */
+static bool cbm_json_mcp_paths_equal(const char *a, const char *b) {
+    while (*a && *b) {
+        char ca = *a;
+        char cb = *b;
+        if (ca == '\\') {
+            ca = '/';
+        }
+        if (cb == '\\') {
+            cb = '/';
+        }
+#ifdef _WIN32
+        ca = (char)tolower((unsigned char)ca);
+        cb = (char)tolower((unsigned char)cb);
+#endif
+        if (ca != cb) {
+            return false;
+        }
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
 static bool cbm_json_mcp_owned_command(const char *command, const char *expected_binary,
                                        const char *previous_managed_binary) {
     if (!command || command[0] == '\0') {
         return false;
     }
-    if (expected_binary && expected_binary[0] && strcmp(command, expected_binary) == 0) {
+    if (expected_binary && expected_binary[0] &&
+        cbm_json_mcp_paths_equal(command, expected_binary)) {
         return true;
     }
     if (previous_managed_binary && previous_managed_binary[0] &&
-        strcmp(command, previous_managed_binary) == 0) {
+        cbm_json_mcp_paths_equal(command, previous_managed_binary)) {
         return true;
     }
     return strcmp(command, "codebase-memory-mcp") == 0 ||
@@ -1638,7 +1723,12 @@ static bool cbm_json_mcp_owned_command(const char *command, const char *expected
  * missing. Upsert repairs it; remove leaves it alone like any other non-owned
  * entry. POSIX never probes config-supplied paths: only the running executable
  * identity above can authorize a moved-install refresh. */
-enum { CBM_JSON_MCP_OWNERSHIP_STALE = 100 };
+enum {
+    CBM_JSON_MCP_OWNERSHIP_STALE = 100,
+    /* Repairable like STALE, but the entry carries client-added keys: only a
+     * FIELD-level repair may touch it — full replacement would drop them. */
+    CBM_JSON_MCP_OWNERSHIP_EXTRAS_STALE = 101,
+};
 
 #ifdef _WIN32
 typedef enum {
@@ -1917,24 +2007,56 @@ static int cbm_json_mcp_snapshot_ownership(const char *document, size_t document
                                            const char *const *object_path, size_t path_len,
                                            cbm_json_mcp_schema_t schema, const char *entry_name,
                                            const char *argument, const char *expected_binary,
-                                           const char *previous_managed_binary) {
+                                           const char *previous_managed_binary,
+                                           char **command_out) {
     cbm_json_like_object_field_t fields[3];
     size_t field_count = cbm_json_mcp_ownership_fields(schema, argument, fields);
     char *command = NULL;
     int result = cbm_json_like_match_object_entry(document, document_length, object_path, path_len,
                                                   entry_name, fields, field_count, &command);
-    if (result == CBM_JSON_LIKE_OBJECT_MATCH &&
+    if ((result == CBM_JSON_LIKE_OBJECT_MATCH ||
+         result == CBM_JSON_LIKE_OBJECT_MATCH_WITH_EXTRAS) &&
         !cbm_json_mcp_owned_command(command, expected_binary, previous_managed_binary)) {
 #ifdef _WIN32
-        result = cbm_json_mcp_command_availability(command) == CBM_JSON_MCP_COMMAND_MISSING
-                     ? CBM_JSON_MCP_OWNERSHIP_STALE
-                     : CBM_JSON_LIKE_OBJECT_MISMATCH;
+        bool had_extras = result == CBM_JSON_LIKE_OBJECT_MATCH_WITH_EXTRAS;
+        result =
+            cbm_json_mcp_command_availability(command) == CBM_JSON_MCP_COMMAND_MISSING
+                ? (had_extras ? CBM_JSON_MCP_OWNERSHIP_EXTRAS_STALE : CBM_JSON_MCP_OWNERSHIP_STALE)
+                : CBM_JSON_LIKE_OBJECT_MISMATCH;
 #else
         result = CBM_JSON_LIKE_OBJECT_MISMATCH;
 #endif
     }
-    free(command);
+    if (command_out) {
+        *command_out = command;
+    } else {
+        free(command);
+    }
     return result;
+}
+
+/* Render just the `command` member's VALUE for a schema — the raw JSON the
+ * field-level repair splices in place of a moved install's stale path. */
+static char *cbm_json_mcp_render_command_value(const char *binary_path,
+                                               cbm_json_mcp_schema_t schema) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return NULL;
+    }
+    yyjson_mut_val *command = cbm_json_mcp_command_is_array(schema)
+                                  ? yyjson_mut_arr(doc)
+                                  : yyjson_mut_strcpy(doc, binary_path);
+    bool ok = command != NULL;
+    if (ok && cbm_json_mcp_command_is_array(schema)) {
+        ok = yyjson_mut_arr_add_strcpy(doc, command, binary_path);
+    }
+    char *json = NULL;
+    if (ok) {
+        yyjson_mut_doc_set_root(doc, command);
+        json = yyjson_mut_write(doc, YYJSON_WRITE_NOFLAG, NULL);
+    }
+    yyjson_mut_doc_free(doc);
+    return json;
 }
 
 static int cbm_upsert_json_named_mcp(const char *binary_path, const char *config_path,
@@ -1951,11 +2073,76 @@ static int cbm_upsert_json_named_mcp(const char *binary_path, const char *config
         return CLI_ERR;
     }
     if (read_result == 0) {
+        char *command = NULL;
         int ownership = cbm_json_mcp_snapshot_ownership(
             document, document_length, object_path, path_len, schema, entry_name, argument,
-            binary_path, g_previous_managed_mcp_command);
-        /* STALE (our exact shape, dead binary path) is repairable — that is
-         * the update contract. Only a genuinely foreign shape refuses. */
+            binary_path, g_previous_managed_mcp_command, &command);
+        /* An entry that already says what we would say, but carries extra keys
+         * the client added, is ALREADY SATISFIED. Return success without
+         * touching the file.
+         *
+         * We must not rewrite it: the editor replaces an entry wholesale, so
+         * writing our canonical shape over it would delete those keys. Doing
+         * nothing is both correct and lossless — the entry already points at
+         * this binary with the right type, which is the whole content of the
+         * install.
+         *
+         * This is #1630: OpenCode writes `"enabled": true` next to our
+         * `command` and `type`, so every user who had toggled a server in the
+         * UI hit `op=mcp_install` failure. Confirmed on Linux and Windows with
+         * two independent configs. Merging our fields into an annotated entry
+         * while preserving the rest is the fuller fix and is tracked there;
+         * this makes the common case work without risking anyone's config. */
+        if (ownership == CBM_JSON_LIKE_OBJECT_MATCH_WITH_EXTRAS) {
+            /* Owned via the PREVIOUS managed binary during a relocating
+             * update: the annotated entry still names the old location, and a
+             * wholesale rewrite would drop the client's keys — repair only the
+             * command member (#1630's deferred field-merge). An entry already
+             * naming the current binary needs nothing. */
+            bool via_previous = command && g_previous_managed_mcp_command &&
+                                strcmp(command, g_previous_managed_mcp_command) == 0 &&
+                                strcmp(command, binary_path) != 0;
+            if (!via_previous) {
+                free(command);
+                free(document);
+                return CLI_OK;
+            }
+            char *value = cbm_json_mcp_render_command_value(binary_path, schema);
+            if (!value) {
+                free(command);
+                free(document);
+                return CLI_ERR;
+            }
+            int repair = cbm_json_like_replace_field_raw_if_unchanged(
+                config_path, object_path, path_len, entry_name, "command", value, document,
+                document_length);
+            free(value);
+            free(command);
+            free(document);
+            return repair == 0 ? CLI_OK : CLI_ERR;
+        }
+        /* Windows only: our shape, annotated, and the named binary
+         * conclusively missing from the local fixed drives — repair ONLY the
+         * command member so the client's keys survive (#1630 field-merge). */
+        if (ownership == CBM_JSON_MCP_OWNERSHIP_EXTRAS_STALE) {
+            char *value = cbm_json_mcp_render_command_value(binary_path, schema);
+            if (!value) {
+                free(command);
+                free(document);
+                return CLI_ERR;
+            }
+            int repair = cbm_json_like_replace_field_raw_if_unchanged(
+                config_path, object_path, path_len, entry_name, "command", value, document,
+                document_length);
+            free(value);
+            free(command);
+            free(document);
+            return repair == 0 ? CLI_OK : CLI_ERR;
+        }
+        /* STALE (our exact shape, dead binary path on Windows) is repairable
+         * — that is the update contract. Only a genuinely foreign shape
+         * refuses. */
+        free(command);
         if (ownership != CBM_JSON_LIKE_OBJECT_MATCH && ownership != CBM_JSON_LIKE_OBJECT_MISSING &&
             ownership != CBM_JSON_MCP_OWNERSHIP_STALE) {
             free(document);
@@ -2003,7 +2190,7 @@ static int cbm_remove_json_named_mcp(const char *config_path, const char *const 
     }
     int ownership =
         cbm_json_mcp_snapshot_ownership(document, document_length, object_path, path_len, schema,
-                                        entry_name, argument, expected_binary, NULL);
+                                        entry_name, argument, expected_binary, NULL, NULL);
     if (ownership == CBM_JSON_LIKE_OBJECT_MISSING || ownership == CBM_JSON_LIKE_OBJECT_MISMATCH ||
         ownership == CBM_JSON_MCP_OWNERSHIP_STALE) {
         free(document);
@@ -2396,6 +2583,20 @@ static void cbm_opencode_config_path(const char *home_dir, char *out, size_t out
     const char *custom = cbm_safe_getenv("OPENCODE_CONFIG", env_buf, sizeof(env_buf), NULL);
     if (custom && custom[0]) {
         snprintf(out, out_sz, "%s", custom);
+        return;
+    }
+    /* OpenCode reads either opencode.json or opencode.jsonc. We always wrote
+     * the .json name, so a user whose real config is .jsonc got a SECOND file
+     * that OpenCode ignores — their MCP server silently never appeared, and the
+     * install looked like it had succeeded (discussion #1560). Prefer whichever
+     * file already exists, .jsonc first since it is the one we used to miss;
+     * with neither present, create .json as before. Other clients in this file
+     * (pochi, kilo) already carry .jsonc paths — OpenCode was the gap. */
+    char candidate[CLI_BUF_1K];
+    int written = snprintf(candidate, sizeof(candidate), "%s/.config/opencode/opencode.jsonc",
+                           home_dir ? home_dir : "");
+    if (written > 0 && (size_t)written < sizeof(candidate) && cbm_file_exists(candidate)) {
+        snprintf(out, out_sz, "%s", candidate);
         return;
     }
     snprintf(out, out_sz, "%s/.config/opencode/opencode.json", home_dir);
@@ -3244,8 +3445,29 @@ int cbm_upsert_codex_mcp(const char *binary_path, const char *config_path) {
         return CLI_ERR;
     }
     char block[CLI_BUF_8K];
+    /* #1562: Codex sanitizes the environment of stdio MCP subprocesses, passing
+     * through only the names listed in env_vars. Without CBM_CACHE_DIR the
+     * Codex-spawned server silently falls back to the DEFAULT cache while the
+     * account daemon uses the configured one; the two disagree and the
+     * handshake closes during initialization, so Codex exposes no cbm tools at
+     * all.
+     *
+     * The names are listed unconditionally rather than only when a variable is
+     * set at install time: env_vars names variables to FORWARD IF PRESENT, so
+     * listing them costs nothing when unset and keeps working for someone who
+     * sets one after installing — which install-time detection would silently
+     * fail to cover.
+     *
+     * CBM_RUNTIME_DIR joined the list with #1664: since #1645 it relocates
+     * the daemon rendezvous, so a Codex subprocess that does not receive it
+     * looks for the daemon in the DEFAULT location and never finds it — the
+     * same silent client/daemon split CBM_CACHE_DIR caused. Both names decide
+     * WHICH daemon a process talks to; behavioural knobs stay unforwarded. */
     int written = snprintf(block, sizeof(block),
-                           CODEX_CMM_SECTION "\ncommand = \"%s\"\nargs = []\n", escaped);
+                           CODEX_CMM_SECTION "\ncommand = \"%s\"\nargs = []\n"
+                                             "env_vars = [\"CBM_CACHE_DIR\", "
+                                             "\"CBM_RUNTIME_DIR\"]\n",
+                           escaped);
     if (written < 0 || (size_t)written >= sizeof(block) ||
         cbm_remove_codex_legacy_mcp(config_path) != 0) {
         return CLI_ERR;
@@ -3382,43 +3604,31 @@ bool cbm_optional_hook_supported_for_testing(const char *agent_name, bool window
 }
 #endif
 
-static int cbm_upsert_codex_hooks_command(const char *config_path, const char *command,
-                                          const char *command_windows) {
+static int cbm_reconcile_codex_hooks_command_detailed(const char *config_path, const char *command,
+                                                      const char *command_windows,
+                                                      cbm_toml_codex_hook_action_t action,
+                                                      bool check_only,
+                                                      cbm_toml_codex_hook_failure_t *failure) {
     if (!config_path || !command || !command_windows) {
         return CLI_ERR;
     }
-    char escaped[CLI_BUF_8K];
-    char escaped_windows[CLI_BUF_8K];
-    if (cbm_toml_escape_basic_string(command, escaped, sizeof(escaped)) != CLI_OK ||
-        cbm_toml_escape_basic_string(command_windows, escaped_windows, sizeof(escaped_windows)) !=
-            CLI_OK) {
-        return CLI_ERR;
-    }
-    char block[CLI_BUF_8K];
-    int written = snprintf(block, sizeof(block),
-                           "[[hooks.SessionStart]]\n"
-                           "matcher = \"startup|resume|clear|compact\"\n\n"
-                           "[[hooks.SessionStart.hooks]]\n"
-                           "type = \"command\"\n"
-                           "command = \"%s\"\n"
-                           "command_windows = \"%s\"\n"
-                           "timeout = 5\n\n"
-                           "[[hooks.SubagentStart]]\n"
-                           "matcher = \"*\"\n\n"
-                           "[[hooks.SubagentStart.hooks]]\n"
-                           "type = \"command\"\n"
-                           "command = \"%s\"\n"
-                           "command_windows = \"%s\"\n"
-                           "timeout = 5\n",
-                           escaped, escaped_windows, escaped, escaped_windows);
-    if (written < 0 || (size_t)written >= sizeof(block)) {
-        return CLI_ERR;
-    }
-    return cbm_toml_upsert_managed_block(config_path, CODEX_HOOK_BEGIN, CODEX_HOOK_END, block) == 0
+    return cbm_toml_reconcile_codex_hooks_detailed(config_path, CODEX_HOOK_BEGIN, CODEX_HOOK_END,
+                                                   command, command_windows, action,
+                                                   check_only ? 1 : 0, failure) == 0
                ? CLI_OK
                : CLI_ERR;
 }
-
+static int cbm_reconcile_codex_hooks_command(const char *config_path, const char *command,
+                                             const char *command_windows,
+                                             cbm_toml_codex_hook_action_t action, bool check_only) {
+    return cbm_reconcile_codex_hooks_command_detailed(config_path, command, command_windows, action,
+                                                      check_only, NULL);
+}
+static int cbm_upsert_codex_hooks_command(const char *config_path, const char *command,
+                                          const char *command_windows) {
+    return cbm_reconcile_codex_hooks_command(config_path, command, command_windows,
+                                             CBM_TOML_CODEX_HOOK_UPSERT, false);
+}
 /* Public path used by config-level regression tests and manual callers. */
 int cbm_upsert_codex_hooks(const char *config_path) {
     return cbm_upsert_codex_hooks_command(config_path, "codebase-memory-mcp hook-augment",
@@ -3426,10 +3636,9 @@ int cbm_upsert_codex_hooks(const char *config_path) {
 }
 
 int cbm_remove_codex_hooks(const char *config_path) {
-    return config_path &&
-                   cbm_toml_remove_managed_block(config_path, CODEX_HOOK_BEGIN, CODEX_HOOK_END) == 0
-               ? CLI_OK
-               : CLI_ERR;
+    return cbm_reconcile_codex_hooks_command(config_path, "codebase-memory-mcp hook-augment",
+                                             "codebase-memory-mcp hook-augment",
+                                             CBM_TOML_CODEX_HOOK_REMOVE, false);
 }
 
 /* ── OpenCode MCP config (JSON with "mcp" key) ───────────────── */
@@ -3624,7 +3833,11 @@ static int cbm_build_yaml_stdio_mcp_block(const char *binary_path, bool goose_sc
         free(encoded);
         return CLI_ERR;
     }
+    /* goose's ExtensionConfig::Stdio requires `name` (serde, no default) and
+     * its loader silently drops entries that fail to deserialize (#1675) — an
+     * entry without it installs cleanly and is then invisible in goose. */
     int written = goose_schema ? snprintf(block, block_size,
+                                          "    name: codebase-memory-mcp\n"
                                           "    type: stdio\n"
                                           "    cmd: %s\n"
                                           "    args: []\n"
@@ -3634,6 +3847,19 @@ static int cbm_build_yaml_stdio_mcp_block(const char *binary_path, bool goose_sc
     free(encoded);
     return written > 0 && (size_t)written < block_size ? CLI_OK : CLI_ERR;
 }
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+/* Test seam for the agent-config block writers: the exact bytes written into a
+ * coding agent's config file are a compatibility contract with THAT agent's
+ * parser (goose deserializes with serde and silently drops entries that fail —
+ * #1675), so tests must be able to assert the block verbatim. */
+int cbm_cli_build_yaml_stdio_mcp_block_for_test(const char *binary_path, bool goose_schema,
+                                                char *block, size_t block_size) {
+    return cbm_build_yaml_stdio_mcp_block(binary_path, goose_schema, block, block_size) == CLI_OK
+               ? 0
+               : -1;
+}
+#endif
 
 static int cbm_upsert_yaml_stdio_mcp(const char *binary_path, const char *config_path,
                                      const char *section_key, bool goose_schema) {
@@ -3717,7 +3943,7 @@ static int cbm_junie_mcp_preflight(const char *binary_path, const char *config_p
     for (size_t i = 0U; i < sizeof(entries) / sizeof(entries[0]); i++) {
         int ownership = cbm_json_mcp_snapshot_ownership(
             document, document_length, path, 1U, CBM_JSON_MCP_STANDARD, entries[i].name,
-            entries[i].argument, binary_path, g_previous_managed_mcp_command);
+            entries[i].argument, binary_path, g_previous_managed_mcp_command, NULL);
         if (ownership != CBM_JSON_LIKE_OBJECT_MATCH && ownership != CBM_JSON_LIKE_OBJECT_MISSING &&
             ownership != CBM_JSON_MCP_OWNERSHIP_STALE) {
             result = CLI_ERR;
@@ -5294,6 +5520,53 @@ static bool cbm_install_subagent_reminder_script(const char *home, const char *b
     return cbm_write_owned_hook_script_with_legacy(script_path, script, legacy, 1U);
 }
 
+/* #1387 dry-run predicate: would writing this hook script succeed, or would
+ * the owned-document migration refuse it because the file on disk is not ours?
+ * Read-only — it must never touch the filesystem, since a dry run promises
+ * exactly that. An unreadable/unsafe state counts as "would not succeed": the
+ * preview should warn rather than promise. */
+static bool cbm_hook_script_write_would_succeed(const char *home, const char *binary_path,
+                                                const char *script_name) {
+    if (!home || !binary_path || !script_name) {
+        return false;
+    }
+    char config_dir[CLI_BUF_1K];
+    cbm_claude_config_dir(home, config_dir, sizeof(config_dir));
+    if (!config_dir[0]) {
+        return false;
+    }
+    char script_path[CLI_BUF_1K];
+    int written =
+        snprintf(script_path, sizeof(script_path), "%s/hooks/%s", config_dir, script_name);
+    if (written <= 0 || (size_t)written >= sizeof(script_path)) {
+        return false;
+    }
+    const char *prefix = cmm_gate_script_prefix;
+    if (strcmp(script_name, CMM_SESSION_REMINDER_SCRIPT) == 0) {
+        prefix = cmm_session_script_prefix;
+    } else if (strcmp(script_name, CMM_SUBAGENT_REMINDER_SCRIPT) == 0) {
+        prefix = cmm_subagent_script_prefix;
+    }
+    char script[CLI_BUF_8K];
+    if (cbm_build_current_hook_script(prefix, binary_path, script, sizeof(script)) != CLI_OK) {
+        return false;
+    }
+    /* Released shapes are accepted by the real write, so they must be accepted
+     * here too or the preview would warn about a script that upgrades fine. */
+    char released[CLI_BUF_8K];
+    const char *candidates[2];
+    size_t candidate_count = 0U;
+    if (strcmp(script_name, CMM_HOOK_GATE_SCRIPT) == 0 &&
+        cbm_build_released_gate_script(binary_path, released, sizeof(released)) == CLI_OK) {
+        candidates[candidate_count++] = released;
+    } else if (strcmp(script_name, CMM_SESSION_REMINDER_SCRIPT) == 0) {
+        candidates[candidate_count++] = cmm_released_session_script;
+    } else if (strcmp(script_name, CMM_SUBAGENT_REMINDER_SCRIPT) == 0) {
+        candidates[candidate_count++] = cmm_released_subagent_script;
+    }
+    return cbm_text_owned_document_status(script_path, script, candidates, candidate_count) == 0;
+}
+
 int cbm_upsert_claude_subagent_hooks(const char *settings_path) {
     char command[CLI_BUF_8K];
     char previous_command[CLI_BUF_8K];
@@ -6463,6 +6736,103 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key) {
 
 /* ── Config CLI subcommand ────────────────────────────────────── */
 
+/* THE config-key table. list, get, help, and key validation all read this one
+ * definition, so a key cannot exist with different defaults in different
+ * subcommands again: `config list` used to print stored-or-DEFAULT while
+ * `config get` printed stored-or-EMPTY — every unset key (and every typo'd
+ * key, at exit 0) "got" an empty string, indistinguishable from a real value
+ * (#1522). The defaults here mirror the runtime readers' fallbacks
+ * (cbm_config_get_bool/int call sites); keep them in sync. */
+typedef struct {
+    const char *key;
+    const char *default_value;
+    const char *help;
+} config_key_def_t;
+
+static const config_key_def_t CONFIG_KEYS[] = {
+    {CBM_CONFIG_AUTO_INDEX, "false", "Enable auto-indexing on MCP session start"},
+    {CBM_CONFIG_AUTO_INDEX_LIMIT, "50000", "Max files for auto-indexing new projects"},
+    {CBM_CONFIG_AUTO_WATCH, "true", "Register background git watcher on session connect"},
+    {CBM_CONFIG_UI_LANG, "auto", "Pin graph UI language: en, zh, or auto"},
+    {CBM_CONFIG_UI_ENABLED, "false", "Serve the graph UI on a loopback HTTP port"},
+    {CBM_CONFIG_UI_PORT, "9749", "Port for the graph UI listener when enabled"},
+};
+
+/* #1558: ui_enabled and ui_port were reachable ONLY by hand-editing
+ * ~/.cache/codebase-memory-mcp/config.json. They were absent from CONFIG_KEYS,
+ * so `config list` could not show them and `config set` rejected them — while
+ * ui_enabled governs a loopback HTTP listener. A user who wants that surface
+ * off should not have to read our source to find the switch, and a reporter
+ * spent two debugging sessions doing exactly that.
+ *
+ * They live in a separate file (cbm_ui_config_load/save), not the key-value
+ * store the other keys use, so exposing them means routing rather than just
+ * listing them. */
+#ifdef CBM_CLI_ENABLE_TEST_API
+size_t cbm_cli_config_key_count_for_testing(void) {
+    return sizeof(CONFIG_KEYS) / sizeof(CONFIG_KEYS[0]);
+}
+const char *cbm_cli_config_key_at_for_testing(size_t index) {
+    return index < sizeof(CONFIG_KEYS) / sizeof(CONFIG_KEYS[0]) ? CONFIG_KEYS[index].key : NULL;
+}
+#endif
+
+static bool config_key_is_ui(const char *key) {
+    return key && (strcmp(key, CBM_CONFIG_UI_ENABLED) == 0 || strcmp(key, CBM_CONFIG_UI_PORT) == 0);
+}
+
+static void config_ui_read(const char *key, char *out, size_t out_sz) {
+    cbm_ui_config_t ui;
+    cbm_ui_config_load(&ui);
+    if (strcmp(key, CBM_CONFIG_UI_ENABLED) == 0) {
+        snprintf(out, out_sz, "%s", ui.ui_enabled ? "true" : "false");
+    } else {
+        snprintf(out, out_sz, "%d", ui.ui_port);
+    }
+}
+
+static int config_ui_write(const char *key, const char *value) {
+    cbm_ui_config_t ui;
+    cbm_ui_config_load(&ui);
+    if (strcmp(key, CBM_CONFIG_UI_ENABLED) == 0) {
+        if (strcmp(value, "true") != 0 && strcmp(value, "false") != 0) {
+            (void)fprintf(stderr, "error: %s must be true or false\n", key);
+            return CLI_ERR;
+        }
+        ui.ui_enabled = strcmp(value, "true") == 0;
+    } else {
+        char *end = NULL;
+        long port = strtol(value, &end, 10);
+        if (!end || *end || port < 1 || port > 65535) {
+            (void)fprintf(stderr, "error: %s must be a port between 1 and 65535\n", key);
+            return CLI_ERR;
+        }
+        ui.ui_port = (int)port;
+    }
+    if (!cbm_ui_config_save(&ui)) {
+        (void)fprintf(stderr, "error: could not write the UI configuration file\n");
+        return CLI_ERR;
+    }
+    return CLI_OK;
+}
+
+static const config_key_def_t *config_key_lookup(const char *key) {
+    for (size_t i = 0; key && i < sizeof(CONFIG_KEYS) / sizeof(CONFIG_KEYS[0]); i++) {
+        if (strcmp(CONFIG_KEYS[i].key, key) == 0) {
+            return &CONFIG_KEYS[i];
+        }
+    }
+    return NULL;
+}
+
+static void config_print_unknown_key(const char *key) {
+    (void)fprintf(stderr, "error: unknown config key: %s\nKnown keys:", key ? key : "");
+    for (size_t i = 0; i < sizeof(CONFIG_KEYS) / sizeof(CONFIG_KEYS[0]); i++) {
+        (void)fprintf(stderr, " %s", CONFIG_KEYS[i].key);
+    }
+    (void)fprintf(stderr, "\n");
+}
+
 int cbm_cmd_config(int argc, char **argv) {
     /* NULL argv with a nonzero argc previously slipped past this guard (the
      * inner `argv &&` shielded only the help comparison) and dereferenced
@@ -6475,14 +6845,10 @@ int cbm_cmd_config(int argc, char **argv) {
         printf("  set <key> <val>  Set a config value\n");
         printf("  reset <key>      Reset a key to default\n\n");
         printf("Config keys:\n");
-        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX, "false",
-               "Enable auto-indexing on MCP session start");
-        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX_LIMIT, "50000",
-               "Max files for auto-indexing new projects");
-        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_WATCH, "true",
-               "Register background git watcher on session connect");
-        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_UI_LANG, "auto",
-               "Pin graph UI language: en, zh, or auto");
+        for (size_t i = 0; i < sizeof(CONFIG_KEYS) / sizeof(CONFIG_KEYS[0]); i++) {
+            printf("  %-25s  default=%-10s  %s\n", CONFIG_KEYS[i].key, CONFIG_KEYS[i].default_value,
+                   CONFIG_KEYS[i].help);
+        }
         return 0;
     }
 
@@ -6504,25 +6870,53 @@ int cbm_cmd_config(int argc, char **argv) {
     int rc = 0;
     if (strcmp(argv[0], "list") == 0 || strcmp(argv[0], "ls") == 0) {
         printf("Configuration:\n");
-        printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_INDEX,
-               cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX, "false"));
-        printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_INDEX_LIMIT,
-               cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "50000"));
-        printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_WATCH,
-               cbm_config_get(cfg, CBM_CONFIG_AUTO_WATCH, "true"));
-        printf("  %-25s = %-10s\n", CBM_CONFIG_UI_LANG,
-               cbm_config_get(cfg, CBM_CONFIG_UI_LANG, "auto"));
+        for (size_t i = 0; i < sizeof(CONFIG_KEYS) / sizeof(CONFIG_KEYS[0]); i++) {
+            char ui_value[CLI_BUF_1K];
+            const char *shown;
+            if (config_key_is_ui(CONFIG_KEYS[i].key)) {
+                config_ui_read(CONFIG_KEYS[i].key, ui_value, sizeof(ui_value));
+                shown = ui_value;
+            } else {
+                shown = cbm_config_get(cfg, CONFIG_KEYS[i].key, CONFIG_KEYS[i].default_value);
+            }
+            printf("  %-25s = %-10s\n", CONFIG_KEYS[i].key, shown);
+        }
     } else if (strcmp(argv[0], "get") == 0) {
         if (argc < MIN_ARGC_GET) {
             (void)fprintf(stderr, "Usage: config get <key>\n");
             rc = CLI_TRUE;
         } else {
-            printf("%s\n", cbm_config_get(cfg, argv[CLI_SKIP_ONE], ""));
+            const config_key_def_t *def = config_key_lookup(argv[CLI_SKIP_ONE]);
+            if (!def) {
+                config_print_unknown_key(argv[CLI_SKIP_ONE]);
+                rc = CLI_TRUE;
+            } else {
+                /* Stored value or the key's real default — the same fallback
+                 * the runtime readers use. `""` here was #1522's bug 2: every
+                 * unset key read as empty with exit 0. */
+                if (config_key_is_ui(def->key)) {
+                    char ui_value[CLI_BUF_1K];
+                    config_ui_read(def->key, ui_value, sizeof(ui_value));
+                    printf("%s\n", ui_value);
+                } else {
+                    printf("%s\n", cbm_config_get(cfg, def->key, def->default_value));
+                }
+            }
         }
     } else if (strcmp(argv[0], "set") == 0) {
         if (argc < MIN_ARGC_CMD) {
             (void)fprintf(stderr, "Usage: config set <key> <value>\n");
             rc = CLI_TRUE;
+        } else if (!config_key_lookup(argv[CLI_SKIP_ONE])) {
+            config_print_unknown_key(argv[CLI_SKIP_ONE]);
+            rc = CLI_TRUE;
+        } else if (config_key_is_ui(argv[CLI_SKIP_ONE])) {
+            if (config_ui_write(argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]) == CLI_OK) {
+                printf("%s = %s\n", argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]);
+                printf("  (restart the daemon for this to take effect)\n");
+            } else {
+                rc = CLI_TRUE;
+            }
         } else {
             if (cbm_config_set(cfg, argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]) == 0) {
                 printf("%s = %s\n", argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]);
@@ -6535,6 +6929,16 @@ int cbm_cmd_config(int argc, char **argv) {
         if (argc < MIN_ARGC_GET) {
             (void)fprintf(stderr, "Usage: config reset <key>\n");
             rc = CLI_TRUE;
+        } else if (!config_key_lookup(argv[CLI_SKIP_ONE])) {
+            config_print_unknown_key(argv[CLI_SKIP_ONE]);
+            rc = CLI_TRUE;
+        } else if (config_key_is_ui(argv[CLI_SKIP_ONE])) {
+            const config_key_def_t *def = config_key_lookup(argv[CLI_SKIP_ONE]);
+            if (config_ui_write(argv[CLI_SKIP_ONE], def->default_value) == CLI_OK) {
+                printf("%s reset to default\n", argv[CLI_SKIP_ONE]);
+            } else {
+                rc = CLI_TRUE;
+            }
         } else {
             cbm_config_delete(cfg, argv[CLI_SKIP_ONE]);
             printf("%s reset to default\n", argv[CLI_SKIP_ONE]);
@@ -7063,12 +7467,63 @@ static void plan_record(const char *agent, const char *kind, const char *path) {
     snprintf(e->path, sizeof(e->path), "%s", path);
 }
 
-static void record_agent_config_error(bool uninstalling, const char *agent, const char *operation,
-                                      const char *path) {
+/* Describe what the target actually IS, so a refusal is triageable.
+ *
+ * The config editors collapse nine distinct fail-closed conditions into a
+ * single -1: unsupported structure, an inline comment on a field line, a
+ * non-single-link file, unsafe metadata, lock contention, I/O. `agent=X op=Y
+ * path=Z` alone cannot separate them, and four such failures currently live in
+ * discussion #1560 with no way to tell them apart — OpenCode and Hermes on two
+ * operating systems, unresolved across five releases.
+ *
+ * This reports only OBSERVED facts about the path, never a guess. In
+ * particular it does NOT print errno: this function is called from 119 sites
+ * and errno may be stale from an unrelated call, which is exactly the defect
+ * fixed in #1537, where a permission decision surfaced a fabricated ENOENT and
+ * sent the reporter hunting a file that was never missing.
+ *
+ * Knowing the file exists, is a regular file, and is writable already excludes
+ * most of the space — it says the refusal is structural, not a permission or
+ * missing-file problem. */
+static void describe_agent_config_target(const char *path, char *out, size_t out_size) {
+    if (!out || out_size == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!path || !path[0]) {
+        return;
+    }
+    cbm_path_info_t info;
+    if (cbm_path_info_utf8(path, &info) != 0) {
+        (void)snprintf(out, out_size, " (target: does not exist or cannot be inspected)");
+        return;
+    }
+    const char *kind = info.is_symlink     ? "symlink"
+                       : info.is_directory ? "directory"
+                       : info.is_regular   ? "regular file"
+                                           : "special file";
+    (void)snprintf(out, out_size, " (target: %s, %lld bytes)", kind, (long long)info.size);
+}
+
+static void record_agent_config_error_with_reason(bool uninstalling, const char *agent,
+                                                  const char *operation, const char *path,
+                                                  const char *reason) {
     int *counter = uninstalling ? &g_agent_uninstall_errors : &g_agent_install_errors;
     (*counter)++;
-    (void)fprintf(stderr, "error: agent_config agent=%s op=%s path=%s\n", agent ? agent : "unknown",
+    char detail[160];
+    describe_agent_config_target(path, detail, sizeof(detail));
+    (void)fprintf(stderr, "error: agent_config agent=%s op=%s path=%s", agent ? agent : "unknown",
                   operation ? operation : "unknown", path ? path : "unknown");
+    if (reason && reason[0]) {
+        (void)fprintf(stderr, " reason=%s", reason);
+    }
+    (void)fputs(detail, stderr);
+    (void)fputc('\n', stderr);
+}
+
+static void record_agent_config_error(bool uninstalling, const char *agent, const char *operation,
+                                      const char *path) {
+    record_agent_config_error_with_reason(uninstalling, agent, operation, path, NULL);
 }
 
 static bool prepare_config_parent(const char *path) {
@@ -7191,6 +7646,18 @@ static void install_claude_code_config(const char *home, const char *binary_path
     bool gate_ok = dry_run;
     bool session_ok = dry_run;
     bool subagent_ok = dry_run;
+    if (dry_run) {
+        /* #1387 (second half): the dry run claimed EVERY hook group as
+         * installable because these flags were simply `true`. When the on-disk
+         * script is not ours the real install refuses to rewrite it, so the
+         * preview promised what the run could not deliver and the reporter had
+         * no way to see the loss coming. Predict each refusal read-only. */
+        gate_ok = cbm_hook_script_write_would_succeed(home, binary_path, CMM_HOOK_GATE_SCRIPT);
+        session_ok =
+            cbm_hook_script_write_would_succeed(home, binary_path, CMM_SESSION_REMINDER_SCRIPT);
+        subagent_ok =
+            cbm_hook_script_write_would_succeed(home, binary_path, CMM_SUBAGENT_REMINDER_SCRIPT);
+    }
     if (!dry_run) {
         char hook_path[CLI_BUF_1K];
         gate_ok = cbm_install_hook_gate_script(home, binary_path);
@@ -7236,6 +7703,22 @@ static void install_claude_code_config(const char *home, const char *binary_path
     }
     if (subagent_ok) {
         printf("  hooks: SubagentStart (MCP usage reminder for subagents)\n");
+    }
+    if (dry_run) {
+        /* Name every script the real run would refuse. Silence is what made
+         * #1387 invisible in advance: the group simply went unmentioned, which
+         * reads as "nothing to do" rather than "this will be skipped". */
+        static const char *const preview_scripts[] = {
+            CMM_HOOK_GATE_SCRIPT, CMM_SESSION_REMINDER_SCRIPT, CMM_SUBAGENT_REMINDER_SCRIPT};
+        const bool preview_ok[] = {gate_ok, session_ok, subagent_ok};
+        for (size_t i = 0U; i < sizeof(preview_scripts) / sizeof(preview_scripts[0]); i++) {
+            if (!preview_ok[i]) {
+                printf("  hooks: %s/hooks/%s would be skipped — the file there is not ours "
+                       "(modified, or written by another install), so the rewrite is refused "
+                       "and existing hook entries are left untouched\n",
+                       config_dir, preview_scripts[i]);
+            }
+        }
     }
 
     /* Migration nudge: when CLAUDE_CONFIG_DIR is set and a legacy ~/.claude tree
@@ -8166,6 +8649,35 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         snprintf(ip, sizeof(ip), "%s/AGENTS.md", config_dir);
         snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
         snprintf(ap, sizeof(ap), "%s/agents/codebase-memory.toml", config_dir);
+        char command[CLI_BUF_8K];
+        char command_windows[CLI_BUF_8K];
+        char hooks_json[CLI_BUF_1K];
+        snprintf(hooks_json, sizeof(hooks_json), "%s/hooks.json", config_dir);
+        bool use_hooks_json = cbm_file_exists(hooks_json);
+        bool commands_ok =
+            cbm_build_augment_command(binary_path, command, sizeof(command)) == CLI_OK &&
+            cbm_build_augment_command_windows(binary_path, command_windows,
+                                              sizeof(command_windows)) == CLI_OK;
+        cbm_toml_codex_hook_action_t preflight_action =
+            use_hooks_json ? CBM_TOML_CODEX_HOOK_REMOVE : CBM_TOML_CODEX_HOOK_UPSERT;
+        cbm_toml_codex_hook_failure_t preflight_failure = CBM_TOML_CODEX_HOOK_FAILURE_NONE;
+        int preflight_result = commands_ok ? cbm_reconcile_codex_hooks_command_detailed(
+                                                 cp, command, command_windows, preflight_action,
+                                                 true, &preflight_failure)
+                                           : CLI_ERR;
+        if (preflight_result != CLI_OK) {
+            if (!g_install_plan) {
+                printf("Codex CLI:\n");
+                fflush(stdout);
+            }
+            const char *reason = preflight_failure == CBM_TOML_CODEX_HOOK_FAILURE_NONE
+                                     ? NULL
+                                     : cbm_toml_codex_hook_failure_name(preflight_failure);
+            record_agent_config_error_with_reason(
+                false, "Codex CLI", commands_ok ? "hook_preflight" : "hook_command_build", cp,
+                reason);
+            goto codex_install_done;
+        }
         install_generic_agent_config("Codex CLI", binary_path, cp, ip, dry_run,
                                      cbm_upsert_codex_mcp);
         install_agent_skill("Codex CLI", skills_dir, force, dry_run);
@@ -8183,53 +8695,29 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
          * SessionStart reminder there instead of config.toml. Writing both
          * makes Codex warn about loading hooks from two representations (#570).
          * config.toml remains the mcp_config target above either way. */
-        char hooks_json[CLI_BUF_1K];
-        snprintf(hooks_json, sizeof(hooks_json), "%s/hooks.json", config_dir);
-        bool use_hooks_json = cbm_file_exists(hooks_json);
         const char *hook_target = use_hooks_json ? hooks_json : cp;
         if (g_install_plan) {
             plan_record("Codex CLI", "hook", hook_target);
         } else {
             bool hook_ok = true;
-            if (!dry_run) {
-                char command[CLI_BUF_8K];
-                char command_windows[CLI_BUF_8K];
-                if (cbm_build_augment_command(binary_path, command, sizeof(command)) == CLI_OK &&
-                    cbm_build_augment_command_windows(binary_path, command_windows,
-                                                      sizeof(command_windows)) == CLI_OK) {
-                    if (use_hooks_json) {
-                        if (cbm_upsert_paired_lifecycle_hooks_json(
-                                hooks_json, command, command_windows, NULL, CMM_HOOK_TIMEOUT_SEC) ==
-                            CLI_OK) {
-                            if (cbm_remove_codex_hooks(cp) != CLI_OK) {
-                                hook_ok = false;
-                                record_agent_config_error(false, "Codex CLI", "legacy_hook_cleanup",
-                                                          cp);
-                            }
-                        } else {
-                            hook_ok = false;
-                            record_agent_config_error(false, "Codex CLI", "hook_install",
-                                                      hooks_json);
-                        }
-                    } else {
-                        if (cbm_upsert_codex_hooks_command(cp, command, command_windows) !=
-                            CLI_OK) {
-                            hook_ok = false;
-                            record_agent_config_error(false, "Codex CLI", "hook_install", cp);
-                        }
-                    }
-                } else {
-                    hook_ok = false;
-                    record_agent_config_error(false, "Codex CLI", "hook_command_build",
-                                              hook_target);
-                }
+            if (!dry_run && use_hooks_json) {
+                hook_ok =
+                    cbm_upsert_paired_lifecycle_hooks_json(hooks_json, command, command_windows,
+                                                           NULL, CMM_HOOK_TIMEOUT_SEC) == CLI_OK &&
+                    cbm_reconcile_codex_hooks_command(cp, command, command_windows,
+                                                      CBM_TOML_CODEX_HOOK_REMOVE, false) == CLI_OK;
+            } else if (!dry_run) {
+                hook_ok = cbm_upsert_codex_hooks_command(cp, command, command_windows) == CLI_OK;
             }
-            if (hook_ok) {
+            if (!hook_ok) {
+                record_agent_config_error(false, "Codex CLI", "hook_install", hook_target);
+            } else {
                 printf("  hooks: SessionStart + SubagentStart (dynamic graph context)\n");
+                printf("  note: non-managed hooks require /hooks trust; definition changes "
+                       "require re-trust\n");
             }
-            printf("  note: non-managed hooks require /hooks trust; definition changes require "
-                   "re-trust\n");
         }
+    codex_install_done:;
     }
     if (agents->gemini) {
         install_gemini_config(home, binary_path, dry_run);
@@ -8877,9 +9365,19 @@ static void install_additional_agent_configs(const cbm_detected_agents_t *agents
     }
 }
 
+/* #1558: set by `install --clients=...` after validation, consumed at the one
+ * place detection happens. Validation runs in cbm_cmd_install so an unknown
+ * token fails before anything is written, not midway through configuring. */
+static const char *g_client_selection = NULL;
+static bool cli_clients_apply_selection(const char *spec, cbm_detected_agents_t *detected);
+static void cli_clients_print_list(FILE *out);
+
 int cbm_install_agent_configs(const char *home, const char *binary_path, bool force, bool dry_run) {
     g_agent_install_errors = 0;
     cbm_detected_agents_t agents = cbm_detect_agents(home);
+    if (g_client_selection && !cli_clients_apply_selection(g_client_selection, &agents)) {
+        return CLI_ERR;
+    }
     if (!g_install_plan) {
         print_detected_agents(&agents, home);
     }
@@ -8995,6 +9493,121 @@ int cbm_install_handle_existing_indexes(const char *home, bool reset, bool dry_r
     return prepare_result;
 }
 
+/* ── Client selection (#1558) ──────────────────────────────────
+ *
+ * `install` configured EVERY detected client. A user who wanted Claude and
+ * Codex had to revert the OpenCode and Cursor integrations by hand, and the
+ * next install silently recreated them. `--clients=claude,codex` restricts it.
+ *
+ * The table is the flag's vocabulary AND its documentation: 26 clients ship
+ * here, with tokens nobody would guess (factory-droid, mistral-vibe,
+ * copilot-cli), so `--clients=help` prints every token. A selector whose
+ * accepted values can only be learned from the source is not a usable
+ * selector, and an unrecognised token fails loudly with the list rather than
+ * silently configuring nothing. */
+typedef struct {
+    const char *token;
+    size_t offset;
+    const char *display;
+} cli_client_def_t;
+
+#define CLI_CLIENT(field, token, display) \
+    { token, offsetof(cbm_detected_agents_t, field), display }
+
+static const cli_client_def_t CLI_CLIENTS[] = {
+    CLI_CLIENT(claude_code, "claude", "Claude Code"),
+    CLI_CLIENT(codex, "codex", "Codex"),
+    CLI_CLIENT(gemini, "gemini", "Gemini"),
+    CLI_CLIENT(zed, "zed", "Zed"),
+    CLI_CLIENT(opencode, "opencode", "OpenCode"),
+    CLI_CLIENT(antigravity, "antigravity", "Antigravity"),
+    CLI_CLIENT(aider, "aider", "Aider"),
+    CLI_CLIENT(kilocode, "kilocode", "Kilo Code"),
+    CLI_CLIENT(vscode, "vscode", "VS Code"),
+    CLI_CLIENT(cursor, "cursor", "Cursor"),
+    CLI_CLIENT(windsurf, "windsurf", "Windsurf"),
+    CLI_CLIENT(augment, "augment", "Augment"),
+    CLI_CLIENT(openclaw, "openclaw", "OpenClaw"),
+    CLI_CLIENT(kiro, "kiro", "Kiro"),
+    CLI_CLIENT(junie, "junie", "Junie"),
+    CLI_CLIENT(hermes, "hermes", "Hermes"),
+    CLI_CLIENT(openhands, "openhands", "OpenHands"),
+    CLI_CLIENT(cline, "cline", "Cline"),
+    CLI_CLIENT(warp, "warp", "Warp"),
+    CLI_CLIENT(qwen, "qwen", "Qwen"),
+    CLI_CLIENT(copilot_cli, "copilot-cli", "Copilot CLI"),
+    CLI_CLIENT(factory_droid, "factory-droid", "Factory Droid"),
+    CLI_CLIENT(crush, "crush", "Crush"),
+    CLI_CLIENT(goose, "goose", "Goose"),
+    CLI_CLIENT(mistral_vibe, "mistral-vibe", "Mistral Vibe"),
+};
+
+enum { CLI_CLIENT_COUNT = sizeof(CLI_CLIENTS) / sizeof(CLI_CLIENTS[0]) };
+
+static void cli_clients_print_list(FILE *out) {
+    (void)fprintf(out, "Available --clients tokens:\n");
+    for (size_t i = 0; i < CLI_CLIENT_COUNT; i++) {
+        (void)fprintf(out, "  %-16s %s\n", CLI_CLIENTS[i].token, CLI_CLIENTS[i].display);
+    }
+    (void)fprintf(out, "\nExample: --clients=claude,codex\n"
+                       "Omit --clients to configure every detected client.\n");
+}
+
+/* Restrict `detected` to the comma-separated token list. Returns false (after
+ * printing the vocabulary) when a token is unknown, so a typo can never be
+ * mistaken for "that client was not installed". */
+static bool cli_clients_apply_selection(const char *spec, cbm_detected_agents_t *detected) {
+    bool wanted[CLI_CLIENT_COUNT];
+    memset(wanted, 0, sizeof(wanted));
+    char buf[CLI_BUF_1K];
+    snprintf(buf, sizeof(buf), "%s", spec ? spec : "");
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        while (*tok == ' ') {
+            tok++;
+        }
+        size_t len = strlen(tok);
+        while (len > 0 && tok[len - 1] == ' ') {
+            tok[--len] = '\0';
+        }
+        if (!tok[0]) {
+            continue;
+        }
+        bool matched = false;
+        for (size_t i = 0; i < CLI_CLIENT_COUNT; i++) {
+            if (strcmp(tok, CLI_CLIENTS[i].token) == 0) {
+                wanted[i] = true;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            (void)fprintf(stderr, "error: unknown client: %s\n\n", tok);
+            cli_clients_print_list(stderr);
+            return false;
+        }
+    }
+    for (size_t i = 0; i < CLI_CLIENT_COUNT; i++) {
+        if (!wanted[i]) {
+            *(bool *)((char *)detected + CLI_CLIENTS[i].offset) = false;
+        }
+    }
+    return true;
+}
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+bool cbm_cli_clients_apply_selection_for_testing(const char *spec,
+                                                 cbm_detected_agents_t *detected) {
+    return cli_clients_apply_selection(spec, detected);
+}
+size_t cbm_cli_clients_count_for_testing(void) {
+    return CLI_CLIENT_COUNT;
+}
+const char *cbm_cli_clients_token_for_testing(size_t index) {
+    return index < CLI_CLIENT_COUNT ? CLI_CLIENTS[index].token : NULL;
+}
+#endif
+
 /* ── Subcommand: install ──────────────────────────────────────── */
 
 /* The activation flow (self-path detection, simple-copy activate) is the same
@@ -9006,16 +9619,29 @@ static bool cbm_detect_self_path(char *buf, size_t buf_sz, const char *home) {
     buf[0] = '\0';
     bool exact = false;
 #ifdef _WIN32
-    DWORD length = GetModuleFileNameA(NULL, buf, (DWORD)buf_sz);
-    exact = length > 0 && (size_t)length < buf_sz;
+    /* GetModuleFileNameA renders the module path through the ANSI code page,
+     * which mangles non-ASCII install paths (café_日本語 -> caf?_???). Resolve
+     * wide and convert to UTF-8 so the returned path survives verbatim. */
+    char *module_path = cbm_module_path_utf8();
+    size_t length = module_path ? strlen(module_path) : 0U;
+    exact = module_path && length > 0U && length < buf_sz;
     if (exact) {
+        memcpy(buf, module_path, length + 1U);
         cbm_normalize_path_sep(buf);
     } else {
         buf[0] = '\0';
     }
+    free(module_path);
 #elif defined(__APPLE__)
     uint32_t sp_sz = (uint32_t)buf_sz;
     exact = _NSGetExecutablePath(buf, &sp_sz) == 0;
+    if (!exact) {
+        buf[0] = '\0';
+    }
+#elif defined(__FreeBSD__)
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
+    size_t cb = buf_sz;
+    exact = sysctl(mib, 4, buf, &cb, NULL, 0) == 0 && cb > 0;
     if (!exact) {
         buf[0] = '\0';
     }
@@ -9036,6 +9662,71 @@ static bool cbm_detect_self_path(char *buf, size_t buf_sz, const char *home) {
 #endif
     }
     return exact;
+}
+
+/* Is the running binary owned by an external package manager rather than by us?
+ *
+ * #1566: cbm's installer does two separable jobs — place the binary (and put its
+ * directory on PATH), and configure the agents. For someone who installed
+ * through mise, Homebrew or nix, the first job is not merely redundant: it drops
+ * a SECOND copy into ~/.local/bin that shadows the managed one depending on PATH
+ * order, and appends to a shell rc file the package manager never asked us to
+ * touch. They wanted the agent configs refreshed and nothing else.
+ *
+ * The signal is simply that the OS says we are running from somewhere other than
+ * the directory we install into. We only infer when the OS REPORTED the path
+ * (exact): the ~/.local/bin fallback is a guess, and guessing here would refuse
+ * to install for someone who has no binary at all. Naming the manager is
+ * best-effort — the behaviour does not depend on recognising it, only the
+ * wording does. */
+static const char *cli_external_manager_name(const char *self_path) {
+    if (!self_path || !self_path[0]) {
+        return NULL;
+    }
+    if (strstr(self_path, "/mise/") || strstr(self_path, "/.mise/")) {
+        return "mise";
+    }
+    if (strstr(self_path, "/Cellar/") || strstr(self_path, "/homebrew/") ||
+        strstr(self_path, "/linuxbrew/")) {
+        return "Homebrew";
+    }
+    if (strstr(self_path, "/nix/store/")) {
+        return "nix";
+    }
+    if (strstr(self_path, "/.asdf/")) {
+        return "asdf";
+    }
+    if (strstr(self_path, "/.cargo/bin/")) {
+        return "cargo";
+    }
+    return NULL;
+}
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+const char *cbm_cli_external_manager_name_for_testing(const char *self_path) {
+    return cli_external_manager_name(self_path);
+}
+#endif
+
+static bool cli_binary_is_externally_managed(const char *self_path, bool self_path_exact,
+                                             const char *bin_dir) {
+    (void)bin_dir;
+    if (!self_path_exact || !self_path || !self_path[0]) {
+        return false;
+    }
+    /* POSITIVE evidence only: the path must look like a known package manager's.
+     *
+     * The tempting rule — "anything outside the directory we install into" —
+     * is wrong, and the test suite proved it immediately: a test binary runs
+     * from build/, and a perfectly ordinary `install --dir=/opt/cbm` also lives
+     * outside the default. Both would be misread as foreign, and `update` would
+     * refuse to update an installation we own.
+     *
+     * The asymmetry decides it. A false positive REFUSES a legitimate update; a
+     * false negative just leaves today's behaviour in place for an unrecognised
+     * manager, which --skip-binary covers explicitly. So we only infer when we
+     * can name the owner. */
+    return cli_external_manager_name(self_path) != NULL;
 }
 
 /* Build the agent.install.plan.v1 receipt (#388): a machine-readable list of
@@ -9168,6 +9859,10 @@ typedef struct {
     cli_binary_validator_t binary_validator;
     bool has_binary_validator;
     bool copy_binary;
+    /* #1566: true when the binary is not ours to place — suppresses the PATH
+     * edit too, since adding a directory to PATH for a binary we did not
+     * install is exactly the unasked-for change that was complained about. */
+    bool skip_binary;
     bool delete_indexes;
     bool skip_config;
     bool force;
@@ -9242,6 +9937,14 @@ static int cli_install_activate(void *opaque) {
         return CLI_ACTIVATION_PARTIAL;
     }
     int path_rc = CLI_TRUE;
+    /* #1566: only touch PATH when WE placed the binary. Appending to a shell rc
+     * for a binary installed by someone else is an unasked-for change to a file
+     * we do not own, and the directory we would add may hold nothing at all. */
+    if (activation->skip_binary) {
+        cli_activation_transaction_finalize_committed_or_fail_stop(&activation->binary_transaction,
+                                                                   "install_transaction_finalize");
+        return CLI_OK;
+    }
 #ifdef _WIN32
     path_rc = cli_ensure_windows_user_path(activation->bin_dir,
                                            activation->dry_run || g_cli_activation_test_ops_set);
@@ -9291,6 +9994,9 @@ int cbm_cmd_install(int argc, char **argv) {
     bool plan = false;
     bool reset_indexes = false;
     bool skip_config = false;
+    bool skip_binary = false;
+    bool force_binary = false;
+    const char *requested_clients = NULL;
     const char *requested_bin_dir = NULL;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--dry-run") == 0) {
@@ -9303,6 +10009,24 @@ int cbm_cmd_install(int argc, char **argv) {
             reset_indexes = true;
         } else if (strcmp(argv[i], "--skip-config") == 0) {
             skip_config = true;
+        } else if (strncmp(argv[i], "--clients=", SLEN("--clients=")) == 0) {
+            requested_clients = argv[i] + SLEN("--clients=");
+            if (!requested_clients[0]) {
+                (void)fprintf(stderr, "error: --clients requires a value\n\n");
+                cli_clients_print_list(stderr);
+                return CLI_TRUE;
+            }
+        } else if (strcmp(argv[i], "--clients") == 0) {
+            /* Bare `--clients` (and `--clients=help`/`list`) print the
+             * vocabulary. 26 clients ship with tokens nobody would guess. */
+            cli_clients_print_list(stdout);
+            return 0;
+        } else if (strcmp(argv[i], "--skip-binary") == 0) {
+            /* #1566: the mirror of --skip-config. Configure the agents, leave
+             * the binary and PATH alone. */
+            skip_binary = true;
+        } else if (strcmp(argv[i], "--force-binary") == 0) {
+            force_binary = true;
         } else if (strncmp(argv[i], "--dir=", SLEN("--dir=")) == 0) {
             requested_bin_dir = argv[i] + SLEN("--dir=");
             if (!requested_bin_dir[0]) {
@@ -9363,15 +10087,45 @@ int cbm_cmd_install(int argc, char **argv) {
         return 0;
     }
 
+    /* #1558: validate the client tokens BEFORE anything is written, so a typo
+     * fails immediately instead of part-way through configuring. */
+    if (requested_clients) {
+        cbm_detected_agents_t probe = cbm_detect_agents(home);
+        if (!cli_clients_apply_selection(requested_clients, &probe)) {
+            return CLI_TRUE;
+        }
+        g_client_selection = requested_clients;
+    }
+
     printf("codebase-memory-mcp install %s\n\n", CBM_VERSION);
 
     char self_path[CLI_BUF_1K] = {0};
-    (void)cbm_detect_self_path(self_path, sizeof(self_path), home);
+    bool self_path_exact = cbm_detect_self_path(self_path, sizeof(self_path), home);
 
-    struct stat target_status;
-    bool target_exists = (stat(bin_target, &target_status) == 0);
+    /* #1566: a binary owned by mise/Homebrew/nix is not ours to relocate. Infer
+     * it, and let either flag override the inference in either direction. */
+    bool externally_managed =
+        !force_binary && cli_binary_is_externally_managed(self_path, self_path_exact, bin_dir);
+    if (externally_managed || skip_binary) {
+        const char *manager = cli_external_manager_name(self_path);
+        if (skip_binary) {
+            printf("Skipping binary placement (--skip-binary); configuring agents only.\n\n");
+        } else {
+            printf("Binary is managed elsewhere%s%s:\n  %s\n"
+                   "Leaving it and your PATH untouched; configuring agents only.\n"
+                   "  (use --force-binary to install a copy into %s anyway)\n\n",
+                   manager ? " by " : "", manager ? manager : "", self_path, bin_dir);
+        }
+        skip_binary = true;
+    }
+
+    /* NOT stat(): on Windows it goes through the ANSI code page, so an
+     * extended-length or non-ASCII target reports "absent" and a non-force
+     * install silently overwrites bytes the user asked to keep. */
+    cbm_path_info_t target_status;
+    bool target_exists = cbm_path_info_utf8(bin_target, &target_status) == 0;
     bool same_binary = cbm_same_file(self_path, bin_target);
-    bool do_copy = !same_binary && (!target_exists || force);
+    bool do_copy = !skip_binary && !same_binary && (!target_exists || force);
 
     /* (#607) Default: preserve existing indexes. `--reset-indexes` opts into
      * the old prompt-and-delete behaviour. The helper returns 0 only when the
@@ -9547,6 +10301,7 @@ int cbm_cmd_install(int argc, char **argv) {
         .copy_binary = do_copy,
         .delete_indexes = delete_indexes,
         .skip_config = skip_config,
+        .skip_binary = skip_binary,
         .force = force,
         .dry_run = dry_run,
     };
@@ -10166,8 +10921,35 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
         snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
         snprintf(ap, sizeof(ap), "%s/agents/codebase-memory.toml", config_dir);
         cbm_agent_installed_binary_path(home, installed_binary, sizeof(installed_binary));
+        char hook_command[CLI_BUF_8K];
+        char hook_command_windows[CLI_BUF_8K];
+        bool hook_command_ok = cbm_build_augment_command(installed_binary, hook_command,
+                                                         sizeof(hook_command)) == CLI_OK;
+        bool hook_commands_ok = hook_command_ok && cbm_build_augment_command_windows(
+                                                       installed_binary, hook_command_windows,
+                                                       sizeof(hook_command_windows)) == CLI_OK;
+        cbm_toml_codex_hook_failure_t preflight_failure = CBM_TOML_CODEX_HOOK_FAILURE_NONE;
+        bool hook_preflight_ok =
+            hook_commands_ok && cbm_reconcile_codex_hooks_command_detailed(
+                                    cp, hook_command, hook_command_windows,
+                                    CBM_TOML_CODEX_HOOK_REMOVE, true, &preflight_failure) == CLI_OK;
+        if (!hook_preflight_ok) {
+            printf("Codex CLI:\n");
+            fflush(stdout);
+            const char *reason = preflight_failure == CBM_TOML_CODEX_HOOK_FAILURE_NONE
+                                     ? NULL
+                                     : cbm_toml_codex_hook_failure_name(preflight_failure);
+            record_agent_config_error_with_reason(true, "Codex CLI", "hook_preflight", cp, reason);
+            goto codex_toml_done;
+        }
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Codex CLI", cp, ip}, dry_run,
                                   cbm_remove_codex_mcp_owned);
+        if (!dry_run &&
+            cbm_reconcile_codex_hooks_command(cp, hook_command, hook_command_windows,
+                                              CBM_TOML_CODEX_HOOK_REMOVE, false) != CLI_OK) {
+            record_agent_config_error(true, "Codex CLI", "hook_uninstall", cp);
+        }
+    codex_toml_done:
         uninstall_agent_skill("Codex CLI", skills_dir, dry_run);
         uninstall_tiered_agent_profiles(
             (cbm_tiered_profile_set_t){
@@ -10179,15 +10961,10 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
             },
             dry_run);
         if (!dry_run) {
-            if (cbm_remove_codex_hooks(cp) != CLI_OK) {
-                record_agent_config_error(true, "Codex CLI", "hook_uninstall", cp);
-            }
             char hooks_json[CLI_BUF_1K];
-            char hook_command[CLI_BUF_8K];
             snprintf(hooks_json, sizeof(hooks_json), "%s/hooks.json", config_dir);
             if (cbm_file_exists(hooks_json) &&
-                (cbm_build_augment_command(installed_binary, hook_command, sizeof(hook_command)) !=
-                     CLI_OK ||
+                (!hook_command_ok ||
                  cbm_remove_paired_lifecycle_hooks_json(hooks_json, hook_command) != CLI_OK)) {
                 record_agent_config_error(true, "Codex CLI", "json_hook_uninstall", hooks_json);
             }
@@ -10819,8 +11596,36 @@ static int cli_uninstall_activate(void *opaque) {
 }
 
 int cbm_cmd_uninstall(int argc, char **argv) {
+    /* `uninstall --help` used to UNINSTALL.
+     *
+     * The top-level dispatcher matches the subcommand at argv[1] and hands the
+     * rest here, so its own --help check never sees argv[2]. Nothing downstream
+     * looked either, and --help is the one flag a person types precisely
+     * BECAUSE they are not sure what a command does. It removed the binary and
+     * every agent configuration (#1038).
+     *
+     * Checked before parse_auto_answer so a `-y` sitting elsewhere on the line
+     * cannot auto-confirm the destruction we are trying to prevent. */
+    for (int i = 0; i < argc; i++) {
+        if (argv && argv[i] && (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0)) {
+            printf("Usage: codebase-memory-mcp uninstall [options]\n\n"
+                   "Removes the codebase-memory-mcp binary, its agent configurations and,\n"
+                   "with confirmation, its indexes. THIS IS DESTRUCTIVE.\n\n"
+                   "Options:\n"
+                   "  --dry-run        Show what would be removed, change nothing\n"
+                   "  --dir=PATH       Uninstall from a custom install directory\n"
+                   "  -y, --yes        Do not prompt for confirmation\n"
+                   "  -h, --help       Show this help and exit\n\n"
+                   "Run with --dry-run first if you are unsure.\n");
+            return CLI_OK;
+        }
+    }
     parse_auto_answer(argc, argv);
     bool dry_run = false;
+    /* An install into a custom --dir must be removable from that same dir:
+     * without this, anyone who installed outside ~/.local/bin has no supported
+     * uninstall path at all. Mirrors cbm_cmd_install's parsing. */
+    const char *requested_bin_dir = NULL;
     for (int i = 0; i < argc; i++) {
         /* The public command dispatcher passes option-only argv, while the
          * long-standing direct API/tests include the subcommand at argv[0]. */
@@ -10829,6 +11634,18 @@ int cbm_cmd_uninstall(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--dry-run") == 0) {
             dry_run = true;
+        } else if (strncmp(argv[i], "--dir=", SLEN("--dir=")) == 0) {
+            requested_bin_dir = argv[i] + SLEN("--dir=");
+            if (!requested_bin_dir[0]) {
+                (void)fprintf(stderr, "error: --dir requires a non-empty path\n");
+                return CLI_TRUE;
+            }
+        } else if (strcmp(argv[i], "--dir") == 0) {
+            if (i + 1 >= argc || !argv[i + 1] || !argv[i + 1][0] || argv[i + 1][0] == '-') {
+                (void)fprintf(stderr, "error: --dir requires a non-empty path\n");
+                return CLI_TRUE;
+            }
+            requested_bin_dir = argv[++i];
         } else if (strcmp(argv[i], "-y") != 0 && strcmp(argv[i], "--yes") != 0 &&
                    strcmp(argv[i], "-n") != 0 && strcmp(argv[i], "--no") != 0) {
             (void)fprintf(stderr, "error: unknown uninstall option: %s\n", argv[i]);
@@ -10868,13 +11685,20 @@ int cbm_cmd_uninstall(int argc, char **argv) {
     char bin_path_storage[CLI_BUF_1K];
     const char *bin_path = bin_path_storage;
 #ifdef _WIN32
-    snprintf(bin_path_storage, sizeof(bin_path_storage), "%s/.local/bin/codebase-memory-mcp.exe",
-             home);
+    static const char kBinaryLeaf[] = "codebase-memory-mcp.exe";
 #else
-    snprintf(bin_path_storage, sizeof(bin_path_storage), "%s/.local/bin/codebase-memory-mcp", home);
+    static const char kBinaryLeaf[] = "codebase-memory-mcp";
 #endif
-    struct stat binary_status;
-    bool binary_exists = stat(bin_path, &binary_status) == 0;
+    int bin_path_length = requested_bin_dir ? snprintf(bin_path_storage, sizeof(bin_path_storage),
+                                                       "%s/%s", requested_bin_dir, kBinaryLeaf)
+                                            : snprintf(bin_path_storage, sizeof(bin_path_storage),
+                                                       "%s/.local/bin/%s", home, kBinaryLeaf);
+    if (bin_path_length <= 0 || (size_t)bin_path_length >= sizeof(bin_path_storage)) {
+        (void)fprintf(stderr, "error: uninstall target path is too long\n");
+        return CLI_TRUE;
+    }
+    cbm_path_info_t binary_status;
+    bool binary_exists = cbm_path_info_utf8(bin_path, &binary_status) == 0;
     cbm_activation_transaction_t *binary_transaction = NULL;
     if (!dry_run && binary_exists) {
         cbm_activation_transaction_status_t stage_status =
@@ -11143,7 +11967,7 @@ static int extract_and_install_binary(extract_install_args_t args) {
  * covers the flow through the activation test seam. */
 /* Build the download URL for the update command. */
 static void build_update_url(char *url, int url_sz, const char *os, const char *arch,
-                             const char *ext, bool want_ui) {
+                             const char *ext) {
     char base_url_buf[CLI_BUF_512];
     const char *base_url =
         cbm_safe_getenv("CBM_DOWNLOAD_URL", base_url_buf, sizeof(base_url_buf), NULL);
@@ -11155,8 +11979,7 @@ static void build_update_url(char *url, int url_sz, const char *os, const char *
      * have no such variant. Keep in sync with install.sh / install.js / pypi
      * _cli.py. */
     const char *portable = (strcmp(os, "linux") == 0) ? "-portable" : "";
-    snprintf(url, url_sz, "%s/codebase-memory-mcp-%s%s-%s%s.%s", base_url, want_ui ? "ui-" : "", os,
-             arch, portable, ext);
+    snprintf(url, url_sz, "%s/codebase-memory-mcp-%s-%s%s.%s", base_url, os, arch, portable, ext);
 }
 
 /* Confirm index deletion before network I/O, but defer the deletion itself to
@@ -11189,8 +12012,8 @@ static int update_prepare_clear_indexes(const char *home, bool dry_run, bool *de
 
 /* Download and verify before disruption, then activate under daemon locks. */
 static int download_verify_install(const char *url, const char *ext, const char *os,
-                                   const char *arch, bool want_ui, const char *bin_dest,
-                                   const char *home, bool delete_indexes) {
+                                   const char *arch, const char *bin_dest, const char *home,
+                                   bool delete_indexes) {
     char tmp_archive[CLI_BUF_256];
     int archive_path_length =
         snprintf(tmp_archive, sizeof(tmp_archive), "%s/cbm-update-XXXXXX", cbm_tmpdir());
@@ -11221,8 +12044,8 @@ static int download_verify_install(const char *url, const char *ext, const char 
     char archive_name[CLI_BUF_256];
     /* Must match build_update_url: linux uses the static "-portable" asset. */
     const char *portable = (strcmp(os, "linux") == 0) ? "-portable" : "";
-    snprintf(archive_name, sizeof(archive_name), "codebase-memory-mcp-%s%s-%s%s.%s",
-             want_ui ? "ui-" : "", os, arch, portable, ext);
+    snprintf(archive_name, sizeof(archive_name), "codebase-memory-mcp-%s-%s%s.%s", os, arch,
+             portable, ext);
     /* Fail closed: install only a positively-verified download. A mismatch,
      * a missing checksum entry, or an unavailable hash tool (crc != 0) all
      * abort rather than install an unverified binary. */
@@ -11243,34 +12066,6 @@ static int download_verify_install(const char *url, const char *ext, const char 
         return CLI_TRUE;
     }
     return 0;
-}
-
-/* Select update variant. Returns 0=standard, 1=ui, -1=error. */
-static int select_update_variant(int variant_flag) {
-    if (variant_flag == VARIANT_A) {
-        return 0;
-    }
-    if (variant_flag == VARIANT_B) {
-        return CLI_TRUE;
-    }
-#ifndef _WIN32
-    if (!isatty(fileno(stdin))) {
-        (void)fprintf(stderr, "error: variant selection requires a terminal. "
-                              "Use --standard or --ui flag.\n");
-        return CLI_ERR;
-    }
-#endif
-    printf("Which binary variant do you want?\n");
-    printf("  1) standard  — MCP server only\n");
-    printf("  2) ui        — MCP server + embedded graph visualization\n");
-    printf("Choose (1/2): ");
-    (void)fflush(stdout);
-    char choice[CLI_BUF_16];
-    if (!fgets(choice, sizeof(choice), stdin)) {
-        (void)fprintf(stderr, "error: failed to read input\n");
-        return CLI_ERR;
-    }
-    return (choice[0] == '2') ? CLI_TRUE : 0;
 }
 
 /* Case-insensitive prefix match (portable — no strncasecmp dependency). */
@@ -11349,24 +12144,94 @@ static bool check_already_latest(void) {
 
 #endif /* CBM_CLI_ENABLE_TEST_API */
 
+/* Is the installer script actually present beside the binary? (#1632)
+ *
+ * `update` hands off to install.sh / install.ps1 and prints the command to run.
+ * It derived that path from the binary's own location, which is not the same
+ * question: the installer is placed beside the binary by install.sh, but a
+ * binary moved, packaged, or built from source has no installer next to it, and
+ * we still printed the path. The user's session then ended on a command that
+ * cannot run.
+ *
+ * Checked with cbm_path_info_utf8 so a non-ASCII install path resolves on
+ * Windows. A symlink counts: it is reported rather than followed, and the shell
+ * will run it perfectly well. */
+bool cbm_cli_installer_beside_binary(const char *dir) {
+    if (!dir || !dir[0]) {
+        return false;
+    }
+    char script[CLI_BUF_1K];
+#ifdef _WIN32
+    const char *name = "install.ps1";
+#else
+    const char *name = "install.sh";
+#endif
+    int written = snprintf(script, sizeof(script), "%s/%s", dir, name);
+    if (written <= 0 || (size_t)written >= sizeof(script)) {
+        return false;
+    }
+    cbm_path_info_t info;
+    return cbm_path_info_utf8(script, &info) == 0 && !info.is_directory;
+}
+
 int cbm_cmd_update(int argc, char **argv) {
     parse_auto_answer(argc, argv);
 
     bool dry_run = false;
     bool force = false;
-    int variant_flag = 0; /* 0 = ask, 1 = standard, 2 = ui */
+    bool legacy_variant_flag = false;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--dry-run") == 0) {
             dry_run = true;
-        } else if (strcmp(argv[i], "--standard") == 0) {
-            variant_flag = VARIANT_A;
-        } else if (strcmp(argv[i], "--ui") == 0) {
-            variant_flag = VARIANT_B;
         } else if (strcmp(argv[i], "--force") == 0) {
             force = true;
+        } else if (strcmp(argv[i], "--ui") == 0 || strcmp(argv[i], "--standard") == 0) {
+            /* v0.10.2 deleted the ui/standard chooser and, with it, these flags —
+             * which turned `update --ui` from a working command into a hard
+             * error for everyone who had it in a script, an alias, or muscle
+             * memory (#1544). Removing a CHOICE is fine; removing the WORDS
+             * people type is a break we owe them nothing for. Accept both,
+             * ignore them, and say once why they no longer mean anything. */
+            legacy_variant_flag = true;
         } else if (strcmp(argv[i], "-y") != 0 && strcmp(argv[i], "--yes") != 0 &&
                    strcmp(argv[i], "-n") != 0 && strcmp(argv[i], "--no") != 0) {
             (void)fprintf(stderr, "error: unknown update option: %s\n", argv[i]);
+            return CLI_TRUE;
+        }
+    }
+    if (legacy_variant_flag) {
+        (void)fprintf(stderr, "note: --ui/--standard are accepted but no longer do anything; since "
+                              "v0.10.0 there is one build per platform and it always includes the "
+                              "graph UI.\n");
+    }
+
+    /* #1566: we cannot update a binary a package manager owns, and pretending
+     * otherwise is the dishonest-success pattern this project keeps fixing:
+     * reporting that an update ran while changing nothing leaves the user
+     * convinced they are current. Refuse, and name the command that WILL work. */
+    {
+        char self_path[CLI_BUF_1K] = {0};
+        const char *home = cbm_get_home_dir();
+        bool self_exact = home && cbm_detect_self_path(self_path, sizeof(self_path), home);
+        char managed_dir[CLI_BUF_1K] = {0};
+        if (self_exact && home) {
+            snprintf(managed_dir, sizeof(managed_dir), "%s/.local/bin", home);
+        }
+        if (self_exact && cli_binary_is_externally_managed(self_path, true, managed_dir)) {
+            const char *manager = cli_external_manager_name(self_path);
+            (void)fprintf(stderr,
+                          "error: this binary is managed by %s, so `update` cannot replace it:\n"
+                          "  %s\n",
+                          manager ? manager : "another installer", self_path);
+            if (manager && strcmp(manager, "mise") == 0) {
+                (void)fprintf(stderr, "  update it with: mise upgrade codebase-memory-mcp\n");
+            } else if (manager && strcmp(manager, "Homebrew") == 0) {
+                (void)fprintf(stderr, "  update it with: brew upgrade codebase-memory-mcp\n");
+            } else {
+                (void)fprintf(stderr, "  update it through whichever tool installed it.\n");
+            }
+            (void)fprintf(stderr, "  to refresh only the agent configurations, run: "
+                                  "codebase-memory-mcp install --skip-binary\n");
             return CLI_TRUE;
         }
     }
@@ -11395,7 +12260,6 @@ int cbm_cmd_update(int argc, char **argv) {
      * rejecting typos instead of silently accepting them. */
     (void)dry_run;
     (void)force;
-    (void)variant_flag;
 #endif
 #ifdef CBM_CLI_ENABLE_TEST_API
     if (g_cli_activation_test_ops_set) {
@@ -11406,35 +12270,41 @@ int cbm_cmd_update(int argc, char **argv) {
     {
         char self_dir[CLI_BUF_1K] = {0};
         bool have_dir = false;
-#ifdef _WIN32
-        /* Native separators on purpose: this path is printed for the user to
-         * paste into PowerShell verbatim. */
-        DWORD self_len = GetModuleFileNameA(NULL, self_dir, (DWORD)sizeof(self_dir));
-        char *last_sep =
-            (self_len > 0 && (size_t)self_len < sizeof(self_dir)) ? strrchr(self_dir, '\\') : NULL;
-#else
+        /* cbm_detect_self_path resolves wide on Windows (non-ASCII install
+         * paths survive) and normalizes to forward separators on every
+         * platform, so one branch serves both. */
         char *last_sep = cbm_detect_self_path(self_dir, sizeof(self_dir), cbm_get_home_dir())
                              ? strrchr(self_dir, '/')
                              : NULL;
-#endif
         if (last_sep) {
             *last_sep = '\0';
             have_dir = true;
         }
         printf("codebase-memory-mcp update (current: %s)\n\n", CBM_VERSION);
 #ifdef _WIN32
+        /* The printed command deliberately carries NO execution-policy override.
+         * A policy-bypass invocation is one of the most heavily weighted
+         * malicious-script patterns there is, and emitting it as a literal put
+         * that signature inside every Windows artifact we distribute — to save
+         * the user one documented step. Pointing at Unblock-File reaches the
+         * same outcome and leaves the policy decision with them. README's
+         * Windows install section carries the override for the
+         * restricted-policy case: documentation is the right place to hand out
+         * that incantation, a shipped binary is not. */
         printf("The update runs from install.ps1, not from this process. Close any\n"
                "running sessions, then run\n\n");
         if (have_dir) {
-            printf("  powershell -ExecutionPolicy Bypass -File \"%s\\install.ps1\"\n\n", self_dir);
+            printf("  powershell -File \"%s/install.ps1\"\n\n", self_dir);
         } else {
-            printf("  powershell -ExecutionPolicy Bypass -File install.ps1\n"
+            printf("  powershell -File install.ps1\n"
                    "  (ships in the release archive, and is placed beside the\n"
                    "  binary on install)\n\n");
         }
         printf("It downloads the latest release, verifies its checksum, and replaces\n"
-               "this binary in place. If PowerShell refuses to run the script because\n"
-               "it came from the internet, Unblock-File it first.\n");
+               "this binary in place. If PowerShell refuses to run the script, it is\n"
+               "usually because the file arrived from the internet: run\n"
+               "'Unblock-File install.ps1' first. If your execution policy still\n"
+               "blocks it, the README's Windows install section lists the options.\n");
 #else
         printf("The update runs from install.sh, not from this process. Run\n\n");
         if (have_dir) {
@@ -11445,7 +12315,8 @@ int cbm_cmd_update(int argc, char **argv) {
         }
         printf("It downloads the latest release, verifies its checksum, and replaces\n"
                "this binary in place. install.sh is idempotent, so re-running it IS\n"
-               "the update; pass --ui for the UI build.\n");
+               "the update. One build per platform — the graph UI is always\n"
+               "included.\n");
 #endif
         return 0;
     }
@@ -11474,26 +12345,17 @@ int cbm_cmd_update(int argc, char **argv) {
         return CLI_TRUE;
     }
 
-    /* Step 2: Determine variant */
-    int want_ui_rc = select_update_variant(variant_flag);
-    if (want_ui_rc < 0) {
-        return CLI_TRUE;
-    }
-    bool want_ui = (want_ui_rc == CLI_TRUE);
-    const char *variant = want_ui ? "ui-" : "";
-    const char *variant_label = want_ui ? "ui" : "standard";
-
     const char *os = detect_os();
     const char *arch = detect_arch();
     const char *ext = strcmp(os, "windows") == 0 ? "zip" : "tar.gz";
 
     char url[CLI_BUF_512];
-    build_update_url(url, sizeof(url), os, arch, ext, want_ui);
+    build_update_url(url, sizeof(url), os, arch, ext);
 
     if (dry_run) {
-        printf("\nWould download %s binary for %s/%s ...\n", variant_label, os, arch);
+        printf("\nWould download the binary for %s/%s ...\n", os, arch);
     } else {
-        printf("\nDownloading %s binary for %s/%s ...\n", variant_label, os, arch);
+        printf("\nDownloading the binary for %s/%s ...\n", os, arch);
     }
     printf("  %s\n", url);
 
@@ -11504,10 +12366,8 @@ int cbm_cmd_update(int argc, char **argv) {
 #else
         printf("  target: %s/.local/bin/codebase-memory-mcp\n", home);
 #endif
-        printf("  variant: %s\n", variant_label);
         printf("  os/arch: %s/%s\n", os, arch);
         printf("\nUpdate dry-run complete.\n");
-        (void)variant;
         return 0;
     }
 
@@ -11527,7 +12387,7 @@ int cbm_cmd_update(int argc, char **argv) {
         return CLI_TRUE;
     }
 
-    int rc = download_verify_install(url, ext, os, arch, want_ui, bin_dest, home, delete_indexes);
+    int rc = download_verify_install(url, ext, os, arch, bin_dest, home, delete_indexes);
     if (rc != 0) {
         return CLI_TRUE;
     }
@@ -11544,7 +12404,6 @@ int cbm_cmd_update(int argc, char **argv) {
     printf("automatically when you next use the MCP server.\n");
     printf("\nUpdate complete. Please restart your coding-agent sessions to "
            "properly take this into account.\n");
-    (void)variant;
     return 0;
 #endif /* CBM_CLI_ENABLE_TEST_API */
 }
@@ -11701,6 +12560,68 @@ static void cli_add_typed(yyjson_mut_doc *out, yyjson_mut_val *obj, const char *
     }
     yyjson_mut_obj_add(obj, yyjson_mut_strcpy(out, key), vv);
 }
+
+static bool cli_stdin_allowed_for_schema(const char *schema_str);
+
+bool cbm_cli_args_from_stdin_allowed(const char *tool_name, bool stdin_is_tty) {
+    /* An interactive run has nothing piped to read: consulting the terminal
+     * would just sit waiting for the user to type JSON. Unchanged by #1359 —
+     * this is why the hang was only ever reachable from automation. */
+    if (stdin_is_tty) {
+        return false;
+    }
+
+    /* WHY the schema gate (#1359): a non-interactive stdin used to be accepted
+     * as piped arguments unconditionally, and cli_slurp_stream reads to EOF. An
+     * ordinary non-interactive caller never sends that EOF — Node's
+     * child_process.spawn defaults to stdio:['pipe','pipe','pipe'] and the
+     * parent must call child.stdin.end() explicitly, which almost nobody does
+     * for a command they are not writing to. fd 0 then stays open with no
+     * writer and the read never returns; the reporter's shell script was still
+     * parked in fread(0) fourteen minutes later. For a tool whose input_schema
+     * declares no properties (list_projects) stdin cannot carry anything the
+     * tool would accept, so that read is pure deadlock with nothing to gain:
+     * never start it, and let the caller fall through to `{}` exactly as an
+     * interactive run already did. Tools that DO declare properties keep the
+     * documented `echo '<json>' | cli <tool>` channel untouched. */
+    const char *schema_str = cbm_mcp_tool_input_schema(tool_name);
+    if (!schema_str) {
+        /* Unknown tool: dispatch rejects it by name and no stdin content can
+         * change that verdict, so do not block for input we would discard. */
+        return false;
+    }
+
+    return cli_stdin_allowed_for_schema(schema_str);
+}
+
+/* Schema→decision core of the stdin gate, split out so the zero-argument
+ * branch stays TESTED even when no shipped tool is zero-argument anymore:
+ * #1181 gave list_projects pagination parameters, retiring the last
+ * empty-properties schema, and the #1359 regression tests had leaned on it
+ * as their live example. The product contract is unchanged — a schema that
+ * declares no properties means stdin has nothing to carry and the read is
+ * pure deadlock; the tests now exercise this path directly. */
+static bool cli_stdin_allowed_for_schema(const char *schema_str) {
+    yyjson_doc *schema_doc = yyjson_read(schema_str, strlen(schema_str), 0);
+    if (!schema_doc) {
+        /* The schemas are compile-time constants, so a parse failure means a
+         * malformed literal rather than caller input. Keep the documented stdin
+         * channel rather than silently narrowing it on a schema we could not
+         * read — the gate must only ever fire on positive evidence that the
+         * tool takes no arguments. */
+        return true;
+    }
+    yyjson_val *props = yyjson_obj_get(yyjson_doc_get_root(schema_doc), "properties");
+    bool accepts_arguments = props && yyjson_is_obj(props) && yyjson_obj_size(props) > 0;
+    yyjson_doc_free(schema_doc);
+    return accepts_arguments;
+}
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+bool cbm_cli_stdin_allowed_for_schema_for_test(const char *schema_str) {
+    return cli_stdin_allowed_for_schema(schema_str);
+}
+#endif
 
 char *cbm_cli_build_args_json(const char *tool_name, int argc, char **argv, char **err_out) {
     if (err_out) {

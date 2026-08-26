@@ -52,6 +52,36 @@ TEST(sql_label_allowlists_match_cbm_label_is_type_like) {
     PASS();
 }
 
+/* Same drift guard for the relation labels (Table/View — SQL data lineage).
+ * Relations are registry symbols but deliberately NOT type-like: the default
+ * cbm_registry_resolve vetoes them, so a code identifier sharing a table's
+ * name never binds into the lineage layer. */
+TEST(sql_relation_labels_match_cbm_label_is_relation) {
+    static const char *const relations[] = {"Table", "View", "Model"};
+    for (size_t i = 0; i < sizeof(relations) / sizeof(relations[0]); i++) {
+        ASSERT_TRUE(cbm_label_is_relation(relations[i]));
+        ASSERT_TRUE(cbm_label_is_registry_symbol(relations[i]));
+        ASSERT_FALSE(cbm_label_is_type_like(relations[i]));
+        char quoted[64];
+        snprintf(quoted, sizeof(quoted), "'%s'", relations[i]);
+        ASSERT_NOT_NULL(strstr(CBM_SQL_RELATION_LABELS, quoted));
+        /* Relations must NOT ride in the callable/type fragments — the arch
+         * queries opt in explicitly by appending CBM_SQL_RELATION_LABELS. */
+        ASSERT_NULL(strstr(CBM_SQL_CALLABLE_OR_TYPE_LABELS, quoted));
+    }
+    /* cbm_label_is_registry_symbol covers exactly the seeded families. */
+    ASSERT_TRUE(cbm_label_is_registry_symbol("Function"));
+    ASSERT_TRUE(cbm_label_is_registry_symbol("Method"));
+    ASSERT_TRUE(cbm_label_is_registry_symbol("Class"));
+    ASSERT_TRUE(cbm_label_is_registry_symbol("Variable"));
+    ASSERT_TRUE(cbm_label_is_registry_symbol("Field"));
+    ASSERT_FALSE(cbm_label_is_registry_symbol("Module"));
+    ASSERT_FALSE(cbm_label_is_registry_symbol("File"));
+    ASSERT_FALSE(cbm_label_is_relation("Class"));
+    ASSERT_FALSE(cbm_label_is_relation(NULL));
+    PASS();
+}
+
 /* ── Schema / Open / Close ──────────────────────────────────────── */
 
 TEST(store_open_memory) {
@@ -544,8 +574,7 @@ TEST(store_lsp_surface_round_trip) {
     ASSERT_STR_EQ(rows[0].defs_json, "[{\"qn\":\"pkg.A\",\"sn\":\"A\",\"label\":\"Function\"}]");
     ASSERT_STR_EQ(rows[0].config_ctx, "cfg-1");
     ASSERT_EQ(rows[0].ref_bloom_len, (int)sizeof(bloom));
-    ASSERT_TRUE(rows[0].ref_bloom != NULL &&
-                memcmp(rows[0].ref_bloom, bloom, sizeof(bloom)) == 0);
+    ASSERT_TRUE(rows[0].ref_bloom != NULL && memcmp(rows[0].ref_bloom, bloom, sizeof(bloom)) == 0);
     ASSERT_STR_EQ(rows[1].rel_path, "pkg/b.go");
     ASSERT_STR_EQ(rows[1].defs_json, "[]");
     ASSERT_EQ(rows[1].ref_bloom_len, 0);
@@ -1262,6 +1291,48 @@ TEST(store_integrity_corrupt_too_many_rows) {
     }
     ASSERT_FALSE(cbm_store_check_integrity(s));
     cbm_store_close(s);
+    PASS();
+}
+
+/* ── Quarantine verdict (#1206, #1037) ──────────────────────────────
+ *
+ * The bool check above cannot answer the only question the quarantine path
+ * actually asks: "is this database damaged, or did I just lose a lock race?"
+ * Answering "damaged" to the second question is what made concurrent instances
+ * rename each other's HEALTHY databases to .corrupt (#1206). These bind the
+ * three-way verdict so that behaviour cannot come back. */
+
+TEST(store_integrity_verdict_healthy_is_ok) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "healthy-proj", "/tmp/healthy");
+    ASSERT_EQ(cbm_store_check_integrity_verdict(s), CBM_INTEGRITY_OK);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_integrity_verdict_real_corruption_is_corrupt) {
+    /* Structural damage the shallow check can see: node IDs landing in
+     * root_path. This one MUST be quarantinable — a verdict that never says
+     * CORRUPT would protect broken databases instead of users. */
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_exec(db,
+                 "INSERT INTO projects (name, indexed_at, root_path) "
+                 "VALUES ('broken', '2024-01-01', '826');",
+                 NULL, NULL, NULL);
+    ASSERT_EQ(cbm_store_check_integrity_verdict(s), CBM_INTEGRITY_CORRUPT);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_integrity_verdict_unopenable_is_transient_not_corrupt) {
+    /* A handle we could not open tells us NOTHING about the file's contents.
+     * Reporting CORRUPT here is how a database nobody could read got renamed
+     * and rebuilt from scratch (#1206) — the destructive answer to a question
+     * that was never asked. */
+    ASSERT_EQ(cbm_store_check_integrity_verdict(NULL), CBM_INTEGRITY_TRANSIENT);
     PASS();
 }
 
@@ -2136,6 +2207,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_coverage_replace_rejects_invalid_row_arguments);
     RUN_TEST(store_coverage_replace_rolls_back_when_shadow_rebuild_fails);
     RUN_TEST(sql_label_allowlists_match_cbm_label_is_type_like);
+    RUN_TEST(sql_relation_labels_match_cbm_label_is_relation);
     RUN_TEST(store_open_memory);
     RUN_TEST(store_close_null);
     RUN_TEST(store_open_memory_twice);
@@ -2144,6 +2216,9 @@ SUITE(store_nodes) {
     RUN_TEST(store_integrity_corrupt_bad_path);
     RUN_TEST(store_integrity_windows_lowercase_drive_issue367);
     RUN_TEST(store_integrity_corrupt_too_many_rows);
+    RUN_TEST(store_integrity_verdict_healthy_is_ok);
+    RUN_TEST(store_integrity_verdict_real_corruption_is_corrupt);
+    RUN_TEST(store_integrity_verdict_unopenable_is_transient_not_corrupt);
     RUN_TEST(store_integrity_null_check);
     RUN_TEST(store_project_crud);
     RUN_TEST(store_project_update);

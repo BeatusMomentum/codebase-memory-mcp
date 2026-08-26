@@ -30,14 +30,29 @@ enum { MIN_PRINTABLE = 0x20 };
 /* Handler arg scan start index (skip first positional). */
 enum { HANDLER_START_IDX = 1 };
 
-/* Look up a module-level string constant by name. */
+/* Look up a module-level string constant by name. URL-builder entries share the
+ * map but are not constants: a bare `thingPath` reference is the function, not
+ * the URL it would build (issue #1009). */
 static const char *lookup_string_constant(const CBMExtractCtx *ctx, const char *name) {
     if (!name || !name[0]) {
         return NULL;
     }
     const CBMStringConstantMap *map = &ctx->string_constants;
     for (int i = 0; i < map->count; i++) {
-        if (strcmp(map->names[i], name) == 0) {
+        if (!map->is_url_builder[i] && strcmp(map->names[i], name) == 0) {
+            return map->values[i];
+        }
+    }
+    return NULL;
+}
+
+static const char *lookup_url_builder(const CBMExtractCtx *ctx, const char *name) {
+    if (!name || !name[0]) {
+        return NULL;
+    }
+    const CBMStringConstantMap *map = &ctx->string_constants;
+    for (int i = 0; i < map->count; i++) {
+        if (map->is_url_builder[i] && strcmp(map->names[i], name) == 0) {
             return map->values[i];
         }
     }
@@ -1855,8 +1870,22 @@ static void extract_call_args(CBMExtractCtx *ctx, TSNode args, CBMCall *call) {
             ca->index = positional_idx++;
             if (is_string_like(ak) && ca->expr) {
                 ca->value = strip_quotes(ctx->arena, ca->expr);
+            } else if (strcmp(ak, "template_string") == 0) {
+                /* Flattened {} form so downstream url-arg detection joins the
+                 * canonical server route shape (issue #1006/#1009). */
+                ca->value = cbm_template_string_text(ctx->arena, arg_node, ctx->source);
             } else if (strcmp(ak, "identifier") == 0 && ca->expr) {
                 ca->value = lookup_string_constant(ctx, ca->expr);
+            } else if (strcmp(ak, "call_expression") == 0) {
+                /* URL-builder helper call (issue #1009): resolve
+                 * client(buildPath(id)) through the per-file builder map. */
+                TSNode fn = ts_node_child_by_field_name(arg_node, TS_FIELD("function"));
+                if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "identifier") == 0) {
+                    char *fname = cbm_node_text(ctx->arena, fn, ctx->source);
+                    if (fname) {
+                        ca->value = lookup_url_builder(ctx, fname);
+                    }
+                }
             }
             call->arg_count++;
         }
@@ -2005,6 +2034,24 @@ static const char *extract_keyword_url(CBMExtractCtx *ctx, TSNode arg) {
     return extract_string_value(ctx, val_node);
 }
 
+// `prefixVar + "/route"` (Go's idiomatic configurable-base-path pattern):
+// recover the literal suffix. A right side that is not itself a literal is
+// left unresolved rather than guessed (issue #1249).
+static const char *extract_binary_concat_suffix(CBMExtractCtx *ctx, TSNode node) {
+    TSNode op_node = ts_node_child_by_field_name(node, TS_FIELD("operator"));
+    if (!ts_node_is_null(op_node)) {
+        char *op = cbm_node_text(ctx->arena, op_node, ctx->source);
+        if (!op || strcmp(op, "+") != 0) {
+            return NULL;
+        }
+    }
+    TSNode rhs = ts_node_child_by_field_name(node, TS_FIELD("right"));
+    if (ts_node_is_null(rhs) || !is_string_like(ts_node_type(rhs))) {
+        return NULL;
+    }
+    return strip_and_validate_string_arg(ctx->arena, cbm_node_text(ctx->arena, rhs, ctx->source));
+}
+
 // Try to extract URL/topic from a positional argument (string or constant).
 static const char *extract_positional_url(CBMExtractCtx *ctx, TSNode arg, const char *ak) {
     /* JS/TS template literals: `/things/${id}` normalizes to "/things/{}" so the
@@ -2013,6 +2060,12 @@ static const char *extract_positional_url(CBMExtractCtx *ctx, TSNode arg, const 
         const char *flat = cbm_template_string_text(ctx->arena, arg, ctx->source);
         if (flat) {
             return strip_and_validate_string_arg(ctx->arena, (char *)flat);
+        }
+    }
+    if (strcmp(ak, "binary_expression") == 0) {
+        const char *suffix = extract_binary_concat_suffix(ctx, arg);
+        if (suffix) {
+            return suffix;
         }
     }
     if (is_string_like(ak)) {
@@ -2058,6 +2111,19 @@ static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args) {
             const char *val = extract_composite_queue_field(ctx, arg);
             if (val) {
                 return val;
+            }
+        }
+
+        /* URL-builder helper call (issue #1009): `client(buildPath(id))` — the
+         * builder's returned URL was recorded in the per-file constant map. */
+        if (strcmp(ak, "call_expression") == 0) {
+            TSNode fn = ts_node_child_by_field_name(arg, TS_FIELD("function"));
+            if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "identifier") == 0) {
+                char *fname = cbm_node_text(ctx->arena, fn, ctx->source);
+                const char *val = fname ? lookup_url_builder(ctx, fname) : NULL;
+                if (val) {
+                    return val;
+                }
             }
         }
 

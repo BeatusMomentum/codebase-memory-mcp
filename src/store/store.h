@@ -211,6 +211,8 @@ typedef struct {
     int visited_count;
     cbm_edge_info_t *edges;
     int edge_count;
+    /* True when trail expansion hit its recursive-row safety budget. */
+    bool truncated;
 } cbm_traverse_result_t;
 
 /* ── Schema introspection ───────────────────────────────────────── */
@@ -281,6 +283,28 @@ bool cbm_store_check_integrity(cbm_store_t *s);
 /* Shallow check + PRAGMA quick_check — catches page-level corruption.
  * O(db size); use on rare paths (artifact import), not hot opens. */
 bool cbm_store_check_integrity_deep(cbm_store_t *s);
+
+/* Outcome of a quarantine-grade integrity check. Used to decide whether a DB
+ * that failed the cheap open-time check should be quarantined (renamed to
+ * .corrupt and rebuilt) or left alone. See cbm_store_check_integrity_verdict. */
+typedef enum {
+    CBM_INTEGRITY_OK = 0,        /* DB is healthy */
+    CBM_INTEGRITY_CORRUPT = 1,   /* DB is structurally damaged — safe to quarantine */
+    CBM_INTEGRITY_TRANSIENT = 2, /* SQL/busy/IO error — NOT corruption, do NOT quarantine */
+} cbm_integrity_verdict_t;
+
+/* Full integrity verdict for the quarantine decision path.
+ *
+ * The plain cbm_store_check_integrity() returns a single bool and cannot
+ * distinguish "the projects table has 99 rows" (real corruption) from
+ * "sqlite3_prepare_v2 returned SQLITE_BUSY because another instance held the
+ * writer lock" (a transient lock contention, #1206). Quarantining on the latter
+ * is what makes concurrent MCP instances destroy each other's healthy DBs.
+ *
+ * This function runs the shallow check, then PRAGMA quick_check, and classifies
+ * the failure mode so the caller can quarantine ONLY on confirmed corruption.
+ * O(db size); use only on the recovery/quarantine path, not hot opens. */
+cbm_integrity_verdict_t cbm_store_check_integrity_verdict(cbm_store_t *s);
 
 /* Open database for a named project in the default cache dir. */
 cbm_store_t *cbm_store_open(const char *project);
@@ -380,6 +404,9 @@ int cbm_store_find_node_by_qn(cbm_store_t *s, const char *project, const char *q
 
 /* Find node by qualified_name only (no project filter — QNs are globally unique). */
 int cbm_store_find_node_by_qn_any(cbm_store_t *s, const char *qn, cbm_node_t *out);
+
+/* Find all nodes in a project. Returns allocated array, caller frees. */
+int cbm_store_find_nodes(cbm_store_t *s, const char *project, cbm_node_t **out, int *count);
 
 /* Find nodes by name (exact match). Returns allocated array, caller frees. */
 int cbm_store_find_nodes_by_name(cbm_store_t *s, const char *project, const char *name,
@@ -577,6 +604,11 @@ void cbm_store_search_free(cbm_search_output_t *out);
 
 int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const char **edge_types,
                   int edge_type_count, int max_depth, int max_results, cbm_traverse_result_t *out);
+
+/* Variable-length Cypher traversal with relationship-trail semantics. */
+int cbm_store_bfs_trail(cbm_store_t *s, int64_t start_id, const char *direction,
+                        const char **edge_types, int edge_type_count, int max_depth,
+                        int max_results, cbm_traverse_result_t *out);
 
 /* Multi-source BFS from ALL seed ids at once (one CTE, temp-table anchored).
  * Seeds are EXCLUDED from the result (impact semantics); MIN(hop) across the

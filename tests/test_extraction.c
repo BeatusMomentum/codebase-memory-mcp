@@ -472,6 +472,15 @@ TEST(java_enum_dedup_preserves_calls_issue1234) {
     ASSERT(has_def(r, "Enum", "Day"));
     ASSERT(has_def(r, "Method", "isWeekend"));
     ASSERT(has_def(r, "Method", "label"));
+    /* The enum CONSTANTS must survive alongside the methods. Reaching the
+     * methods means descending into enum_body_declarations, and the tempting
+     * way to do that -- redirecting the shared find_class_body -- also makes
+     * the constants unreachable, because they are siblings of that node rather
+     * than children. find_class_member_body exists to descend for members only
+     * and leave find_class_body (which extract_enum_members uses) alone; these
+     * two assertions are what stop that distinction being collapsed again. */
+    ASSERT(has_def(r, "Variable", "MON"));
+    ASSERT(has_def(r, "Variable", "SUN"));
     ASSERT(has_def(r, "Class", "DayUtil"));
     ASSERT(has_def(r, "Method", "describe"));
     ASSERT_EQ(count_defs_with_label(r, "Function"), 0);
@@ -651,6 +660,21 @@ TEST(swift_class) {
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Class", "Vehicle"));
     ASSERT(has_def(r, "Method", "accelerate"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(swift_protocol) {
+    /* A protocol requirement is a bodyless func inside a protocol body. Swift
+     * codebases are heavily protocol-driven, so the requirement is very often
+     * the declaration a reader is actually looking for — before this it was
+     * absent from the graph entirely. */
+    CBMFileResult *r = extract("protocol StudyRunning {\n    func generate() -> String\n}\n",
+                               CBM_LANG_SWIFT, "t", "StudyRunning.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Interface", "StudyRunning"));
+    ASSERT(has_def(r, "Method", "generate"));
     cbm_free_result(r);
     PASS();
 }
@@ -1812,6 +1836,152 @@ TEST(sql_function) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_GTE(r->defs.count, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(sql_ddl_node_labels) {
+    CBMFileResult *r = extract("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);\n"
+                               "CREATE VIEW active_users AS SELECT * FROM users;\n",
+                               CBM_LANG_SQL, "t", "schema.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Table", "users"));
+    ASSERT(has_def(r, "View", "active_users"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(sql_view_lineage_usages) {
+    /* A view's FROM/JOIN relations are emitted as usages (ref_name = table),
+     * which pass_usages later resolves into view -> table USAGE lineage edges. */
+    CBMFileResult *r = extract("CREATE TABLE users (id INTEGER);\n"
+                               "CREATE VIEW active_users AS SELECT * FROM users;\n",
+                               CBM_LANG_SQL, "t", "schema.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int found_users = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        if (r->usages.items[i].ref_name && strcmp(r->usages.items[i].ref_name, "users") == 0) {
+            found_users = 1;
+        }
+    }
+    ASSERT(found_users);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(sql_schema_qualified_name) {
+    /* schema-qualified DDL (schema.table) is named by the table, not the schema,
+     * and FROM schema.table resolves to that table for lineage. */
+    CBMFileResult *r = extract("CREATE TABLE app.users (id INTEGER);\n"
+                               "CREATE VIEW app.active AS SELECT * FROM app.users;\n",
+                               CBM_LANG_SQL, "t", "schema.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Table", "users"));
+    ASSERT(has_def(r, "View", "active"));
+    int found_users = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        if (r->usages.items[i].ref_name && strcmp(r->usages.items[i].ref_name, "users") == 0) {
+            found_users = 1;
+        }
+    }
+    ASSERT(found_users);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* --- dbt Jinja lineage --- */
+
+/* Helper: does the file's usage list carry `name`? */
+static int has_usage(CBMFileResult *r, const char *name) {
+    for (int i = 0; i < r->usages.count; i++) {
+        if (r->usages.items[i].ref_name && strcmp(r->usages.items[i].ref_name, name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+TEST(dbt_model_and_ref_lineage) {
+    /* A dbt model: the file stem is the model identity, and each ref() is a
+     * dependency on another model. The SQL grammar cannot read `{{ ref(..) }}`
+     * at all, so without the dbt pass this file yields no lineage whatsoever. */
+    CBMFileResult *r = extract("SELECT o.id, c.name\n"
+                               "FROM {{ ref('stg_orders') }} o\n"
+                               "JOIN {{ ref('stg_customers') }} c ON c.id = o.customer_id\n",
+                               CBM_LANG_SQL, "t", "models/marts/orders_enriched.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT(has_def(r, "Model", "orders_enriched"));
+    ASSERT(has_usage(r, "stg_orders"));
+    ASSERT(has_usage(r, "stg_customers"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dbt_source_and_two_arg_ref) {
+    /* Both dbt builtins name the relation in their LAST string argument:
+     * source('group','table') -> table, and the two-argument
+     * ref('package','model') form -> model. */
+    CBMFileResult *r = extract("SELECT * FROM {{ source('raw', 'customers') }}\n"
+                               "UNION ALL SELECT * FROM {{ ref('analytics', 'legacy_customers') }}\n",
+                               CBM_LANG_SQL, "t", "models/stg_customers.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT(has_def(r, "Model", "stg_customers"));
+    ASSERT(has_usage(r, "customers"));
+    ASSERT(has_usage(r, "legacy_customers"));
+    /* the group/package argument is not the relation */
+    ASSERT_FALSE(has_usage(r, "raw"));
+    ASSERT_FALSE(has_usage(r, "analytics"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dbt_ignores_non_dbt_jinja) {
+    /* Templated SQL is not dbt SQL. An Airflow-style parameter substitution has
+     * Jinja but no dbt builtin, so the dbt pass must contribute NOTHING — no
+     * Model node named after the file, and no usage minted from the template
+     * variables. This is the gate that keeps every non-dbt repository free of
+     * fabricated data-lineage vocabulary.
+     *
+     * The ordinary SQL identifier path is unaffected and still sees the literal
+     * `FROM events`; the second extraction below is the control proving that
+     * usage is pre-existing SQL behaviour rather than anything dbt added. */
+    CBMFileResult *r = extract("SELECT * FROM events WHERE day = '{{ ds }}'\n"
+                               "  AND region = '{{ params.region_code }}'\n",
+                               CBM_LANG_SQL, "t", "queries/daily_events.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(has_def(r, "Model", "daily_events"));
+
+    /* Control: the same statement with the templates replaced by plain string
+     * literals. Both parse as SQL identically, so an equal usage count is the
+     * precise statement of "the dbt pass contributed nothing here" — stronger
+     * than naming individual identifiers, and immune to how SQL happens to
+     * tokenize the template text. */
+    CBMFileResult *plain = extract("SELECT * FROM events WHERE day = '2026-01-01'\n"
+                                   "  AND region = 'eu-west'\n",
+                                   CBM_LANG_SQL, "t", "queries/daily_events.sql");
+    ASSERT_NOT_NULL(plain);
+    ASSERT_FALSE(has_def(plain, "Model", "daily_events"));
+    ASSERT_EQ(r->usages.count, plain->usages.count);
+    ASSERT_EQ(r->defs.count, plain->defs.count);
+    cbm_free_result(plain);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dbt_plain_sql_untouched) {
+    /* Plain DDL keeps producing exactly the Table/View relations it did before
+     * the dbt pass existed — no Model node, and the FROM lineage is unchanged. */
+    CBMFileResult *r = extract("CREATE TABLE users (id INTEGER);\n"
+                               "CREATE VIEW active_users AS SELECT * FROM users;\n",
+                               CBM_LANG_SQL, "t", "schema.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Table", "users"));
+    ASSERT(has_def(r, "View", "active_users"));
+    ASSERT_FALSE(has_def(r, "Model", "schema"));
     cbm_free_result(r);
     PASS();
 }
@@ -3200,6 +3370,169 @@ static const CBMCall *find_call_by_callee(CBMFileResult *r, const char *callee) 
     return NULL;
 }
 
+/* Issue #1009: URL-builder helper pattern — a function returning a URL-shaped
+ * literal, consumed as client(buildPath(id)). The builder's URL is recorded in
+ * the per-file constant map and resolved at the call site, for both return
+ * statements and arrow expression bodies. */
+TEST(extract_ts_url_builder_issue1009) {
+    CBMFileResult *r = extract("function thingDetail(id: string): string {\n"
+                               "  return `/api/v1/things/${id}/detail`;\n"
+                               "}\n"
+                               "const arrowPath = (id: string) => `/api/v1/arrows/${id}`;\n"
+                               "export function useThing(id: string) {\n"
+                               "  return apiGet(thingDetail(id));\n"
+                               "}\n"
+                               "export function useArrow(id: string) {\n"
+                               "  return apiFetch(arrowPath(id));\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "builders.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c1 = find_call_by_callee(r, "apiGet");
+    ASSERT_NOT_NULL(c1);
+    ASSERT_NOT_NULL(c1->first_string_arg);
+    ASSERT_STR_EQ(c1->first_string_arg, "/api/v1/things/{}/detail");
+    const CBMCall *c2 = find_call_by_callee(r, "apiFetch");
+    ASSERT_NOT_NULL(c2);
+    ASSERT_NOT_NULL(c2->first_string_arg);
+    ASSERT_STR_EQ(c2->first_string_arg, "/api/v1/arrows/{}");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Issue #1009 (composed builders): a builder whose template inlines an earlier
+ * builder's call plus a query string: `return \`${basePath(id)}?${params}\``.
+ * The known-substitution is inlined and the query string is truncated, so the
+ * resolved URL joins the server route exactly. */
+TEST(extract_ts_url_builder_composed_issue1009) {
+    CBMFileResult *r = extract("function activityPath(id: string): string {\n"
+                               "  return `/api/v1/team-members/${id}/activity`;\n"
+                               "}\n"
+                               "function buildPath(id: string, cursor: string): string {\n"
+                               "  const params = new URLSearchParams();\n"
+                               "  params.set('cursor', cursor);\n"
+                               "  return `${activityPath(id)}?${params.toString()}`;\n"
+                               "}\n"
+                               "export function useActivity(id: string, cursor: string) {\n"
+                               "  return apiGet(buildPath(id, cursor));\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "composed.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c = find_call_by_callee(r, "apiGet");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(c->first_string_arg);
+    ASSERT_STR_EQ(c->first_string_arg, "/api/v1/team-members/{}/activity");
+    cbm_free_result(r);
+    PASS();
+}
+
+static bool any_call_arg_resolves_to(CBMFileResult *r, const char *url) {
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->first_string_arg && strcmp(c->first_string_arg, url) == 0) {
+            return true;
+        }
+        for (int a = 0; a < c->arg_count; a++) {
+            if (c->args[a].value && strcmp(c->args[a].value, url) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+TEST(extract_c_url_builder_gated_issue1009) {
+    CBMFileResult *r = extract("static const char *cfg_path(void) {\n"
+                               "  return \"/etc/myapp/conf.d\";\n"
+                               "}\n"
+                               "void init(void) {\n"
+                               "  parse_config(cfg_path());\n"
+                               "}\n",
+                               CBM_LANG_C, "t", "conf.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(any_call_arg_resolves_to(r, "/etc/myapp/conf.d"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* One literal return next to a computed one would attribute the literal to every
+ * call site, including those taking the computed branch. A builder whose returns
+ * are not all URL literals is declined. */
+TEST(extract_ts_url_builder_mixed_returns_issue1009) {
+    CBMFileResult *r = extract("function pathFor(kind: string): string {\n"
+                               "  if (kind === 'user') return '/api/users';\n"
+                               "  return computePath(kind);\n"
+                               "}\n"
+                               "export function load(kind: string) {\n"
+                               "  return apiGet(pathFor(kind));\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "mixed.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(any_call_arg_resolves_to(r, "/api/users"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Two different literal URLs make the call site's route unknowable, so the
+ * builder is tombstoned and lookups miss. */
+TEST(extract_ts_url_builder_ambiguous_issue1009) {
+    CBMFileResult *r = extract("function pathFor(kind: string): string {\n"
+                               "  if (kind === 'user') return '/api/users';\n"
+                               "  return '/api/teams';\n"
+                               "}\n"
+                               "export function load(kind: string) {\n"
+                               "  return apiGet(pathFor(kind));\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "ambiguous.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(any_call_arg_resolves_to(r, "/api/users"));
+    ASSERT_FALSE(any_call_arg_resolves_to(r, "/api/teams"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Handing a builder to a callback position builds no URL. Only a call to it
+ * resolves, so the mapping function does not inherit an HTTP_CALLS edge to the
+ * route. */
+TEST(extract_ts_url_builder_reference_issue1009) {
+    CBMFileResult *r = extract("function thingPath(id: string): string {\n"
+                               "  return `/api/v1/things/${id}`;\n"
+                               "}\n"
+                               "export function loadAll(ids: string[]) {\n"
+                               "  return ids.map(thingPath);\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "reference.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(any_call_arg_resolves_to(r, "/api/v1/things/{}"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A helper returning an ordinary string is not a URL builder, so its call site
+ * gets no resolved string argument. */
+TEST(extract_ts_url_builder_non_url_issue1009) {
+    CBMFileResult *r = extract("function label(): string {\n"
+                               "  return 'plain text';\n"
+                               "}\n"
+                               "export function render() {\n"
+                               "  return send(label());\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "label.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c = find_call_by_callee(r, "send");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NULL(c->first_string_arg);
+    ASSERT_FALSE(any_call_arg_resolves_to(r, "plain text"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Issue #1006: JS/TS template-literal URLs must flatten ${...} substitutions
  * to the canonical "{}" placeholder, both as call arguments (HTTP_CALLS) and
  * as URL-shaped string_refs collected from const/return positions. */
@@ -3226,6 +3559,57 @@ TEST(extract_ts_template_string_url_issue1006) {
         }
     }
     ASSERT(found);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Issue #1249: a mux route built as `configVar + "/literal"` (Go's idiomatic
+ * configurable-base-path pattern) must index the literal suffix, both for a
+ * route registration and for an outbound URL built the same way. A real BFF
+ * with 47 such registrations produced only 9 Route nodes before this fix. */
+TEST(extract_go_binary_concat_url_issue1249) {
+    CBMFileResult *r = extract("package main\n"
+                               "import \"net/http\"\n"
+                               "func setup(mux *http.ServeMux, base string) {\n"
+                               "    mux.HandleFunc(base+\"/login\", loginHandler)\n"
+                               "}\n"
+                               "func report(host string, port string) {\n"
+                               "    http.Get(\"http://\" + host + \":\" + port + \"/log\")\n"
+                               "}\n",
+                               CBM_LANG_GO, "t", "routes.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMCall *reg = find_call_by_callee(r, "mux.HandleFunc");
+    ASSERT_NOT_NULL(reg);
+    ASSERT_NOT_NULL(reg->first_string_arg);
+    ASSERT_STR_EQ(reg->first_string_arg, "/login");
+
+    const CBMCall *out = find_call_by_callee(r, "http.Get");
+    ASSERT_NOT_NULL(out);
+    ASSERT_NOT_NULL(out->first_string_arg);
+    ASSERT_STR_EQ(out->first_string_arg, "/log");
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Same issue: when the right side of the concatenation is not itself a
+ * literal (`base + suffixVar`), there is no literal route to recover. The
+ * fix must leave this unresolved rather than fabricate a path. */
+TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249) {
+    CBMFileResult *r = extract("package main\n"
+                               "func setup(mux *http.ServeMux, base string, suffix string) {\n"
+                               "    mux.HandleFunc(base+suffix, dynHandler)\n"
+                               "}\n",
+                               CBM_LANG_GO, "t", "routes.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMCall *reg = find_call_by_callee(r, "mux.HandleFunc");
+    ASSERT_NOT_NULL(reg);
+    ASSERT_NULL(reg->first_string_arg);
+
     cbm_free_result(r);
     PASS();
 }
@@ -4139,6 +4523,111 @@ TEST(extract_rust_test_attr_marks_is_test_issue855) {
     ASSERT(asyn == 1 && "#[tokio::test] fn is_test");
 
     cbm_free_result(r);
+    PASS();
+}
+
+/* Function.is_test must follow the file's test-directory membership, not just
+ * a test_/_test basename convention: a helper under tests/ with none of those
+ * naming conventions (tests/helpers/fixtures.c) was previously indexed as an
+ * ordinary, non-test Function — invisible to store.c's `is_test != 1`
+ * dead-code/search filters even though trace_path's own independent path
+ * check already treated the same file as a test (#1294). */
+TEST(extract_c_test_dir_marks_is_test_issue1294) {
+    const char *src = "void helper(void) {}\n";
+
+    /* Regression: a test_*-named file directly under tests/ must remain a
+     * test (this already worked before the fix). */
+    CBMFileResult *r1 = extract(src, CBM_LANG_C, "t", "tests/test_pipeline.c");
+    ASSERT_NOT_NULL(r1);
+    ASSERT_FALSE(r1->has_error);
+    ASSERT(has_def(r1, "Function", "helper"));
+    int reg = -1;
+    for (int i = 0; i < r1->defs.count; i++) {
+        if (strcmp(r1->defs.items[i].label, "Function") == 0 && r1->defs.items[i].name &&
+            strcmp(r1->defs.items[i].name, "helper") == 0) {
+            reg = r1->defs.items[i].is_test ? 1 : 0;
+        }
+    }
+    ASSERT(reg == 1 && "test_*.c directly under tests/ is a test (regression)");
+    cbm_free_result(r1);
+
+    /* Positive: a file under tests/ that matches none of the test_/_test
+     * naming conventions must now ALSO be a test. */
+    CBMFileResult *r2 = extract(src, CBM_LANG_C, "t", "tests/helpers/fixtures.c");
+    ASSERT_NOT_NULL(r2);
+    ASSERT_FALSE(r2->has_error);
+    ASSERT(has_def(r2, "Function", "helper"));
+    int nonconv = -1;
+    for (int i = 0; i < r2->defs.count; i++) {
+        if (strcmp(r2->defs.items[i].label, "Function") == 0 && r2->defs.items[i].name &&
+            strcmp(r2->defs.items[i].name, "helper") == 0) {
+            nonconv = r2->defs.items[i].is_test ? 1 : 0;
+        }
+    }
+    ASSERT(nonconv == 1 && "non-test_-named file under tests/ is now a test");
+    cbm_free_result(r2);
+
+    /* Negative: a file with no test/ directory or test_/_test naming in its
+     * path must never be flagged — this fix must not widen detection beyond
+     * the tests/ (and sibling) directory tree. */
+    CBMFileResult *r3 = extract(src, CBM_LANG_C, "t", "src/pipeline/helper.c");
+    ASSERT_NOT_NULL(r3);
+    ASSERT_FALSE(r3->has_error);
+    ASSERT(has_def(r3, "Function", "helper"));
+    int outside = -1;
+    for (int i = 0; i < r3->defs.count; i++) {
+        if (strcmp(r3->defs.items[i].label, "Function") == 0 && r3->defs.items[i].name &&
+            strcmp(r3->defs.items[i].name, "helper") == 0) {
+            outside = r3->defs.items[i].is_test ? 1 : 0;
+        }
+    }
+    ASSERT(outside == 0 && "file outside tests/ is never a test");
+    cbm_free_result(r3);
+
+    PASS();
+}
+
+/* Same convergence for Method definitions (push_method_def), which take a
+ * separate code path from free functions: a class method on a class defined
+ * under tests/ with no test_/_test naming (e.g. tests/helpers/base.py) must
+ * be marked is_test too, and a method on the same class outside tests/ must
+ * not be (#1294). */
+TEST(extract_python_method_test_dir_marks_is_test_issue1294) {
+    const char *src = "class Foo:\n"
+                       "    def helper(self):\n"
+                       "        pass\n";
+
+    /* Python's LSP layer injects synthetic builtin stub Methods (str.upper,
+     * dict.get, ...) into defs.items alongside real ones (py_builtins.c), so
+     * matching must key on name, not just label="Method". */
+    CBMFileResult *r1 = extract(src, CBM_LANG_PYTHON, "t", "tests/helpers/base.py");
+    ASSERT_NOT_NULL(r1);
+    ASSERT_FALSE(r1->has_error);
+    ASSERT(has_def(r1, "Method", "helper"));
+    int in_tests = -1;
+    for (int i = 0; i < r1->defs.count; i++) {
+        if (strcmp(r1->defs.items[i].label, "Method") == 0 && r1->defs.items[i].name &&
+            strcmp(r1->defs.items[i].name, "helper") == 0) {
+            in_tests = r1->defs.items[i].is_test ? 1 : 0;
+        }
+    }
+    ASSERT(in_tests == 1 && "method on a class under tests/helpers/ is a test");
+    cbm_free_result(r1);
+
+    CBMFileResult *r2 = extract(src, CBM_LANG_PYTHON, "t", "app/models/base.py");
+    ASSERT_NOT_NULL(r2);
+    ASSERT_FALSE(r2->has_error);
+    ASSERT(has_def(r2, "Method", "helper"));
+    int outside_tests = -1;
+    for (int i = 0; i < r2->defs.count; i++) {
+        if (strcmp(r2->defs.items[i].label, "Method") == 0 && r2->defs.items[i].name &&
+            strcmp(r2->defs.items[i].name, "helper") == 0) {
+            outside_tests = r2->defs.items[i].is_test ? 1 : 0;
+        }
+    }
+    ASSERT(outside_tests == 0 && "method on a class outside tests/ is never a test");
+    cbm_free_result(r2);
+
     PASS();
 }
 
@@ -5243,6 +5732,7 @@ SUITE(extraction) {
     RUN_TEST(csharp_class);
     RUN_TEST(csharp_interface);
     RUN_TEST(swift_class);
+    RUN_TEST(swift_protocol);
     RUN_TEST(kotlin_function);
     RUN_TEST(kotlin_class);
     RUN_TEST(scala_function);
@@ -5344,6 +5834,13 @@ SUITE(extraction) {
     /* Config/Markup */
     RUN_TEST(html_elements);
     RUN_TEST(sql_function);
+    RUN_TEST(sql_ddl_node_labels);
+    RUN_TEST(sql_view_lineage_usages);
+    RUN_TEST(sql_schema_qualified_name);
+    RUN_TEST(dbt_model_and_ref_lineage);
+    RUN_TEST(dbt_source_and_two_arg_ref);
+    RUN_TEST(dbt_ignores_non_dbt_jinja);
+    RUN_TEST(dbt_plain_sql_untouched);
     RUN_TEST(meson_project);
     RUN_TEST(css_rules);
     RUN_TEST(scss_rules);
@@ -5450,6 +5947,15 @@ SUITE(extraction) {
     RUN_TEST(extract_java_method_annotations_issue382);
     RUN_TEST(extract_java_jaxrs_path_composition_issue1005);
     RUN_TEST(extract_ts_template_string_url_issue1006);
+    RUN_TEST(extract_go_binary_concat_url_issue1249);
+    RUN_TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249);
+    RUN_TEST(extract_ts_url_builder_issue1009);
+    RUN_TEST(extract_ts_url_builder_composed_issue1009);
+    RUN_TEST(extract_c_url_builder_gated_issue1009);
+    RUN_TEST(extract_ts_url_builder_mixed_returns_issue1009);
+    RUN_TEST(extract_ts_url_builder_ambiguous_issue1009);
+    RUN_TEST(extract_ts_url_builder_reference_issue1009);
+    RUN_TEST(extract_ts_url_builder_non_url_issue1009);
     RUN_TEST(extract_java_no_double_class_qn);
     RUN_TEST(extract_go_no_filename_in_module_qn);
     RUN_TEST(extract_large_ts_has_functions_issue213);
@@ -5475,6 +5981,8 @@ SUITE(extraction) {
     RUN_TEST(extract_c_clean_file_no_recovery_duplicates_issue961);
     RUN_TEST(walk_defs_no_truncation_over_4096_issue668);
     RUN_TEST(extract_rust_test_attr_marks_is_test_issue855);
+    RUN_TEST(extract_c_test_dir_marks_is_test_issue1294);
+    RUN_TEST(extract_python_method_test_dir_marks_is_test_issue1294);
     RUN_TEST(docstring_utf8_truncation_boundary_issue1017);
     RUN_TEST(extract_ts_decorators_survive_interleaved_comment);
 
