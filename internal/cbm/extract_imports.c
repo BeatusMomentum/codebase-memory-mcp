@@ -2764,6 +2764,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
         parse_es_imports(ctx);
         break;
     case CBM_LANG_JAVA:

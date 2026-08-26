@@ -37,7 +37,7 @@ The core runtime headers in `internal/cbm/vendored/common/tree_sitter/`
 
 ## Tree-sitter Grammars
 
-159 pre-generated parsers are vendored in `internal/cbm/vendored/grammars/<lang>/`
+160 pre-generated parsers are vendored in `internal/cbm/vendored/grammars/<lang>/`
 (generated `parser.c` plus `scanner.c` where applicable, compiled statically).
 Each grammar is the work of its upstream authors and each grammar directory
 contains the upstream `LICENSE` file.
@@ -54,10 +54,15 @@ License summary:
   `pine` is **ISC** (declared by its upstream).
 - The grammars authored in-house for this project (`cobol`, `form`, `janet`,
   `magma`, `protobuf`, `wolfram`) are **MIT** under the project's own license,
-  (c) DeusData. Six further grammars (`assembly`, `cfml`, `cfscript`,
-  `dotenv`, `pine`, `qml`) are self-maintained forks that retain their
-  original upstream authors' licenses — see the manifest for per-grammar
-  provenance.
+  (c) DeusData. Seven further grammars (`arkts`, `assembly`, `cfml`,
+  `cfscript`, `dotenv`, `pine`, `qml`) are self-maintained forks that retain
+  their original upstream authors' licenses — see the manifest for per-grammar
+  provenance. `arkts` is a first-party derivative of
+  [tree-sitter/tree-sitter-typescript](https://github.com/tree-sitter/tree-sitter-typescript)
+  (MIT, (c) 2017 Max Brunsfeld; on the
+  [tree-sitter-javascript](https://github.com/tree-sitter/tree-sitter-javascript)
+  base, MIT, (c) 2014 Max Brunsfeld) with (c) 2026 DeusData ArkTS additions;
+  its grammar source lives in `tools/tree-sitter-arkts/`.
 
 ### tree-sitter-objectscript (UDL + routine)
 

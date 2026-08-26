@@ -1649,6 +1649,7 @@ static bool is_actual_import_boundary(CBMExtractCtx *ctx, TSNode node, const CBM
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
         if (strcmp(kind, "export_statement") == 0) {
             /* An export is an import CONTEXT only in its re-export forms:
              * `export ... from 'mod'` (source field) or a bare specifier list
