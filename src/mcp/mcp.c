@@ -1600,6 +1600,10 @@ struct cbm_mcp_server {
     void *quarantine_test_context;
     cbm_mcp_command_test_hook_fn command_test_hook;
     void *command_test_context;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    cbm_mcp_auto_index_count_test_hook_fn auto_index_count_test_hook;
+    void *auto_index_count_test_context;
+#endif
     size_t search_output_limit_override;
     cbm_thread_t autoindex_tid;
     bool autoindex_active; /* true if auto-index thread was started */
@@ -1668,6 +1672,17 @@ void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg) {
         srv->config = cfg;
     }
 }
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_mcp_server_set_auto_index_count_test_hook(cbm_mcp_server_t *srv,
+                                                   cbm_mcp_auto_index_count_test_hook_fn hook,
+                                                   void *context) {
+    if (srv) {
+        srv->auto_index_count_test_hook = hook;
+        srv->auto_index_count_test_context = context;
+    }
+}
+#endif
 
 bool cbm_mcp_server_set_session_context(cbm_mcp_server_t *srv, const char *session_root,
                                         const char *allowed_root) {
@@ -11624,6 +11639,21 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         return; /* no session root detected */
     }
 
+    /* Automatic work must honor the same shared workspace boundary as the
+     * explicit index_repository worker. Do this before the existing-DB watcher
+     * branch and before bounded discovery, so a refused session root begins no
+     * automatic observation or indexing. An exact sensitive-root grant remains
+     * the shared policy's authenticated override. */
+    const char *allowed_root =
+        srv->allowed_root_policy_set ? srv->allowed_root : getenv("CBM_ALLOWED_ROOT");
+    char boundary_err[CBM_SZ_1K];
+    if (!cbm_workspace_root_allowed(srv->session_root, cbm_workspace_home_dir(),
+                                    cbm_workspace_cache_dir(), allowed_root, boundary_err,
+                                    sizeof(boundary_err))) {
+        cbm_log_warn("autoindex.skip", "reason", "workspace_boundary", "detail", boundary_err);
+        return;
+    }
+
     /* Check if project already has a DB */
     const char *home = cbm_get_home_dir();
     if (home) {
@@ -11656,6 +11686,11 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
 
     /* Quick tracked-file count check to avoid OOM on massive repos. */
     int file_count = -1;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (srv->auto_index_count_test_hook) {
+        srv->auto_index_count_test_hook(srv->auto_index_count_test_context);
+    }
+#endif
     if (!cbm_mcp_auto_index_within_file_limit(srv->session_root, file_limit, &file_count)) {
         char files[32];
         (void)snprintf(files, sizeof(files), "%d", file_count);

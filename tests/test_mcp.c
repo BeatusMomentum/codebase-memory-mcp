@@ -10,6 +10,7 @@
 #include "../src/foundation/log.h"
 #include "../src/foundation/platform.h" /* cbm_file_size */
 #include "../src/foundation/subprocess.h"
+#include "../src/foundation/workspace.h"
 #include "../src/mcp/compact_out.h"
 #include "test_framework.h"
 #include "test_helpers.h"
@@ -1292,6 +1293,83 @@ TEST(server_handle_initialized_notification) {
     cbm_mcp_server_free(srv);
     PASS();
 }
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static void issue403_count_started(void *context) {
+    int *calls = context;
+    (*calls)++;
+}
+
+static int issue403_initialize_count_calls(const char *session_root, bool approve_sensitive) {
+    char *cache = th_mktempdir("cbm_mcp_403");
+    if (!cache) {
+        return -1;
+    }
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char err[1024];
+    bool approved = !approve_sensitive ||
+                    cbm_workspace_grant_add(cache, cbm_workspace_home_dir(), session_root, true,
+                                            err, sizeof(err));
+    cbm_config_t *cfg = approved ? cbm_config_open(cache) : NULL;
+    cbm_mcp_server_t *srv = cfg ? cbm_mcp_server_new(NULL) : NULL;
+    int calls = -2;
+    if (srv) {
+        cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "true");
+        /* The hook proves entry to the count path; keep the actual discovery
+         * call fail-closed so this unit test can never launch an index thread. */
+        cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "-1");
+        if (cbm_mcp_server_set_session_context(srv, session_root, NULL)) {
+            calls = 0;
+            cbm_mcp_server_set_config(srv, cfg);
+            cbm_mcp_server_set_auto_index_count_test_hook(srv, issue403_count_started, &calls);
+            char *response = cbm_mcp_server_handle(
+                srv, "{\"jsonrpc\":\"2.0\",\"id\":403,\"method\":\"initialize\",\"params\":{}}");
+            free(response);
+        }
+        cbm_mcp_server_free(srv);
+    }
+    if (cfg) {
+        cbm_config_close(cfg);
+    }
+
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    th_cleanup(cache);
+    return calls;
+}
+
+TEST(mcp_issue403_sensitive_root_stops_before_discovery_count) {
+    int sensitive = issue403_initialize_count_calls(
+        "C:/Users/dev/AppData/Local/Programs/Antigravity", false);
+    int ordinary = issue403_initialize_count_calls("C:/Users/dev/projects/app", false);
+    ASSERT_EQ(sensitive, 0);
+    ASSERT_EQ(ordinary, 1);
+    PASS();
+}
+
+TEST(mcp_issue403_explicit_approval_preserves_auto_index) {
+    char *sensitive_home = th_mktempdir("cbm_mcp_403_home");
+    ASSERT_NOT_NULL(sensitive_home);
+    const char *saved_home = getenv("HOME");
+    char *saved_home_copy = saved_home ? strdup(saved_home) : NULL;
+    cbm_setenv("HOME", sensitive_home, 1);
+
+    int approved = issue403_initialize_count_calls(sensitive_home, true);
+
+    if (saved_home_copy) {
+        cbm_setenv("HOME", saved_home_copy, 1);
+    } else {
+        cbm_unsetenv("HOME");
+    }
+    free(saved_home_copy);
+    th_cleanup(sensitive_home);
+    ASSERT_EQ(approved, 1);
+    PASS();
+}
+#endif
 
 TEST(server_handle_tools_list) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
@@ -11291,6 +11369,10 @@ SUITE(mcp) {
     /* Server protocol handling */
     RUN_TEST(server_handle_initialize);
     RUN_TEST(server_handle_initialized_notification);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(mcp_issue403_sensitive_root_stops_before_discovery_count);
+    RUN_TEST(mcp_issue403_explicit_approval_preserves_auto_index);
+#endif
     RUN_TEST(server_handle_tools_list);
     RUN_TEST(server_handle_tools_list_defaults_to_all_tools_and_accepts_cursor);
     RUN_TEST(server_handle_analysis_profile_filters_and_rejects_mutators);
