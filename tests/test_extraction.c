@@ -3444,7 +3444,7 @@ static bool any_call_arg_resolves_to(CBMFileResult *r, const char *url) {
 
 TEST(extract_c_url_builder_gated_issue1009) {
     CBMFileResult *r = extract("static const char *cfg_path(void) {\n"
-                               "  return \"/etc/myapp/conf.d\";\n"
+                               "  return \"/srv/myapp/conf.d\";\n"
                                "}\n"
                                "void init(void) {\n"
                                "  parse_config(cfg_path());\n"
@@ -3452,7 +3452,7 @@ TEST(extract_c_url_builder_gated_issue1009) {
                                CBM_LANG_C, "t", "conf.c");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
-    ASSERT_FALSE(any_call_arg_resolves_to(r, "/etc/myapp/conf.d"));
+    ASSERT_FALSE(any_call_arg_resolves_to(r, "/srv/myapp/conf.d"));
     cbm_free_result(r);
     PASS();
 }
