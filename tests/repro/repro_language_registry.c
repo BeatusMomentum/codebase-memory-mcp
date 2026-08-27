@@ -211,6 +211,7 @@ static const LanguageCapabilityEntry LANGUAGE_CAPABILITIES[CBM_LANG_COUNT] = {
     CALL_WITH_REFERENCE_VOCAB(OBJECTSCRIPT_ROUTINE),
     TRANSFORM_ONLY(OBJECTSCRIPT_EXPORT),
     CALL_WITH_REFERENCE_VOCAB(ARKTS),
+    CALL_WITHOUT_REFERENCE_VOCAB(PLSQL),
 };
 
 #undef CALL_WITH_REFERENCE_VOCAB
@@ -300,7 +301,7 @@ TEST(repro_language_capability_ledger_covers_every_enum) {
     }
 
     if (counts[CAP_CALL_WITH_REFERENCE_VOCAB] != 87 ||
-        counts[CAP_CALL_WITHOUT_REFERENCE_VOCAB] != 25 || counts[CAP_NO_CALL] != 50 ||
+        counts[CAP_CALL_WITHOUT_REFERENCE_VOCAB] != 26 || counts[CAP_NO_CALL] != 50 ||
         counts[CAP_TRANSFORM_ONLY] != 1 || counts[CAP_UNSUPPORTED] != 1) {
         fprintf(stderr,
                 "  [language-registry] invariant=capability_partition call_ref_vocab=%d ref_gap=%d "
@@ -317,8 +318,8 @@ TEST(repro_language_capability_ledger_covers_every_enum) {
 TEST(repro_call_argument_matrices_equal_call_capability_ledger) {
     enum {
         EXPECTED_MATRIX_A_ROWS = 68,
-        EXPECTED_MATRIX_B_ROWS = 46,
-        EXPECTED_CALL_CAPABLE_LANGUAGES = 112,
+        EXPECTED_MATRIX_B_ROWS = 47,
+        EXPECTED_CALL_CAPABLE_LANGUAGES = 113,
         EXPECTED_NON_CALL_LANGUAGES = 52,
         EXPECTED_NON_CALL_DOMAIN_CONTROLS = 2,
     };
