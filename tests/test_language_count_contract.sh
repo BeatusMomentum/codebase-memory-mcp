@@ -73,7 +73,7 @@ EXEMPT=(
 )
 
 failures=0
-claims=0
+distinct=0
 
 for path in "${SURFACES[@]}"; do
     if [[ ! -f "$path" ]]; then
@@ -90,7 +90,7 @@ for path in "${SURFACES[@]}"; do
         continue
     fi
     while IFS= read -r n; do
-        claims=$((claims + 1))
+        distinct=$((distinct + 1))
         if [[ "$n" != "$expected" ]]; then
             echo "FAIL: $path claims $n languages, $expected grammars are vendored" >&2
             failures=$((failures + 1))
@@ -120,4 +120,4 @@ if ((failures > 0)); then
     exit 1
 fi
 
-echo "Language-count contract passed ($claims claims across ${#SURFACES[@]} surfaces, registry = $expected)"
+echo "Language-count contract passed (${#SURFACES[@]} surfaces, $distinct distinct value(s) checked, $expected grammars vendored)"
