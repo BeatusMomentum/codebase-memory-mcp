@@ -75,6 +75,7 @@ static const lang_name_entry_t LANG_NAME_TABLE[] = {
     {"javascript", CBM_LANG_JAVASCRIPT},
     {"typescript", CBM_LANG_TYPESCRIPT},
     {"tsx", CBM_LANG_TSX},
+    {"arkts", CBM_LANG_ARKTS},
     {"rust", CBM_LANG_RUST},
     {"java", CBM_LANG_JAVA},
     {"c++", CBM_LANG_CPP},

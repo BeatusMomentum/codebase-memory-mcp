@@ -90,6 +90,9 @@ static const ext_entry_t EXT_TABLE[] = {
     /* Elm */
     {".elm", CBM_LANG_ELM},
 
+    /* ArkTS (HarmonyOS/OpenHarmony) */
+    {".ets", CBM_LANG_ARKTS},
+
     /* Emacs Lisp */
     {".el", CBM_LANG_EMACSLISP},
 
@@ -850,6 +853,7 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_OBJECTSCRIPT_UDL] = "ObjectScript UDL",
     [CBM_LANG_OBJECTSCRIPT_ROUTINE] = "ObjectScript Routine",
     [CBM_LANG_OBJECTSCRIPT_EXPORT] = "ObjectScript Export XML",
+    [CBM_LANG_ARKTS] = "ArkTS",
 
 };
 
