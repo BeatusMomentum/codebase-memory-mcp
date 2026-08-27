@@ -693,7 +693,10 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang) {
 
 /* Append cross-file results from `src_out` (allocated in a scratch arena
  * about to be destroyed) into `dst_calls` (lives in cache_entry->arena),
- * copying every string field into dst_arena. Skips entries whose
+ * copying every string field into dst_arena. A manifest-qualified Rust
+ * cross-crate result supersedes any earlier result for the exact same source
+ * occurrence: the Cargo member path is stronger evidence than a same-named
+ * local fallback. Skips entries whose
  * (kind, caller_qn, callee_qn, source span) is already present — avoids
  * inflating the array with cross-file duplicates without conflating distinct
  * same-named occurrences. For an exact duplicate, retain the higher-confidence
@@ -714,6 +717,39 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
     CBMArena keys;
     cbm_arena_init(&keys);
     CBMHashTable *seen = cbm_ht_create((uint32_t)(dst_calls->count + src_out->count + 1));
+
+    /* Per-file Rust resolution may already have confidently matched the tail
+     * of `member::call()` to a same-named local function. Once the cross pass
+     * proves that `member` is a declared Cargo workspace member, replace only
+     * records for that exact parser occurrence before constructing the dedup
+     * table. This preserves distinct same-named calls at other spans while
+     * preventing the stale local result from out-ranking manifest evidence. */
+    for (int j = 0; j < src_out->count; j++) {
+        const CBMResolvedCall *src = &src_out->items[j];
+        if (!src->strategy || strcmp(src->strategy, "lsp_cross_crate") != 0 || !src->caller_qn ||
+            !src->callee_qn || src->site_end_byte <= src->site_start_byte) {
+            continue;
+        }
+        for (int i = 0; i < dst_calls->count; i++) {
+            CBMResolvedCall *dst = &dst_calls->items[i];
+            if (!dst->caller_qn || dst->kind != src->kind ||
+                dst->site_start_byte != src->site_start_byte ||
+                dst->site_end_byte != src->site_end_byte ||
+                dst->source_origin != src->source_origin ||
+                strcmp(dst->caller_qn, src->caller_qn) != 0) {
+                continue;
+            }
+            dst->caller_qn = cbm_arena_strdup(dst_arena, src->caller_qn);
+            dst->callee_qn = cbm_arena_strdup(dst_arena, src->callee_qn);
+            dst->strategy = cbm_arena_strdup(dst_arena, src->strategy);
+            dst->confidence = src->confidence;
+            dst->reason = src->reason ? cbm_arena_strdup(dst_arena, src->reason) : NULL;
+            dst->kind = src->kind;
+            dst->site_start_byte = src->site_start_byte;
+            dst->site_end_byte = src->site_end_byte;
+            dst->source_origin = src->source_origin;
+        }
+    }
 
     for (int i = 0; i < dst_calls->count; i++) {
         const CBMResolvedCall *rc = &dst_calls->items[i];
@@ -1191,8 +1227,8 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
     free(filtered);
 }
 
-static bool pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena,
-                                    CBMCargoManifest *out_m) {
+bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena,
+                                 CBMCargoManifest *out_m) {
     if (!ctx || !ctx->repo_path || !marena || !out_m)
         return false;
     char path[1024];
@@ -1234,7 +1270,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     bool have_manifest = false;
     if (have_rust) {
         cbm_arena_init(&cargo_arena);
-        have_manifest = pxc_build_rust_manifest(ctx, &cargo_arena, &cargo_manifest);
+        have_manifest = cbm_pxc_build_rust_manifest(ctx, &cargo_arena, &cargo_manifest);
         cbm_pxc_set_rust_manifest(have_manifest ? &cargo_manifest : NULL);
     }
 

@@ -70,6 +70,7 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/pass_lsp_cross.h" /* cbm_pxc_* helpers for fused cross-file LSP */
 #include "pipeline/lsp_resolve.h"
+#include "lsp/rust_cargo.h"
 #include "helpers.h" /* cbm_kind_in_set_free_cache — per-worker-thread cache teardown */
 #include "pipeline/worker_pool.h"
 #include "foundation/compat.h"
@@ -1397,6 +1398,11 @@ typedef struct {
      * cbm_run_X_lsp_cross_with_registry — skip per-file build entirely.
      * Stored as CBMCrossLspRegistries* (typedef from pass_lsp_cross.h). */
     CBMCrossLspRegistries *cross_registries;
+
+    /* Parsed once on the coordinator thread and borrowed read-only by resolve
+     * workers.  The pointer is installed into each worker's TLS slot so Rust's
+     * manifest-aware cross-file resolver sees the same Cargo context. */
+    const CBMCargoManifest *rust_manifest;
 
     /* F4: LAZILY-built shared Rust registry (built ONCE, on the first NULL-filter
      * rust file — the ~all_defs amplifier files). Not eager: repos whose rust files
@@ -2944,6 +2950,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
     resolve_ctx_t *rc = ctx_ptr;
     resolve_worker_state_t *ws = &rc->workers[worker_id];
 
+    cbm_pxc_set_rust_manifest(rc->rust_manifest);
+
     if (!ws->local_edge_buf) {
         ws->local_edge_buf =
             cbm_gbuf_new_shared_ids(rc->project_name, rc->repo_path, rc->shared_ids);
@@ -3009,6 +3017,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
          * a mixed-source-root Java↔Kotlin site remains unresolved, so JVM
          * callers run whenever either kind of site exists. */
         bool jvm_cross_lsp = (lang == CBM_LANG_JAVA || lang == CBM_LANG_KOTLIN);
+        bool rust_workspace_cross_lsp =
+            (lang == CBM_LANG_RUST && rc->rust_manifest && rc->rust_manifest->member_count > 0);
         int call_reference_sites = pp_call_reference_site_count(result, lang);
         int semantic_sites = result->calls.count + call_reference_sites;
         int qualified_lsp_sites = pp_qualified_lsp_site_count(result);
@@ -3016,7 +3026,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         bool cross_lsp_eligible =
             (rc->all_defs && rc->def_count > 0 && cbm_pxc_has_cross_lsp(lang) &&
              (semantic_sites > 0 || pending_lsp_site) &&
-             (jvm_cross_lsp || pending_lsp_site || qualified_lsp_sites < semantic_sites) &&
+             (jvm_cross_lsp || rust_workspace_cross_lsp || pending_lsp_site ||
+              qualified_lsp_sites < semantic_sites) &&
              !is_generated);
 
         /* Skip files with nothing else to resolve and no cross-LSP work. */
@@ -3187,6 +3198,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
      * into dead TLS and are never retired, so a later cross-thread free can
      * never bring their refcount to zero (leak). Retiring them here releases
      * each page as its final chunk returns. */
+    cbm_pxc_set_rust_manifest(NULL);
     cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
     cbm_service_pattern_cache_end();
@@ -3213,6 +3225,25 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     }
     memset(workers, 0, (size_t)worker_count * sizeof(resolve_worker_state_t));
 
+    bool have_rust = false;
+    for (int i = 0; i < file_count; i++) {
+        if (result_cache[i] && files[i].language == CBM_LANG_RUST) {
+            have_rust = true;
+            break;
+        }
+    }
+    CBMArena rust_manifest_arena;
+    CBMCargoManifest rust_manifest;
+    bool rust_manifest_arena_live = false;
+    const CBMCargoManifest *rust_manifest_ptr = NULL;
+    if (have_rust) {
+        cbm_arena_init(&rust_manifest_arena);
+        rust_manifest_arena_live = true;
+        if (cbm_pxc_build_rust_manifest(ctx, &rust_manifest_arena, &rust_manifest)) {
+            rust_manifest_ptr = &rust_manifest;
+        }
+    }
+
     resolve_ctx_t rc = {
         .files = files,
         .file_count = file_count,
@@ -3230,6 +3261,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .def_modules = def_modules,
         .module_def_index = module_def_index,
         .cross_registries = cross_registries,
+        .rust_manifest = rust_manifest_ptr,
     };
     atomic_init(&rc.next_file_idx, 0);
     atomic_init(&rc.lsp_cross_processed, 0);
@@ -3255,6 +3287,9 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         rc.rust_shared_arena_live = false;
     }
     cbm_mutex_destroy(&rc.rust_shared_mu);
+    if (rust_manifest_arena_live) {
+        cbm_arena_destroy(&rust_manifest_arena);
+    }
 
     /* Sub-phase: Merge all local edge bufs into main gbuf (SEQUENTIAL) */
     CBM_PROF_START(t_resolve_merge);
