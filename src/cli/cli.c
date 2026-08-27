@@ -6795,6 +6795,14 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key) {
     return rc;
 }
 
+/* Whether the background watcher subsystem should run (default true). The
+ * daemon host gates watcher construction and thread startup on this; see
+ * cbm_config_watcher_enabled in cli.h. NULL-safe via cbm_config_get_bool (a
+ * NULL cfg returns the default). */
+bool cbm_config_watcher_enabled(cbm_config_t *cfg) {
+    return cbm_config_get_bool(cfg, CBM_CONFIG_WATCHER_ENABLED, true);
+}
+
 /* ── Config CLI subcommand ────────────────────────────────────── */
 
 /* THE config-key table. list, get, help, and key validation all read this one
@@ -6814,6 +6822,8 @@ static const config_key_def_t CONFIG_KEYS[] = {
     {CBM_CONFIG_AUTO_INDEX, "false", "Enable auto-indexing on MCP session start"},
     {CBM_CONFIG_AUTO_INDEX_LIMIT, "50000", "Max files for auto-indexing new projects"},
     {CBM_CONFIG_AUTO_WATCH, "true", "Register background git watcher on session connect"},
+    {CBM_CONFIG_WATCHER_ENABLED, "true",
+     "Run the background watcher thread (auto-reindex); false to disable"},
     {CBM_CONFIG_UI_LANG, "auto", "Pin graph UI language: en, zh, or auto"},
     {CBM_CONFIG_UI_ENABLED, "false", "Serve the graph UI on a loopback HTTP port"},
     {CBM_CONFIG_UI_PORT, "9749", "Port for the graph UI listener when enabled"},
