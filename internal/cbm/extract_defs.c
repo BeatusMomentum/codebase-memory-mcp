@@ -2550,7 +2550,7 @@ static const char **extract_base_classes(CBMArena *a, TSNode node, const char *s
     }
     // Languages whose heritage is not exposed via a tree-sitter field need
     // dedicated walkers; the generic field/keyword path mis-captures them.
-    if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
+    if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS) {
         const char **ts_result = extract_ts_bases(a, node, source);
         if (ts_result) {
             return ts_result;
@@ -3097,7 +3097,7 @@ static char *resolve_param_type_text(CBMArena *a, TSNode param, const char *sour
         return ts_node_is_null(typename) ? NULL : cbm_node_text(a, typename, source);
     }
 
-    if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
+    if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS) {
         if (strcmp(pk, "required_parameter") == 0 || strcmp(pk, "optional_parameter") == 0) {
             return extract_ts_param_type(a, param, source);
         }
@@ -3230,7 +3230,7 @@ static bool is_signature_implicit_receiver(CBMArena *a, TSNode param, const char
         return true;
     }
 
-    if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
+    if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS) {
         char *name = signature_receiver_name(a, param, source, false);
         return name && strcmp(name, "this") == 0;
     }
@@ -3658,7 +3658,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     if (ctx->enclosing_class_qn &&
         (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA ||
          ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX ||
-         ctx->language == CBM_LANG_NIX)) {
+         ctx->language == CBM_LANG_ARKTS || ctx->language == CBM_LANG_NIX)) {
         def.qualified_name = cbm_arena_sprintf(a, "%s.%s", ctx->enclosing_class_qn, qn_name);
     }
     def.label = "Function";
@@ -3792,7 +3792,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
 
     // JS/TS export detection
     if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
-        ctx->language == CBM_LANG_TSX) {
+        ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) {
         if (is_js_exported(node)) {
             def.is_entry_point = true;
         }
@@ -4395,16 +4395,17 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             label = "Interface";
         }
     }
-    // Rust/Swift/D: a struct is a distinct kind from a class — emit the precise
-    // "Struct" label rather than collapsing it to "Class". Scoped to these three
-    // grammar/LSP languages. Rust's struct node is `struct_item`; D's is
-    // `struct_declaration`. C/C++/Obj-C keep `struct_specifier` → "Class"
-    // (a C++ struct is class-like). "Struct" is a type-like container: every
-    // type-resolution / registry / IMPLEMENTS / LSP-registrar consumer routes
-    // through cbm_label_is_type_like(), so a struct still resolves as a type for
-    // its methods, fields, inheritance and impls.
+    // Rust/Swift/D/ArkTS: a struct is a distinct kind from a class — emit the
+    // precise "Struct" label rather than collapsing it to "Class". Scoped to
+    // these grammar/LSP languages. Rust's struct node is `struct_item`; D's and
+    // ArkTS's is `struct_declaration` (an ArkUI @Component custom component).
+    // C/C++/Obj-C keep `struct_specifier` → "Class" (a C++ struct is
+    // class-like). "Struct" is a type-like container: every type-resolution /
+    // registry / IMPLEMENTS / LSP-registrar consumer routes through
+    // cbm_label_is_type_like(), so a struct still resolves as a type for its
+    // methods, fields, inheritance and impls.
     if (ctx->language == CBM_LANG_RUST || ctx->language == CBM_LANG_SWIFT ||
-        ctx->language == CBM_LANG_DLANG) {
+        ctx->language == CBM_LANG_DLANG || ctx->language == CBM_LANG_ARKTS) {
         if (strcmp(kind, "struct_item") == 0 || strcmp(kind, "struct_declaration") == 0) {
             label = "Struct";
         }
@@ -5492,6 +5493,7 @@ static void extract_vars_mainstream(CBMExtractCtx *ctx, TSNode node, CBMArena *a
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
         extract_js_vars(ctx, node, a);
         break;
     case CBM_LANG_JAVA: {
@@ -5988,6 +5990,7 @@ static void extract_var_names(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
     case CBM_LANG_JAVA:
     case CBM_LANG_CSHARP:
     case CBM_LANG_CPP:
@@ -6683,6 +6686,10 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
         def.start_line = ts_node_start_point(child).row + TS_LINE_OFFSET;
         def.end_line = ts_node_end_point(child).row + TS_LINE_OFFSET;
         def.is_exported = cbm_is_exported(name, ctx->language);
+        /* Field decorators/annotations (ArkTS @State/@Prop/@Link state members,
+         * TS @Input()-style fields, JVM field annotations via the modifiers
+         * child) — same extraction the class and method paths already run. */
+        def.decorators = extract_decorators(a, child, ctx->source, ctx->language, spec);
 
         cbm_defs_push(&ctx->result->defs, a, def);
     }
@@ -7481,7 +7488,8 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
                 bool descend_into_func =
                     (ctx->language == CBM_LANG_WOLFRAM || ctx->language == CBM_LANG_TYPESCRIPT ||
                      ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TSX ||
-                     ctx->language == CBM_LANG_ADA || ctx->language == CBM_LANG_NIX);
+                     ctx->language == CBM_LANG_ARKTS || ctx->language == CBM_LANG_ADA ||
+                     ctx->language == CBM_LANG_NIX);
                 if (!descend_into_func) {
                     continue;
                 }
@@ -7501,7 +7509,8 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
          * the class/func paths on the namespace node itself. */
         if (is_namespace_scope_kind(ctx->language, kind, node)) {
             const char *new_enclosing = compute_class_qn(ctx, node, frame.enclosing_class_qn);
-            if (ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX) {
+            if (ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX ||
+                ctx->language == CBM_LANG_ARKTS) {
                 extract_typescript_namespace_def(ctx, node, frame.enclosing_class_qn);
             }
             wd_push_children_reverse(&s, node, new_enclosing);

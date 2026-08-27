@@ -3304,6 +3304,148 @@ TEST(extract_java_method_annotations_issue382) {
     PASS();
 }
 
+/* ── ArkTS (HarmonyOS .ets) ─────────────────────────────────────── */
+
+TEST(arkts_component_struct) {
+    CBMFileResult *r = extract(
+        "@Entry\n@Component\nstruct Index {\n  @State message: string = 'Hello'\n\n"
+        "  build() {\n    Column() {\n      Text(this.message).fontSize(20)\n    }\n"
+        "    .width('100%')\n  }\n}\n",
+        CBM_LANG_ARKTS, "t", "Index.ets");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Struct", "Index"));
+    ASSERT(has_def(r, "Method", "build"));
+    ASSERT(has_def(r, "Field", "message"));
+    const CBMDefinition *s = find_def_by_name(r, "Index");
+    ASSERT(decorators_contain(s, "Component"));
+    ASSERT(decorators_contain(s, "Entry"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The common shared-component form: `@Component export struct X` puts the
+ * decorator on the export_statement; extract_decorators reaches it through
+ * the prev-sibling walk (skipping the anonymous `export` token). */
+TEST(arkts_exported_struct_decorators) {
+    CBMFileResult *r = extract("@Component\nexport struct TitleBar {\n"
+                               "  @Prop title: string\n\n  build() {\n    Row() {\n"
+                               "      Text(this.title)\n    }\n  }\n}\n",
+                               CBM_LANG_ARKTS, "t", "TitleBar.ets");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Struct", "TitleBar"));
+    ASSERT(decorators_contain(find_def_by_name(r, "TitleBar"), "Component"));
+    ASSERT(has_def(r, "Field", "title"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(arkts_member_decorators) {
+    CBMFileResult *r = extract(
+        "@Component\nstruct S {\n  @State a: number = 0\n  @Prop b: string\n"
+        "  @Link c: boolean\n  @Provide('k') d: string = ''\n  @Consume('k') e: string\n"
+        "  @StorageLink('s') f: number = 1\n  @State @Watch('onW') g: boolean = false\n\n"
+        "  build() {\n  }\n}\n",
+        CBM_LANG_ARKTS, "t", "S.ets");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(decorators_contain(find_def_by_name(r, "a"), "State"));
+    ASSERT(decorators_contain(find_def_by_name(r, "b"), "Prop"));
+    ASSERT(decorators_contain(find_def_by_name(r, "c"), "Link"));
+    ASSERT(decorators_contain(find_def_by_name(r, "d"), "Provide"));
+    ASSERT(decorators_contain(find_def_by_name(r, "e"), "Consume"));
+    ASSERT(decorators_contain(find_def_by_name(r, "f"), "StorageLink"));
+    ASSERT(decorators_contain(find_def_by_name(r, "g"), "Watch"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Spike regression: ArkUI builtins must never be emitted as definitions.
+ * Routing .ets through the plain TypeScript grammar made `Column() { ... }`
+ * parse chaos mint Column/Row/ListItem/... as user function DEFINITIONS
+ * (0/19 components found; 28% of CALLS edges were cross-file fabrications).
+ * With the arkts grammar they are call expressions — calls, never defs. */
+TEST(arkts_no_phantom_builtin_defs) {
+    CBMFileResult *r = extract(
+        "@Component\nstruct S {\n  build() {\n    Column() {\n      Row() {\n"
+        "        Text('x').fontSize(10)\n      }\n      List() {\n        ListItem() {\n"
+        "          Text('y')\n        }\n      }\n      ForEach(this.items, (i: string) => {\n"
+        "        Text(i)\n      })\n    }\n    .width('100%')\n  }\n}\n",
+        CBM_LANG_ARKTS, "t", "S.ets");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    static const char *builtins[] = {"Column", "Row", "Text", "List", "ListItem", "ForEach", NULL};
+    for (int i = 0; builtins[i]; i++) {
+        ASSERT_FALSE(has_def_any(r, builtins[i]));
+    }
+    ASSERT(has_call(r, "Column"));
+    ASSERT(has_call(r, "ListItem"));
+    ASSERT(has_call(r, "ForEach"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(arkts_builder_extend_styles) {
+    CBMFileResult *r = extract(
+        "@Builder\nfunction card(t: string) {\n  Column() {\n    Text(t)\n  }\n}\n\n"
+        "@Extend(Text)\nfunction fancy(size: number) {\n  .fontSize(size)\n}\n\n"
+        "@Styles\nfunction pressed() {\n  .backgroundColor('#eee')\n}\n",
+        CBM_LANG_ARKTS, "t", "b.ets");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "card"));
+    ASSERT(has_def(r, "Function", "fancy"));
+    ASSERT(has_def(r, "Function", "pressed"));
+    ASSERT(decorators_contain(find_def_by_name(r, "card"), "Builder"));
+    ASSERT(decorators_contain(find_def_by_name(r, "fancy"), "Extend"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(arkts_lazy_import) {
+    CBMFileResult *r = extract("import lazy { HeavyModule, Other } from './heavy'\n"
+                               "import { router } from '@kit.ArkUI'\n"
+                               "import lazy from './lazymod'\n",
+                               CBM_LANG_ARKTS, "t", "i.ets");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_import(r, "./heavy"));
+    ASSERT(has_import(r, "@kit.ArkUI"));
+    ASSERT(has_import(r, "./lazymod"));
+    int heavy = 0, other = 0;
+    for (int i = 0; i < r->imports.count; i++) {
+        if (r->imports.items[i].local_name) {
+            if (strcmp(r->imports.items[i].local_name, "HeavyModule") == 0) {
+                heavy = 1;
+            }
+            if (strcmp(r->imports.items[i].local_name, "Other") == 0) {
+                other = 1;
+            }
+        }
+    }
+    ASSERT(heavy);
+    ASSERT(other);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(arkts_ts_compat) {
+    CBMFileResult *r = extract(
+        "@Observed\nclass Model {\n  count: number = 0\n  bump(): void { this.count++ }\n}\n\n"
+        "interface Props {\n  title: string\n}\n\n"
+        "export function helper(x: number): number {\n  return x * 2\n}\n",
+        CBM_LANG_ARKTS, "t", "m.ets");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Class", "Model"));
+    ASSERT(has_def(r, "Method", "bump"));
+    ASSERT(has_def(r, "Interface", "Props"));
+    ASSERT(has_def(r, "Function", "helper"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Issue #1005: JAX-RS splits a route across two annotations (@GET carries the
  * verb, a sibling @Path carries the path). Returning on the first mapping
  * annotation dropped every method-level @Path, and the class-level @Path
@@ -5945,6 +6087,13 @@ SUITE(extraction) {
     RUN_TEST(js_index_module_qn_not_collide_with_folder);
     RUN_TEST(python_regular_module_qn_unchanged);
     RUN_TEST(extract_java_method_annotations_issue382);
+    RUN_TEST(arkts_component_struct);
+    RUN_TEST(arkts_exported_struct_decorators);
+    RUN_TEST(arkts_member_decorators);
+    RUN_TEST(arkts_no_phantom_builtin_defs);
+    RUN_TEST(arkts_builder_extend_styles);
+    RUN_TEST(arkts_lazy_import);
+    RUN_TEST(arkts_ts_compat);
     RUN_TEST(extract_java_jaxrs_path_composition_issue1005);
     RUN_TEST(extract_ts_template_string_url_issue1006);
     RUN_TEST(extract_go_binary_concat_url_issue1249);

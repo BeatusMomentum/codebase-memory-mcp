@@ -104,6 +104,7 @@ static bool is_reference_node(TSNode node, CBMLanguage lang) {
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
     case CBM_LANG_QML:
     case CBM_LANG_CFSCRIPT:
         return strcmp(kind, "property_identifier") == 0 ||
@@ -1367,6 +1368,7 @@ static bool language_may_stamp_exact_callable_value_candidate(CBMLanguage langua
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
     case CBM_LANG_GO:
     case CBM_LANG_PYTHON:
     case CBM_LANG_C:
@@ -1492,7 +1494,7 @@ static TSNode call_reference_candidate_site(CBMExtractCtx *ctx, TSNode node, con
         (void)occurrence_parent(cursor, node, &parent, &parent_field);
     }
     bool ts_family = ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
-                     ctx->language == CBM_LANG_TSX;
+                     ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS;
     if (ts_family && strcmp(kind, "property_identifier") == 0 && !ts_node_is_null(parent) &&
         strcmp(ts_node_type(parent), "member_expression") == 0) {
         TSNode property = ts_node_child_by_field_name(parent, TS_FIELD("property"));
@@ -1995,7 +1997,8 @@ static bool is_import_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const 
     }
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
-    case CBM_LANG_TSX: {
+    case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS: {
         if (strcmp(ts_node_type(boundary), "import_statement") != 0) {
             return false;
         }
@@ -2182,7 +2185,7 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
         scope_id = lexical_ancestor_of_kind(state, current_id, true, false);
         whole_scope = true;
     } else if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
-               ctx->language == CBM_LANG_TSX) {
+               ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) {
         bool is_var = js_var_binding(node);
         scope_id = lexical_ancestor_of_kind(state, current_id, is_var, !is_var);
         if (scope_id == 0) {

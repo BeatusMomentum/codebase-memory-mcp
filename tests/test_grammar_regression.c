@@ -202,6 +202,14 @@ const GrammarCase CBM_GRAMMAR_CASES[] = {
      "fn foo() -> Int:\n    return 1\n\nstruct A:\n    fn bar(self) -> Int:\n        return foo()\n",
      2,
      {"foo", "A", NULL}},
+    {"arkts",
+     CBM_LANG_ARKTS,
+     "a.ets",
+     "@Component\nstruct Card {\n  @State title: string = ''\n\n  build() {\n    Column() {\n"
+     "      Text(this.title).fontSize(20)\n    }\n  }\n}\n\n@Builder\nfunction rowCard() {\n"
+     "  Row() {}\n}\n",
+     2,
+     {"Card", "build", "rowCard"}},
     {"smali",
      CBM_LANG_SMALI,
      "A.smali",

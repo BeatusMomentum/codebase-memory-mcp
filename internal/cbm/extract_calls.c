@@ -3338,7 +3338,7 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
             // right. Bare calls (helper()) and new_expression have no member
             // receiver, so they keep is_method=false (struct is zero-init).
             if ((ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
-                 ctx->language == CBM_LANG_TSX) &&
+                 ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) &&
                 strcmp(ts_node_type(node), "call_expression") == 0) {
                 TSNode fn = ts_node_child_by_field_name(node, TS_FIELD("function"));
                 if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "member_expression") == 0) {
