@@ -1209,7 +1209,11 @@ TEST(plsql_create_type_as_object_limitation) {
                       "/\n";
     CBMFileResult *r = extract(src, CBM_LANG_PLSQL, "t", "address.tps");
     ASSERT_NOT_NULL(r);
-    /* Must not crash; Class extraction is best-effort and may be absent. */
+    /* Pin the limitation positively: the tree contains ERROR/MISSING nodes.
+     * When a grammar upgrade clears this, this assertion goes RED — then
+     * expect the Class def here instead of the absence below. */
+    ASSERT(r->parse_incomplete);
+    /* Must not crash; Class extraction is best-effort and currently absent. */
     ASSERT(!has_def(r, "Class", "address_t"));
     cbm_free_result(r);
     PASS();
