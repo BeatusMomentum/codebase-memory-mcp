@@ -197,6 +197,8 @@ static bool is_reference_node(TSNode node, CBMLanguage lang) {
     case CBM_LANG_OBJECTSCRIPT_ROUTINE:
         return strcmp(kind, "objectscript_identifier") == 0 ||
                strcmp(kind, "objectscript_identifier_special") == 0;
+    case CBM_LANG_PLSQL:
+        return strcmp(kind, "identifier") == 0;
     default:
         return false;
     }
@@ -1097,6 +1099,14 @@ static bool is_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLang
         }
 
         const char *kind = ts_node_type(parent);
+        /* PL/SQL: `parameter` is a ref_call ARGUMENT wrapper (upstream grammar
+         * naming), not a declaration; definition-side bindings use the distinct
+         * parameter_declaration kind. Skip it so call arguments stay ordinary
+         * value usages. */
+        if (ctx->language == CBM_LANG_PLSQL && strcmp(kind, "parameter") == 0) {
+            current = parent;
+            continue;
+        }
         if (kind_in_exact_set(kind, common_whole_binding_nodes) ||
             kind_in_exact_set(kind, occurrence->whole_binding_nodes)) {
             return true;

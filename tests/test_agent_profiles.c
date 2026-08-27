@@ -31,6 +31,7 @@ static const direct_dialect_expectation_t direct_dialects[] = {
     {CBM_GRAPH_DIALECT_FACTORY, "mcp__codebase-memory-mcp__check_index_coverage",
      "tools: [\"Read\", \"LS\", \"Grep\", \"Glob\"", "source read/grep fallback"},
     {CBM_GRAPH_DIALECT_VIBE, "agent_type = \"subagent\"", "\"read_file\"", "\"grep_search\""},
+    {CBM_GRAPH_DIALECT_GROK, "mcpInheritance:", "read_file", "grep"},
 };
 
 static const cbm_graph_profile_dialect_t handoff_only_dialects[] = {
@@ -279,6 +280,41 @@ TEST(agent_profiles_vibe_uses_matching_prompt_identifier_and_contract) {
     PASS();
 }
 
+/* Grok Build children reach MCP only through its search_tool/use_tool
+ * dispatcher and filter inheritance per server, so the direct profile must
+ * name the server for inheritance and spell out the tier's qualified tool ids
+ * as the dispatcher accepts them; handoff profiles must inherit nothing. */
+TEST(agent_profiles_grok_uses_dispatcher_ids_and_named_inheritance) {
+    for (int tier = 0; tier < (int)CBM_GRAPH_TIER_COUNT; tier++) {
+        const char *slug = cbm_graph_tier_slug((cbm_graph_tier_t)tier);
+        char *direct = cbm_render_graph_profile(CBM_GRAPH_DIALECT_GROK, (cbm_graph_tier_t)tier,
+                                                CBM_GRAPH_ACCESS_DIRECT, NULL);
+        char *handoff = cbm_render_graph_profile(CBM_GRAPH_DIALECT_GROK, (cbm_graph_tier_t)tier,
+                                                 CBM_GRAPH_ACCESS_HANDOFF, NULL);
+        char name_line[128];
+        snprintf(name_line, sizeof(name_line), "---\nname: %s\n", slug);
+        int direct_ok =
+            direct && strstr(direct, name_line) &&
+            strstr(direct, "tools: read_file, grep, list_dir, search_tool, use_tool\n") &&
+            strstr(direct, "mcpInheritance:\n  named:\n    - codebase-memory-mcp\n---\n") &&
+            strstr(direct, "codebase-memory-mcp__search_graph") &&
+            strstr(direct, "codebase-memory-mcp__check_index_coverage") &&
+            !strstr(direct, "codebase-memory-mcp__*") && !profile_has_mutator(direct) &&
+            (tier != (int)CBM_GRAPH_TIER_SCOUT) ==
+                (strstr(direct, "codebase-memory-mcp__query_graph") != NULL);
+        int handoff_ok = handoff && strstr(handoff, name_line) &&
+                         strstr(handoff, "tools: read_file, grep, list_dir\n") &&
+                         strstr(handoff, "mcpInheritance: none\n---\n") &&
+                         !strstr(handoff, "use_tool") && !strstr(handoff, "codebase-memory-mcp__");
+        free(direct);
+        free(handoff);
+        if (!direct_ok || !handoff_ok) {
+            FAIL("Grok profiles must name the server for inheritance and list dispatcher tool ids");
+        }
+    }
+    PASS();
+}
+
 TEST(agent_profiles_render_deterministically_and_reject_invalid_inputs) {
     char *first = cbm_render_graph_profile(CBM_GRAPH_DIALECT_QWEN, CBM_GRAPH_TIER_VERIFY,
                                            CBM_GRAPH_ACCESS_DIRECT, NULL);
@@ -312,5 +348,6 @@ SUITE(agent_profiles) {
     RUN_TEST(agent_profiles_kiro_is_valid_json_and_escapes_binary_path);
     RUN_TEST(agent_profiles_codex_declares_transport_and_escapes_binary_path);
     RUN_TEST(agent_profiles_vibe_uses_matching_prompt_identifier_and_contract);
+    RUN_TEST(agent_profiles_grok_uses_dispatcher_ids_and_named_inheritance);
     RUN_TEST(agent_profiles_render_deterministically_and_reject_invalid_inputs);
 }
