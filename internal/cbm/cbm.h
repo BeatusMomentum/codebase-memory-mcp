@@ -728,6 +728,9 @@ void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
 // --- Sub-extractor entry points ---
 
 void cbm_extract_definitions(CBMExtractCtx *ctx);
+/* Internal companion for embedded-language trees that contribute definitions
+ * to an existing host-file Module rather than minting a second Module. */
+void cbm_extract_definitions_without_module(CBMExtractCtx *ctx);
 // dbt lineage for Jinja-templated SQL models: emits a Model def plus one usage
 // per ref()/source() call. No-op unless the file parses as SQL and actually
 // contains a dbt builtin call. Defined in extract_dbt.c.
