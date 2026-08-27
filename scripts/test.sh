@@ -266,6 +266,9 @@ bash "$ROOT/tests/test_shell_line_endings.sh"
 echo "=== Step 0v: nomic blob generator contract ==="
 bash "$ROOT/tests/test_nomic_blob_generator_contract.sh"
 
+echo "=== Step 0w: published language-count contract ==="
+bash "$ROOT/tests/test_language_count_contract.sh"
+
 # Verify compiler supports target arch
 verify_compiler "$CC"
 
