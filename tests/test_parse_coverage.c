@@ -295,6 +295,55 @@ TEST(dockerfile_with_final_newline_still_clean_issue1610) {
     PASS();
 }
 
+/* #1746: on Windows, a Dockerfile whose final instruction is followed by one
+ * ASCII space and then EOF was reported as parse_partial. */
+TEST(dockerfile_trailing_space_at_eof_not_flagged_issue1746) {
+    const char *src = "FROM scratch\nENTRYPOINT [\"a\"] ";
+    CBMFileResult *r = do_extract(src, CBM_LANG_DOCKERFILE, "Dockerfile");
+    ASSERT_NOT_NULL(r);
+    bool flagged = r->parse_incomplete;
+    if (flagged) {
+        fprintf(stderr, "  exact issue #1746 fixture flagged: ranges=%s\n",
+                r->error_ranges ? r->error_ranges : "(none)");
+    }
+    cbm_free_result(r);
+    if (flagged) {
+        FAIL("trailing horizontal whitespace at Dockerfile EOF must not be parse_partial");
+    }
+    PASS();
+}
+
+/* The same bytes WITH the LF must stay clean. This is a separate test so the
+ * control executes even while the exact affected fixture is RED. */
+TEST(dockerfile_trailing_space_with_final_newline_clean_issue1746) {
+    const char *src = "FROM scratch\nENTRYPOINT [\"a\"] \n";
+    CBMFileResult *r = do_extract(src, CBM_LANG_DOCKERFILE, "Dockerfile");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Removing the trailing space while retaining EOF must also stay clean. */
+TEST(dockerfile_without_trailing_space_at_eof_clean_issue1746) {
+    const char *src = "FROM scratch\nENTRYPOINT [\"a\"]";
+    CBMFileResult *r = do_extract(src, CBM_LANG_DOCKERFILE, "Dockerfile");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The reporter also observed the same failure when the first line uses CRLF. */
+TEST(dockerfile_crlf_trailing_space_at_eof_not_flagged_issue1746) {
+    const char *src = "FROM scratch\r\nENTRYPOINT [\"a\"] ";
+    CBMFileResult *r = do_extract(src, CBM_LANG_DOCKERFILE, "Dockerfile");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Language-general, not a Dockerfile patch: these four were each proven to flag
  * on a stripped trailing newline. */
 TEST(missing_final_newline_not_flagged_across_grammars_issue1610) {
@@ -381,6 +430,10 @@ SUITE(parse_coverage) {
     RUN_TEST(c_trailing_recovered_defs_keep_flag);
     RUN_TEST(dockerfile_missing_final_newline_not_flagged_issue1610);
     RUN_TEST(dockerfile_with_final_newline_still_clean_issue1610);
+    RUN_TEST(dockerfile_trailing_space_at_eof_not_flagged_issue1746);
+    RUN_TEST(dockerfile_trailing_space_with_final_newline_clean_issue1746);
+    RUN_TEST(dockerfile_without_trailing_space_at_eof_clean_issue1746);
+    RUN_TEST(dockerfile_crlf_trailing_space_at_eof_not_flagged_issue1746);
     RUN_TEST(missing_final_newline_not_flagged_across_grammars_issue1610);
     RUN_TEST(real_error_before_eof_still_flagged_without_final_newline_issue1610);
     RUN_TEST(width_bearing_error_at_eof_still_flagged_issue1610);
