@@ -64,6 +64,21 @@ License summary:
   base, MIT, (c) 2014 Max Brunsfeld) with (c) 2026 DeusData ArkTS additions;
   its grammar source lives in `tools/tree-sitter-arkts/`.
 
+### tree-sitter-plsql
+
+- **Project:** [AndreasMaierDe/tree-sitter-plsql](https://github.com/AndreasMaierDe/tree-sitter-plsql)
+- **License:** MIT
+- **Copyright:** (c) 2022 AndreasMaierDe
+- **Vendored at:** `internal/cbm/vendored/grammars/plsql/`
+- **Pinned commit:** `28aebef209be`
+- **Notes:** Community-maintained grammar for Oracle PL/SQL; not in the
+  nvim-treesitter or Helix registries (`community-niche` in the manifest). No
+  external scanner. One local patch: `parser.c`'s
+  `#include <tree_sitter/parser.h>` is changed to the quoted form used by every
+  other vendored grammar, as documented in
+  `internal/cbm/vendored/grammars/MANIFEST.md`. PL/SQL support was originally
+  contributed in PR #1033 by Oğuz (@ouzsrcm).
+
 ### tree-sitter-objectscript (UDL + routine)
 
 - **Project:** [intersystems/tree-sitter-objectscript](https://github.com/intersystems/tree-sitter-objectscript)
