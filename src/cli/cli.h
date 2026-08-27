@@ -193,6 +193,7 @@ typedef struct {
     bool crush;         /* Crush config or CLI exists */
     bool goose;         /* Goose config or CLI exists */
     bool mistral_vibe;  /* $VIBE_HOME, ~/.vibe/, or vibe CLI exists */
+    bool grok;          /* $GROK_HOME, ~/.grok/, or grok CLI exists */
 } cbm_detected_agents_t;
 
 /* Detect which coding agents are installed.

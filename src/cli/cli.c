@@ -2638,6 +2638,17 @@ static void cbm_vibe_config_dir(const char *home_dir, char *out, size_t out_sz) 
     }
 }
 
+/* Resolve Grok Build's user configuration directory.
+ * Honors $GROK_HOME; falls back to "$home_dir/.grok". */
+static void cbm_grok_config_dir(const char *home_dir, char *out, size_t out_sz) {
+    char env_buf[CLI_BUF_1K];
+    const char *custom = cbm_safe_getenv("GROK_HOME", env_buf, sizeof(env_buf), NULL);
+    snprintf(out, out_sz, "%s", custom && custom[0] ? custom : "");
+    if ((!custom || !custom[0]) && home_dir && home_dir[0]) {
+        snprintf(out, out_sz, "%s/.grok", home_dir);
+    }
+}
+
 static bool cbm_hook_script_name_safe(const char *script_name) {
     if (!script_name || !script_name[0]) {
         return false;
@@ -2877,6 +2888,9 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
 
     cbm_vibe_config_dir(home_dir, path, sizeof(path));
     agents.mistral_vibe = dir_exists(path) || cbm_agent_cli_exists("vibe", home_dir);
+
+    cbm_grok_config_dir(home_dir, path, sizeof(path));
+    agents.grok = dir_exists(path) || cbm_agent_cli_exists("grok", home_dir);
 
     return agents;
 }
@@ -4060,6 +4074,53 @@ static int cbm_remove_vibe_mcp_owned(const char *binary_path, const char *config
     }
     return cbm_toml_remove_owned_named_array_table(config_path, "mcp_servers", "name",
                                                    "codebase-memory-mcp", body);
+}
+
+/* ── Grok Build MCP config (TOML) ────────────────────────────── */
+
+#define GROK_CMM_TABLE "mcp_servers.codebase-memory-mcp"
+#define GROK_CMM_SECTION "[" GROK_CMM_TABLE "]"
+#define GROK_MCP_BEGIN "# >>> codebase-memory-mcp MCP >>>"
+#define GROK_MCP_END "# <<< codebase-memory-mcp MCP <<<"
+
+/* A pre-marker table with the known owned shape (what `grok mcp add` writes
+ * for this binary) is adopted; any other same-name table is foreign and left
+ * byte-identical, because a second [mcp_servers.codebase-memory-mcp] header
+ * would make Grok reject the whole config.toml. */
+static int cbm_remove_grok_legacy_mcp(const char *config_path) {
+    return cbm_toml_remove_legacy_table(config_path, GROK_CMM_TABLE, GROK_MCP_BEGIN, GROK_MCP_END);
+}
+
+static int cbm_upsert_grok_mcp(const char *binary_path, const char *config_path) {
+    if (!binary_path || !config_path) {
+        return CLI_ERR;
+    }
+    char escaped[CLI_BUF_8K];
+    if (cbm_toml_escape_basic_string(binary_path, escaped, sizeof(escaped)) != 0) {
+        return CLI_ERR;
+    }
+    /* Grok spawns stdio servers with the full parent environment (verified
+     * against grok 1.0.5), so unlike Codex (#1562) nothing has to be
+     * forwarded: CBM_CACHE_DIR and CBM_RUNTIME_DIR reach the server as-is. */
+    char block[CLI_BUF_8K];
+    int written =
+        snprintf(block, sizeof(block), GROK_CMM_SECTION "\ncommand = \"%s\"\nargs = []\n", escaped);
+    if (written < 0 || (size_t)written >= sizeof(block) ||
+        cbm_remove_grok_legacy_mcp(config_path) != 0) {
+        return CLI_ERR;
+    }
+    return cbm_toml_upsert_managed_block(config_path, GROK_MCP_BEGIN, GROK_MCP_END, block) == 0
+               ? CLI_OK
+               : CLI_ERR;
+}
+
+static int cbm_remove_grok_mcp_owned(const char *binary_path, const char *config_path) {
+    (void)binary_path;
+    if (!config_path ||
+        cbm_toml_remove_managed_block(config_path, GROK_MCP_BEGIN, GROK_MCP_END) != 0) {
+        return CLI_ERR;
+    }
+    return cbm_remove_grok_legacy_mcp(config_path) >= 0 ? CLI_OK : CLI_ERR;
 }
 
 /* ── Claude Code pre-tool hooks ───────────────────────────────── */
@@ -7409,6 +7470,7 @@ static void print_detected_agents(const cbm_detected_agents_t *a, const char *ho
         {a->crush, "Crush"},
         {a->goose, "Goose"},
         {a->mistral_vibe, "Mistral-Vibe"},
+        {a->grok, "Grok-Build"},
     };
     printf("Detected agents:");
     bool any = false;
@@ -9363,6 +9425,38 @@ static void install_additional_agent_configs(const cbm_detected_agents_t *agents
         install_tiered_profile_prompts("Mistral Vibe", prompt_path, CBM_GRAPH_DIALECT_VIBE,
                                        legacy_vibe_verify_prompt_content, dry_run);
     }
+    if (agents->grok) {
+        char config_dir[CLI_BUF_1K];
+        char cp[CLI_BUF_1K];
+        char ip[CLI_BUF_1K];
+        char skills_dir[CLI_BUF_1K];
+        char ap[CLI_BUF_1K];
+        cbm_grok_config_dir(home, config_dir, sizeof(config_dir));
+        snprintf(cp, sizeof(cp), "%s/config.toml", config_dir);
+        /* Every .md under $GROK_HOME/rules/ is always scanned and applies to
+         * every project; an owned file there never touches a user AGENTS.md. */
+        snprintf(ip, sizeof(ip), "%s/rules/codebase-memory.md", config_dir);
+        snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
+        snprintf(ap, sizeof(ap), "%s/agents/codebase-memory.md", config_dir);
+        install_generic_agent_config("Grok Build", binary_path, cp, ip, dry_run,
+                                     cbm_upsert_grok_mcp);
+        install_agent_skill("Grok Build", skills_dir, force, dry_run);
+        install_tiered_agent_profiles(
+            (cbm_tiered_profile_set_t){
+                .label = "Grok Build",
+                .verify_path = ap,
+                .binary_path = binary_path,
+                .dialect = CBM_GRAPH_DIALECT_GROK,
+            },
+            dry_run);
+        /* Grok's passive hook events (SessionStart, SubagentStart, PostToolUse)
+         * discard stdout and PreToolUse honors only decision/updatedInput, so
+         * the context augmenter would run for nothing: no hook is installed. */
+        if (!g_install_plan) {
+            printf("  hooks: withheld (Grok passive hook events discard stdout; no context "
+                   "contract)\n");
+        }
+    }
 }
 
 /* #1558: set by `install --clients=...` after validation, consumed at the one
@@ -9540,6 +9634,7 @@ static const cli_client_def_t CLI_CLIENTS[] = {
     CLI_CLIENT(crush, "crush", "Crush"),
     CLI_CLIENT(goose, "goose", "Goose"),
     CLI_CLIENT(mistral_vibe, "mistral-vibe", "Mistral Vibe"),
+    CLI_CLIENT(grok, "grok", "Grok Build"),
 };
 
 enum { CLI_CLIENT_COUNT = sizeof(CLI_CLIENTS) / sizeof(CLI_CLIENTS[0]) };
@@ -9778,6 +9873,7 @@ static char *cbm_build_install_plan_json_options(const char *home, const char *b
         {det.crush, "crush"},
         {det.goose, "goose"},
         {det.mistral_vibe, "mistral-vibe"},
+        {det.grok, "grok"},
     };
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -11474,6 +11570,28 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
             dry_run);
         uninstall_tiered_profile_prompts("Mistral Vibe", prompt_path, CBM_GRAPH_DIALECT_VIBE,
                                          legacy_vibe_verify_prompt_content, dry_run);
+    }
+    if (agents->grok) {
+        char config_dir[CLI_BUF_1K];
+        char cp[CLI_BUF_1K];
+        char ip[CLI_BUF_1K];
+        char skills_dir[CLI_BUF_1K];
+        char ap[CLI_BUF_1K];
+        cbm_grok_config_dir(home, config_dir, sizeof(config_dir));
+        snprintf(cp, sizeof(cp), "%s/config.toml", config_dir);
+        snprintf(ip, sizeof(ip), "%s/rules/codebase-memory.md", config_dir);
+        snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
+        snprintf(ap, sizeof(ap), "%s/agents/codebase-memory.md", config_dir);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Grok Build", cp, ip}, dry_run,
+                                  cbm_remove_grok_mcp_owned);
+        uninstall_agent_skill("Grok Build", skills_dir, dry_run);
+        uninstall_tiered_agent_profiles(
+            (cbm_tiered_profile_set_t){
+                .label = "Grok Build",
+                .verify_path = ap,
+                .dialect = CBM_GRAPH_DIALECT_GROK,
+            },
+            dry_run);
     }
 }
 
