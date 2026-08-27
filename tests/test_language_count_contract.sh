@@ -81,7 +81,15 @@ for path in "${SURFACES[@]}"; do
         failures=$((failures + 1))
         continue
     fi
-    hits=$(grep -oE '[0-9]{2,3} languages' "$path" | grep -oE '^[0-9]+' | sort -u || true)
+    # Two claim forms. Prose says "<N> languages"; a shields.io badge says
+    # "languages-<N>-colour". The badge was MISSED by the first version of this
+    # contract: it gated only the prose form, so README's badge sat three behind
+    # the prose in the same file while this test reported success. The lesson is
+    # that the enumeration and the gate must not share a regex — if they do, the
+    # gate can only ever confirm what the enumeration already saw.
+    hits=$( { grep -oE '[0-9]{2,3} languages' "$path" | grep -oE '^[0-9]+'
+              grep -oiE 'languages-[0-9]{2,3}' "$path" | grep -oE '[0-9]+$'
+            } | sort -u || true)
     if [[ -z "$hits" ]]; then
         echo "FAIL: $path is registered as a language-count surface but states no" \
             "count — either it lost the claim (drop it from SURFACES) or the" \
@@ -113,7 +121,7 @@ while IFS= read -r path; do
         "SURFACES so it stays in step with the registry, or to EXEMPT with a" \
         "note saying what its number actually counts." >&2
     failures=$((failures + 1))
-done < <(git grep -IlE '[0-9]{2,3} languages' || true)
+done < <(git grep -IlE '[0-9]{2,3} languages|languages-[0-9]{2,3}' || true)
 
 if ((failures > 0)); then
     echo "FAIL: $failures language-count contract violation(s)" >&2

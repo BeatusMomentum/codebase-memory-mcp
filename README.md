@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/DeusData/codebase-memory-mcp/dry-run.yml?label=CI)](https://github.com/DeusData/codebase-memory-mcp/actions/workflows/dry-run.yml)
 [![Tests](https://img.shields.io/badge/tests-6768_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)
-[![Languages](https://img.shields.io/badge/languages-158-orange)](https://github.com/DeusData/codebase-memory-mcp)
+[![Languages](https://img.shields.io/badge/languages-161-orange)](https://github.com/DeusData/codebase-memory-mcp)
 [![Hybrid LSP](https://img.shields.io/badge/Hybrid_LSP-10_languages-blue)](#hybrid-lsp)
 [![Agents](https://img.shields.io/badge/agent_surfaces-43-purple)](https://github.com/DeusData/codebase-memory-mcp)
 [![Pure C](https://img.shields.io/badge/pure_C-no_language_runtime-blue)](https://github.com/DeusData/codebase-memory-mcp)
