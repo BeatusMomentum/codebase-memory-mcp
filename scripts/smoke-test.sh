@@ -1314,6 +1314,7 @@ echo "=== Phase 8: agent config install E2E ==="
 FAKE_HOME=$(smoke_mktemp_dir)
 mkdir -p "$FAKE_HOME/.claude"
 mkdir -p "$FAKE_HOME/.codex"
+mkdir -p "$FAKE_HOME/.grok"
 mkdir -p "$FAKE_HOME/.gemini/antigravity-cli"
 mkdir -p "$FAKE_HOME/.junie"
 mkdir -p "$FAKE_HOME/.cursor"
@@ -2558,7 +2559,40 @@ assert_tier_profile_set "Qoder" "$FAKE_HOME/.qoder/agents" ".md" "direct"
 assert_tier_profile_set "CodeBuddy" "$FAKE_HOME/.codebuddy/agents" ".md" "direct"
 assert_tier_profile_set "Pochi" "$FAKE_HOME/.pochi/agents" ".md" "handoff"
 assert_tier_profile_set "Rovo" "$FAKE_HOME/.rovodev/subagents" ".md" "handoff"
+assert_tier_profile_set "Grok" "$FAKE_HOME/.grok/agents" ".md" "direct"
 echo "OK 8aw: all supported Scout/Verify/Auditor profile sets"
+
+# 8ax: Grok Build config.toml MCP table (exactly one header), owned rules file,
+# skill, named-server subagent inheritance with dispatcher tool ids, and NO
+# hook: Grok's passive hook events discard stdout, so context hooks are withheld.
+GROK_CONFIG="$FAKE_HOME/.grok/config.toml"
+GROK_CMD=$(sed -n 's/^command *= *//p' "$GROK_CONFIG" 2>/dev/null | head -1)
+if ! grep -q '^\[mcp_servers\.codebase-memory-mcp\]$' "$GROK_CONFIG" 2>/dev/null ||
+   [ "$(grep -c '^\[mcp_servers\.codebase-memory-mcp\]$' "$GROK_CONFIG" 2>/dev/null)" != "1" ] ||
+   ! grep -q '^args = \[\]$' "$GROK_CONFIG" 2>/dev/null ||
+   ! quoted_path_value_matches "$GROK_CMD" "$SELF_PATH"; then
+  echo "FAIL 8ax: Grok Build MCP table missing or malformed"
+  exit 1
+fi
+if ! grep -q 'search_graph' "$FAKE_HOME/.grok/rules/codebase-memory.md" 2>/dev/null ||
+   ! grep -q 'search_graph' "$FAKE_HOME/.grok/skills/codebase-memory/SKILL.md" 2>/dev/null; then
+  echo "FAIL 8ax: Grok Build rules file or skill missing"
+  exit 1
+fi
+GROK_AGENT="$FAKE_HOME/.grok/agents/codebase-memory.md"
+if ! grep -Fq 'tools: read_file, grep, list_dir, search_tool, use_tool' "$GROK_AGENT" 2>/dev/null ||
+   ! grep -Fq '    - codebase-memory-mcp' "$GROK_AGENT" 2>/dev/null ||
+   ! grep -Fq 'codebase-memory-mcp__search_graph' "$GROK_AGENT" 2>/dev/null ||
+   ! grep -Fq 'codebase-memory-mcp__check_index_coverage' "$GROK_AGENT" 2>/dev/null ||
+   grep -Fq 'codebase-memory-mcp__*' "$GROK_AGENT" 2>/dev/null; then
+  echo "FAIL 8ax: Grok Build graph agent lacks named inheritance or dispatcher tool ids"
+  exit 1
+fi
+if [ -e "$FAKE_HOME/.grok/hooks" ]; then
+  echo "FAIL 8ax: Grok Build must not receive hooks"
+  exit 1
+fi
+echo "OK 8ax: Grok Build MCP + rules + skill + named-inheritance agents; hooks withheld"
 
 echo ""
 echo "=== Phase 9: agent config uninstall E2E ==="
@@ -2813,6 +2847,7 @@ echo "OK 9l: JSON agents, lifecycle hooks, and Kilo cleaned; foreign settings pr
 if grep -q '^  codebase-memory-mcp:' "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null ||
    grep -q '^  pre_llm_call:' "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null ||
    grep -q '^  codebase-memory-mcp:' "$GOOSE_CFG" 2>/dev/null ||
+   grep -q 'codebase-memory-mcp' "$FAKE_HOME/.grok/config.toml" 2>/dev/null ||
    grep -q '^name = "codebase-memory-mcp"' "$FAKE_HOME/.vibe/config.toml" 2>/dev/null; then
   echo "FAIL 9m: YAML/TOML MCP entry remains"
   exit 1
@@ -2834,6 +2869,7 @@ for CONTEXT_FILE in \
   "$KILO_RULE" \
   "$CLINE_RULE" \
   "$FAKE_HOME/.vibe/AGENTS.md" \
+  "$FAKE_HOME/.grok/rules/codebase-memory.md" \
   "$FAKE_HOME/.codeium/windsurf/memories/global_rules.md" \
   "$DEVIN_INSTRUCTIONS" \
   "$CODEBUDDY_INSTRUCTIONS" \
@@ -2872,6 +2908,7 @@ if [ -d "$FAKE_HOME/.claude/skills/codebase-memory" ] ||
    [ -d "$FAKE_HOME/.rovodev/skills/codebase-memory" ] ||
    [ -d "$FAKE_HOME/.copilot/skills/codebase-memory" ] ||
    [ -d "$FAKE_HOME/.vibe/skills/codebase-memory" ] ||
+   [ -d "$FAKE_HOME/.grok/skills/codebase-memory" ] ||
    [ -e "$DEVIN_SKILL" ] ||
    [ -e "$CODEBUDDY_SKILL" ] ||
    [ -e "$BOB_SKILL" ] ||
@@ -2909,6 +2946,7 @@ assert_tier_profile_set_removed "Qwen" "$FAKE_HOME/.qwen/agents" ".md"
 assert_tier_profile_set_removed "Factory" "$FAKE_HOME/.factory/droids" ".md"
 assert_tier_profile_set_removed "Vibe" "$FAKE_HOME/.vibe/agents" ".toml"
 assert_tier_profile_set_removed "Vibe prompt" "$FAKE_HOME/.vibe/prompts" ".md"
+assert_tier_profile_set_removed "Grok" "$FAKE_HOME/.grok/agents" ".md"
 assert_tier_profile_set_removed "Copilot" "$FAKE_HOME/.copilot/agents" ".agent.md"
 assert_tier_profile_set_removed "Qoder" "$FAKE_HOME/.qoder/agents" ".md"
 assert_tier_profile_set_removed "CodeBuddy" "$FAKE_HOME/.codebuddy/agents" ".md"

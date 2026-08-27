@@ -4412,6 +4412,31 @@ TEST(cli_detect_agents_finds_codex) {
     PASS();
 }
 
+TEST(cli_detect_agents_finds_grok) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-detect-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char *saved_grok = save_test_env("GROK_HOME");
+    char *saved_path = save_test_env("PATH");
+    cbm_unsetenv("GROK_HOME");
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_detected_agents_t before = cbm_detect_agents(tmpdir);
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/.grok", tmpdir);
+    test_mkdirp(dir);
+    cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
+
+    restore_test_env("GROK_HOME", saved_grok);
+    restore_test_env("PATH", saved_path);
+    test_rmdir_r(tmpdir);
+    ASSERT_FALSE(before.grok);
+    ASSERT_TRUE(agents.grok);
+    PASS();
+}
+
 /* issue #222: Cursor (~/.cursor/) must be detected so install/update registers
  * the MCP server in ~/.cursor/mcp.json — previously it was never discovered. */
 TEST(cli_detect_agents_finds_cursor_issue222) {
@@ -4527,6 +4552,7 @@ TEST(cli_supported_agent_surfaces_match_installers) {
         "Crush",
         "Goose",
         "Mistral Vibe",
+        "Grok Build",
         "Qoder CLI",
         "Kimi Code CLI",
         "GitLab Duo CLI",
@@ -4546,13 +4572,13 @@ TEST(cli_supported_agent_surfaces_match_installers) {
         "Pi",
         "Sourcegraph Cody",
     };
-    ASSERT_EQ(sizeof(required_agents) / sizeof(required_agents[0]), 43U);
+    ASSERT_EQ(sizeof(required_agents) / sizeof(required_agents[0]), 44U);
     char *data = read_test_file_alloc("README.md");
     if (!data)
         FAIL("could not read README.md for supported-agent contract");
-    if (!strstr(data, "43 supported automatic/conditional client surfaces")) {
+    if (!strstr(data, "44 supported automatic/conditional client surfaces")) {
         free(data);
-        FAIL("README must describe all 43 automatic/conditional client surfaces accurately");
+        FAIL("README must describe all 44 automatic/conditional client surfaces accurately");
     }
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
@@ -4565,9 +4591,9 @@ TEST(cli_supported_agent_surfaces_match_installers) {
     data = read_test_file_alloc("pkg/npm/README.md");
     if (!data)
         FAIL("could not read npm README for supported-agent contract");
-    if (!strstr(data, "43 supported automatic/conditional client surfaces")) {
+    if (!strstr(data, "44 supported automatic/conditional client surfaces")) {
         free(data);
-        FAIL("npm README must describe all 43 automatic/conditional client surfaces accurately");
+        FAIL("npm README must describe all 44 automatic/conditional client surfaces accurately");
     }
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
@@ -4580,9 +4606,9 @@ TEST(cli_supported_agent_surfaces_match_installers) {
     data = read_test_file_alloc("docs/index.html");
     if (!data)
         FAIL("could not read docs/index.html for supported-agent contract");
-    if (!strstr(data, "configures 43 automatic/conditional client surfaces")) {
+    if (!strstr(data, "configures 44 automatic/conditional client surfaces")) {
         free(data);
-        FAIL("landing page must describe all 43 automatic/conditional client surfaces accurately");
+        FAIL("landing page must describe all 44 automatic/conditional client surfaces accurately");
     }
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
@@ -4601,7 +4627,7 @@ TEST(cli_supported_agent_surfaces_match_installers) {
             FAIL("CLI help must list every automatic/conditional client surface");
         }
     }
-    if (!strstr(data, "Supported automatic/conditional client surfaces (43)")) {
+    if (!strstr(data, "Supported automatic/conditional client surfaces (44)")) {
         free(data);
         FAIL("CLI help must not describe all conditional surfaces as auto-detected");
     }
@@ -4610,10 +4636,10 @@ TEST(cli_supported_agent_surfaces_match_installers) {
     data = read_test_file_alloc("docs/llms.txt");
     if (!data)
         FAIL("could not read docs/llms.txt for supported-agent contract");
-    if (!strstr(data, "43 automatic/conditional client surfaces") ||
-        !strstr(data, "37 automatically detected") || !strstr(data, "6 conditional/explicit")) {
+    if (!strstr(data, "44 automatic/conditional client surfaces") ||
+        !strstr(data, "38 automatically detected") || !strstr(data, "6 conditional/explicit")) {
         free(data);
-        FAIL("llms.txt must describe the 43-surface 37+6 support matrix accurately");
+        FAIL("llms.txt must describe the 44-surface 38+6 support matrix accurately");
     }
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
@@ -4634,10 +4660,12 @@ TEST(cli_new_agent_install_plans_use_documented_paths) {
     char *saved_copilot = save_test_env("COPILOT_HOME");
     char *saved_crush = save_test_env("CRUSH_GLOBAL_CONFIG");
     char *saved_vibe = save_test_env("VIBE_HOME");
+    char *saved_grok = save_test_env("GROK_HOME");
     char *saved_appdata = save_test_env("APPDATA");
     cbm_unsetenv("COPILOT_HOME");
     cbm_unsetenv("CRUSH_GLOBAL_CONFIG");
     cbm_unsetenv("VIBE_HOME");
+    cbm_unsetenv("GROK_HOME");
 #ifdef _WIN32
     char appdata[512];
     snprintf(appdata, sizeof(appdata), "%s/AppData/Roaming", tmpdir);
@@ -4658,6 +4686,7 @@ TEST(cli_new_agent_install_plans_use_documented_paths) {
         ".config/goose",
 #endif
         ".vibe",
+        ".grok",
     };
     char path[768];
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
@@ -4702,6 +4731,11 @@ TEST(cli_new_agent_install_plans_use_documented_paths) {
         "\"mistral-vibe\"",
         "/.vibe/config.toml",
         "/.vibe/AGENTS.md",
+        "\"grok\"",
+        "/.grok/config.toml",
+        "/.grok/rules/codebase-memory.md",
+        "/.grok/skills/codebase-memory/SKILL.md",
+        "/.grok/agents/codebase-memory.md",
     };
     const char *missing = NULL;
     for (size_t i = 0; json && i < sizeof(expected) / sizeof(expected[0]); i++) {
@@ -4715,6 +4749,7 @@ TEST(cli_new_agent_install_plans_use_documented_paths) {
     restore_test_env("COPILOT_HOME", saved_copilot);
     restore_test_env("CRUSH_GLOBAL_CONFIG", saved_crush);
     restore_test_env("VIBE_HOME", saved_vibe);
+    restore_test_env("GROK_HOME", saved_grok);
     restore_test_env("APPDATA", saved_appdata);
     test_rmdir_r(tmpdir);
 
@@ -4731,7 +4766,8 @@ TEST(cli_new_agent_configs_use_documented_schemas) {
 
     const char *const env_names[] = {
         "PATH",       "COPILOT_HOME",      "CRUSH_GLOBAL_CONFIG", "VIBE_HOME",
-        "CODEX_HOME", "CLAUDE_CONFIG_DIR", "OPENCODE_CONFIG",     "APPDATA"};
+        "CODEX_HOME", "CLAUDE_CONFIG_DIR", "OPENCODE_CONFIG",     "APPDATA",
+        "GROK_HOME"};
     char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
     for (size_t i = 0; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
         saved_env[i] = save_test_env(env_names[i]);
@@ -4758,6 +4794,7 @@ TEST(cli_new_agent_configs_use_documented_schemas) {
         ".config/goose",
 #endif
         ".vibe",
+        ".grok",
     };
     char path[768];
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
@@ -4858,6 +4895,12 @@ TEST(cli_new_agent_configs_use_documented_schemas) {
     snprintf(path, sizeof(path), "%s/.vibe/config.toml", tmpdir);
     schemas_ok = schemas_ok && test_file_contains_all(path, vibe, 5);
     snprintf(path, sizeof(path), "%s/.vibe/AGENTS.md", tmpdir);
+    schemas_ok = schemas_ok && test_file_contains_all(path, durable_hint, 3);
+    const char *const grok[] = {"[mcp_servers.codebase-memory-mcp]", "command = \"", "args = []",
+                                binary};
+    snprintf(path, sizeof(path), "%s/.grok/config.toml", tmpdir);
+    schemas_ok = schemas_ok && test_file_contains_all(path, grok, 4);
+    snprintf(path, sizeof(path), "%s/.grok/rules/codebase-memory.md", tmpdir);
     schemas_ok = schemas_ok && test_file_contains_all(path, durable_hint, 3);
 
     for (size_t i = 0; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
@@ -5171,6 +5214,7 @@ TEST(cli_durable_profiles_follow_current_vendor_paths) {
         "CLINE_DATA_DIR",
         "KIRO_HOME",
         "VIBE_HOME",
+        "GROK_HOME",
         "OPENCODE_CONFIG",
         /* Linux path resolvers prefer $XDG_CONFIG_HOME over $HOME/.config;
          * CI runners export it, so an isolated-process run resolved OUTSIDE
@@ -5189,18 +5233,21 @@ TEST(cli_durable_profiles_follow_current_vendor_paths) {
     char cline_data_dir[512];
     char kiro_home[512];
     char vibe_home[512];
+    char grok_home[512];
     snprintf(codex_home, sizeof(codex_home), "%s/vendor-codex", tmpdir);
     snprintf(qwen_home, sizeof(qwen_home), "%s/vendor-qwen", tmpdir);
     snprintf(copilot_home, sizeof(copilot_home), "%s/vendor-copilot", tmpdir);
     snprintf(cline_data_dir, sizeof(cline_data_dir), "%s/vendor-cline-data", tmpdir);
     snprintf(kiro_home, sizeof(kiro_home), "%s/vendor-kiro", tmpdir);
     snprintf(vibe_home, sizeof(vibe_home), "%s/vendor-vibe", tmpdir);
+    snprintf(grok_home, sizeof(grok_home), "%s/vendor-grok", tmpdir);
     test_mkdirp(codex_home);
     test_mkdirp(qwen_home);
     test_mkdirp(copilot_home);
     test_mkdirp(cline_data_dir);
     test_mkdirp(kiro_home);
     test_mkdirp(vibe_home);
+    test_mkdirp(grok_home);
 
     const char *const dirs[] = {
         ".claude",
@@ -5233,6 +5280,7 @@ TEST(cli_durable_profiles_follow_current_vendor_paths) {
     cbm_setenv("CLINE_DATA_DIR", cline_data_dir, 1);
     cbm_setenv("KIRO_HOME", kiro_home, 1);
     cbm_setenv("VIBE_HOME", vibe_home, 1);
+    cbm_setenv("GROK_HOME", grok_home, 1);
 
     char qwen_settings[640];
     snprintf(qwen_settings, sizeof(qwen_settings), "%s/settings.json", qwen_home);
@@ -5264,6 +5312,10 @@ TEST(cli_durable_profiles_follow_current_vendor_paths) {
         "/vendor-vibe/skills/codebase-memory/SKILL.md",
         "/vendor-vibe/agents/codebase-memory.toml",
         "/vendor-vibe/prompts/codebase-memory.md",
+        "/vendor-grok/skills/codebase-memory/SKILL.md",
+        "/vendor-grok/agents/codebase-memory.md",
+        "/vendor-grok/agents/codebase-memory-scout.md",
+        "/vendor-grok/agents/codebase-memory-auditor.md",
         "/.config/kilo/agents/codebase-memory.md",
         "/.factory/skills/codebase-memory/SKILL.md",
         "/.factory/droids/codebase-memory.md",
@@ -5458,6 +5510,21 @@ TEST(cli_durable_profiles_follow_current_vendor_paths) {
     free(profile);
     snprintf(path, sizeof(path), "%s/prompts/codebase-memory.md", vibe_home);
     files_ok = files_ok && test_file_contains_all(path, graph_terms, 3U);
+    snprintf(path, sizeof(path), "%s/skills/codebase-memory/SKILL.md", grok_home);
+    files_ok = files_ok && test_file_contains_all(path, graph_terms, 3);
+    snprintf(path, sizeof(path), "%s/agents/codebase-memory.md", grok_home);
+    const char *const grok_agent_terms[] = {
+        "name: codebase-memory\n",
+        "tools: read_file, grep, list_dir, search_tool, use_tool",
+        "mcpInheritance:\n  named:\n    - codebase-memory-mcp",
+        "codebase-memory-mcp__search_graph",
+        "codebase-memory-mcp__check_index_coverage",
+        "Tier 2"};
+    files_ok = files_ok && test_file_contains_all(path, grok_agent_terms, 6U);
+    profile = read_test_file_alloc(path);
+    files_ok = files_ok && profile && !strstr(profile, "codebase-memory-mcp__*") &&
+               !strstr(profile, "delete_project") && !strstr(profile, "manage_adr");
+    free(profile);
 
     snprintf(path, sizeof(path), "%s/.factory/droids/codebase-memory.md", tmpdir);
     const char *const factory_agent_terms[] = {"name: codebase-memory",
@@ -5903,6 +5970,147 @@ TEST(cli_tiered_vibe_installs_matching_agent_prompt_sets) {
     test_rmdir_r(tmpdir);
     if (!plan_ok || !installed || !removed)
         FAIL("Vibe must install and remove matching Scout, Verify, and Auditor agent/prompt pairs");
+    PASS();
+}
+
+/* Grok Build: config.toml table, owned rules file, skill, three graph agents
+ * with named-server inheritance; hooks withheld (its passive events discard
+ * stdout); uninstall removes exactly the owned state. */
+TEST(cli_tiered_grok_installs_profiles_and_withholds_hooks) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-tiered-grok-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char grok_home[512];
+    snprintf(grok_home, sizeof(grok_home), "%s/grok", tmpdir);
+    test_mkdirp(grok_home);
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    char *saved_grok = save_test_env("GROK_HOME");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_setenv("GROK_HOME", grok_home, 1);
+
+    char config_path[640];
+    char rules_path[640];
+    char skill_path[640];
+    char hooks_dir[640];
+    snprintf(config_path, sizeof(config_path), "%s/config.toml", grok_home);
+    snprintf(rules_path, sizeof(rules_path), "%s/rules/codebase-memory.md", grok_home);
+    snprintf(skill_path, sizeof(skill_path), "%s/skills/codebase-memory/SKILL.md", grok_home);
+    snprintf(hooks_dir, sizeof(hooks_dir), "%s/hooks", grok_home);
+    /* A pre-existing user table must survive both install and uninstall. */
+    write_test_file(config_path, "[cli]\ninstaller = \"internal\"\n");
+
+    const char *const slugs[] = {
+        "codebase-memory-scout",
+        "codebase-memory",
+        "codebase-memory-auditor",
+    };
+    const char *const tier_markers[] = {"Tier 1", "Tier 2", "Tier 3"};
+    char agent_paths[3][640];
+    for (size_t i = 0U; i < 3U; i++) {
+        snprintf(agent_paths[i], sizeof(agent_paths[i]), "%s/agents/%s.md", grok_home, slugs[i]);
+    }
+
+    int install_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    bool installed = install_rc == 0;
+    const char *const mcp_terms[] = {"[mcp_servers.codebase-memory-mcp]",
+                                     "command = \"/opt/codebase-memory-mcp\"", "args = []",
+                                     "installer = \"internal\""};
+    installed = installed && test_file_contains_all(config_path, mcp_terms, 4U);
+    const char *const rules_terms[] = {"search_graph", "trace_path", "check_index_coverage"};
+    installed = installed && test_file_contains_all(rules_path, rules_terms, 3U);
+    const char *const skill_terms[] = {"name: codebase-memory", "search_graph"};
+    installed = installed && test_file_contains_all(skill_path, skill_terms, 2U);
+    for (size_t i = 0U; installed && i < 3U; i++) {
+        char name_line[128];
+        snprintf(name_line, sizeof(name_line), "name: %s\n", slugs[i]);
+        char *agent = read_test_file_alloc(agent_paths[i]);
+        installed = agent && strstr(agent, name_line) && strstr(agent, tier_markers[i]) &&
+                    strstr(agent, "tools: read_file, grep, list_dir, search_tool, use_tool") &&
+                    strstr(agent, "mcpInheritance:\n  named:\n    - codebase-memory-mcp") &&
+                    strstr(agent, "codebase-memory-mcp__check_index_coverage") &&
+                    !strstr(agent, "index_repository") && !strstr(agent, "delete_project") &&
+                    !strstr(agent, "manage_adr") && !strstr(agent, "ingest_traces");
+        free(agent);
+    }
+    struct stat state;
+    bool hooks_withheld = stat(hooks_dir, &state) != 0;
+    char *config = read_test_file_alloc(config_path);
+    size_t tables = 0U;
+    for (const char *at = config; at && (at = strstr(at, "[mcp_servers.codebase-memory-mcp]"));
+         at++) {
+        tables++;
+    }
+    bool single_table = tables == 1U;
+    free(config);
+
+    char *argv[] = {"uninstall", "--yes"};
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
+    bool removed = uninstall_rc == 0;
+    for (size_t i = 0U; removed && i < 3U; i++) {
+        removed = stat(agent_paths[i], &state) != 0;
+    }
+    removed = removed && stat(skill_path, &state) != 0;
+    char *after = read_test_file_alloc(config_path);
+    removed = removed && after && !strstr(after, "codebase-memory-mcp") &&
+              strstr(after, "installer = \"internal\"");
+    free(after);
+    char *rules_after = read_test_file_alloc(rules_path);
+    removed = removed && (!rules_after || !strstr(rules_after, "search_graph"));
+    free(rules_after);
+
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("GROK_HOME", saved_grok);
+    test_rmdir_r(tmpdir);
+    if (!installed)
+        FAIL("Grok Build must install config.toml table, rules, skill, and three graph agents");
+    if (!hooks_withheld)
+        FAIL("Grok Build must not receive hooks (passive events discard stdout)");
+    if (!single_table)
+        FAIL("Grok Build install must write exactly one MCP table");
+    if (!removed)
+        FAIL("Grok Build uninstall must remove exactly the owned state");
+    PASS();
+}
+
+/* A same-name table that is not ours (for example a remote url entry) must be
+ * left byte-identical: a second [mcp_servers.codebase-memory-mcp] header would
+ * make Grok reject the whole config.toml. */
+TEST(cli_grok_mcp_preserves_foreign_table) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-grok-foreign-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char grok_home[512];
+    snprintf(grok_home, sizeof(grok_home), "%s/.grok", tmpdir);
+    test_mkdirp(grok_home);
+    char *saved_path = save_test_env("PATH");
+    char *saved_grok = save_test_env("GROK_HOME");
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_unsetenv("GROK_HOME");
+
+    char config_path[640];
+    snprintf(config_path, sizeof(config_path), "%s/config.toml", grok_home);
+    const char *foreign = "[mcp_servers.codebase-memory-mcp]\n"
+                          "url = \"https://mcp.example.com/mcp\"\n"
+                          "headers = { \"Authorization\" = \"Bearer ${TOKEN}\" }\n";
+    write_test_file(config_path, foreign);
+
+    (void)cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    char *after = read_test_file_alloc(config_path);
+    bool preserved = after && strcmp(after, foreign) == 0;
+    free(after);
+
+    restore_test_env("PATH", saved_path);
+    restore_test_env("GROK_HOME", saved_grok);
+    test_rmdir_r(tmpdir);
+    if (!preserved)
+        FAIL("Grok Build install must leave a foreign same-name MCP table byte-identical");
     PASS();
 }
 
@@ -7378,6 +7586,48 @@ TEST(cli_codex_respects_codex_home) {
         FAIL("Codex detection must honor CODEX_HOME");
     if (!plans_config || !plans_instructions)
         FAIL("Codex install plan must place config and AGENTS.md under CODEX_HOME");
+    PASS();
+}
+
+TEST(cli_grok_respects_grok_home) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-grok-home-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char grok_home[512];
+    snprintf(grok_home, sizeof(grok_home), "%s/custom-grok", tmpdir);
+    test_mkdirp(grok_home);
+    char *saved = save_test_env("GROK_HOME");
+    cbm_setenv("GROK_HOME", grok_home, 1);
+
+    cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
+    char *json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+    const char *const suffixes[] = {
+        "/config.toml",
+        "/rules/codebase-memory.md",
+        "/skills/codebase-memory/SKILL.md",
+        "/agents/codebase-memory.md",
+        "/agents/codebase-memory-scout.md",
+        "/agents/codebase-memory-auditor.md",
+    };
+    bool planned = json != NULL;
+    for (size_t i = 0U; planned && i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        char expected[640];
+        snprintf(expected, sizeof(expected), "%s%s", grok_home, suffixes[i]);
+        planned = strstr(json, expected) != NULL;
+    }
+    /* Grok's passive hook events discard stdout, so no hook may be planned. */
+    bool no_hooks = json && !strstr(json, "custom-grok/hooks");
+
+    free(json);
+    restore_test_env("GROK_HOME", saved);
+    test_rmdir_r(tmpdir);
+
+    if (!agents.grok)
+        FAIL("Grok Build detection must honor GROK_HOME");
+    if (!planned || !no_hooks)
+        FAIL("Grok install plan must place config, rules, skill, and agents under GROK_HOME "
+             "and never plan a hook");
     PASS();
 }
 
@@ -13111,6 +13361,7 @@ SUITE(cli) {
     RUN_TEST(cli_detect_agents_finds_claude);
     RUN_TEST(cli_detect_agents_finds_claude_via_env);
     RUN_TEST(cli_detect_agents_finds_codex);
+    RUN_TEST(cli_detect_agents_finds_grok);
     RUN_TEST(cli_detect_agents_finds_cursor_issue222);
     RUN_TEST(cli_install_plan_receipt_no_mutation_issue388);
     RUN_TEST(cli_supported_agent_surfaces_match_installers);
@@ -13128,6 +13379,8 @@ SUITE(cli) {
     RUN_TEST(cli_owned_durable_profiles_preserve_user_files);
     RUN_TEST(cli_tiered_codex_profiles_migrate_preserve_and_uninstall);
     RUN_TEST(cli_tiered_vibe_installs_matching_agent_prompt_sets);
+    RUN_TEST(cli_tiered_grok_installs_profiles_and_withholds_hooks);
+    RUN_TEST(cli_grok_mcp_preserves_foreign_table);
     RUN_TEST(cli_junie_current_durable_context_contract);
     RUN_TEST(cli_rovo_installs_documented_global_memory);
     RUN_TEST(cli_hermes_stable_shell_context_contract);
@@ -13148,6 +13401,7 @@ SUITE(cli) {
     RUN_TEST(cli_openclaw_resolves_active_json5_workspace);
     RUN_TEST(cli_claude_user_scope_avoids_nested_mcp_json);
     RUN_TEST(cli_codex_respects_codex_home);
+    RUN_TEST(cli_grok_respects_grok_home);
     RUN_TEST(cli_gemini_session_hook_uses_json_for_all_sources);
     RUN_TEST(cli_gemini_installs_dedicated_graph_subagent);
     RUN_TEST(cli_antigravity_does_not_imply_gemini);
