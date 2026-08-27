@@ -2468,8 +2468,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * construction. res.strategy may carry an lsp_* value here (LSP-resolved
          * calls keep res through this point); the helper's EXPLICIT drop-list
          * leaves lsp_ts_method / lsp_cross untouched. See #606 direction. */
-        bool is_tsjs =
-            lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
+        bool is_tsjs = lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
+                       lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS;
         bool tsjs_drop_plain_call =
             cbm_tsjs_suppress_weak_method_match(is_tsjs, call->is_method, res.strategy);
 
