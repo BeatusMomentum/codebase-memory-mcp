@@ -719,6 +719,7 @@ extern void suite_pipeline(void);
 extern void suite_pipeline_semantic_manifest_repro(void);
 extern void suite_cross_repo(void);
 extern void suite_index_resilience(void);
+extern void suite_index_format(void);
 extern void suite_fqn(void);
 extern void suite_route_canon(void);
 extern void suite_path_alias(void);
@@ -984,6 +985,7 @@ int main(int argc, char **argv) {
     /* Pipeline (M8) */
     RUN_SELECTED_SUITE(registry);
     RUN_SELECTED_SUITE(pipeline);
+    RUN_SELECTED_SUITE(index_format);
     RUN_SELECTED_SUITE(pipeline_semantic_manifest_repro);
     RUN_SELECTED_SUITE(call_reference_contract);
     RUN_SELECTED_SUITE(call_reference_language_complex_contract);
