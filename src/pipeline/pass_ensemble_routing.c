@@ -74,13 +74,18 @@ typedef struct {
 static void extract_xml_attr(const char *xml, int offset, const char *attr, char *out, int outsz) {
     char needle[CBM_SZ_64];
     snprintf(needle, sizeof(needle), "%s=\"", attr);
-    const char *p = strstr(xml + offset, needle);
     out[0] = '\0';
-    if (!p)
+    const char *tag = xml + offset;
+    /* An attribute belongs to THIS tag only. Without bounding the search at the
+     * tag's closing '>', a tag that omits the attribute silently inherits it
+     * from a later tag, mispairing ClassName/Enabled across production items. */
+    const char *tag_end = strchr(tag, '>');
+    const char *p = strstr(tag, needle);
+    if (!p || (tag_end && p >= tag_end))
         return;
     p += strlen(needle);
     const char *e = strchr(p, '"');
-    if (!e)
+    if (!e || (tag_end && e >= tag_end))
         return;
     int len = (int)(e - p);
     if (len >= outsz)
@@ -128,6 +133,7 @@ static ens_prod_def_t *parse_production_xml(const char *xml, const char *class_q
         }
 
         const char *item_end = strstr(item_start, "</Item>");
+        const bool item_terminated = item_end != NULL;
         if (!item_end)
             item_end = item_start + strlen(item_start);
 
@@ -165,6 +171,10 @@ static ens_prod_def_t *parse_production_xml(const char *xml, const char *class_q
                          "settings truncated at MAX_SETTINGS cap");
         }
         def->n_items++;
+        /* item_end is the NUL terminator when the item is unterminated, so
+         * advancing by strlen("</Item>") would read past the allocation. */
+        if (!item_terminated)
+            break;
         p = item_end + 7;
     }
     /* Warn when items were truncated at the cap. */
@@ -191,8 +201,8 @@ static char *read_file(const char *full_path) {
         fclose(f);
         return NULL;
     }
-    fread(buf, 1, (size_t)sz, f);
-    buf[sz] = '\0';
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    buf[got] = '\0';
     fclose(f);
     return buf;
 }
@@ -586,7 +596,12 @@ void cbm_pipeline_pass_ensemble_routing(cbm_pipeline_ctx_t *ctx) {
                     continue;
                 char item_qn[CBM_SZ_512];
                 snprintf(item_qn, sizeof(item_qn), "%s.%s", def->production_class, item->item_name);
-                const cbm_gbuf_node_t *item_node = cbm_gbuf_find_by_qn(ctx->gbuf, item_qn);
+                /* Route nodes are keyed by the prefixed qn (see emit_async_call);
+                 * cbm_gbuf_find_by_qn is an exact hashtable lookup, so the bare
+                 * item qn never matches and every settings edge was dropped. */
+                char item_route_qn[CBM_SZ_512];
+                snprintf(item_route_qn, sizeof(item_route_qn), "__route__ensemble__%s", item_qn);
+                const cbm_gbuf_node_t *item_node = cbm_gbuf_find_by_qn(ctx->gbuf, item_route_qn);
                 if (!item_node)
                     continue;
                 if (strcmp(setting->setting_name, "TargetConfigNames") == 0) {

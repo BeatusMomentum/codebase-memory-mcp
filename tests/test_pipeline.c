@@ -12150,6 +12150,185 @@ TEST(pipeline_ensemble_routing_edges) {
     PASS();
 }
 
+TEST(pipeline_ensemble_routing_attr_does_not_leak_across_items) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_ens_attr_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("failed to create temp dir");
+
+    char path[512];
+
+    /* The first item declares no ClassName. Attribute lookup used to scan
+     * forward from the tag with no bound, so it inherited ClassName from the
+     * SECOND item and emitted a Route for an item that does not name a class,
+     * pairing it with the wrong implementation. Only the well-formed item may
+     * produce a Route. */
+    snprintf(path, sizeof(path), "%s/AttrProduction.cls", tmpdir);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        th_rmtree(tmpdir);
+        FAIL("fopen production");
+    }
+    fprintf(f, "Class MyApp.AttrProduction Extends Ens.Production\n"
+               "{\n"
+               "XData ProductionDefinition\n"
+               "{\n"
+               "<Production Name=\"MyApp.AttrProduction\">\n"
+               "  <Item Name=\"NoClass\" Enabled=\"true\">\n"
+               "  </Item>\n"
+               "  <Item Name=\"Real\" ClassName=\"MyApp.Real\" Enabled=\"true\">\n"
+               "  </Item>\n"
+               "</Production>\n"
+               "}\n"
+               "}\n");
+    fclose(f);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/ens.db", tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_node_t *routes = NULL;
+    int route_count = 0;
+    cbm_store_find_nodes_by_label(s, project, "Route", &routes, &route_count);
+    int ens_route_count = 0;
+    for (int i = 0; i < route_count; i++) {
+        if (routes[i].qualified_name &&
+            strstr(routes[i].qualified_name, "__route__ensemble__") != NULL)
+            ens_route_count++;
+    }
+    ASSERT_EQ(ens_route_count, 1);
+    cbm_store_free_nodes(routes, route_count);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(pipeline_ensemble_routing_settings_targets) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_ens_set_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("failed to create temp dir");
+
+    char path[512];
+
+    /* A production whose ONLY routing information is declarative: a
+     * TargetConfigNames setting on the router item. No class file defines
+     * SendRequestSync anywhere, so every ASYNC_CALLS edge this run produces
+     * must have come from the settings path. */
+    snprintf(path, sizeof(path), "%s/RouterProduction.cls", tmpdir);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        th_rmtree(tmpdir);
+        FAIL("fopen production");
+    }
+    fprintf(f, "Class MyApp.RouterProduction Extends Ens.Production\n"
+               "{\n"
+               "XData ProductionDefinition\n"
+               "{\n"
+               "<Production Name=\"MyApp.RouterProduction\">\n"
+               "  <Item Name=\"Router\" ClassName=\"MyApp.Router\" Enabled=\"true\">\n"
+               "    <Setting Target=\"Host\" Name=\"TargetConfigNames\">OpA,OpB</Setting>\n"
+               "  </Item>\n"
+               "  <Item Name=\"OpA\" ClassName=\"MyApp.OpA\" Enabled=\"true\">\n"
+               "  </Item>\n"
+               "  <Item Name=\"OpB\" ClassName=\"MyApp.OpB\" Enabled=\"true\">\n"
+               "  </Item>\n"
+               "</Production>\n"
+               "}\n"
+               "}\n");
+    fclose(f);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/ens.db", tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    /* Router -> OpA and Router -> OpB, both derived from TargetConfigNames.
+     * Before the Route-qn fix this was 0: the settings loop looked the source
+     * item up by its bare qn, which cbm_gbuf_find_by_qn (an exact hashtable
+     * lookup) never matches, so every edge was skipped by `continue`. */
+    int async_calls = cbm_store_count_edges_by_type(s, project, "ASYNC_CALLS");
+    ASSERT_EQ(async_calls, 2);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(pipeline_ensemble_routing_unterminated_item_is_safe) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_ens_bad_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("failed to create temp dir");
+
+    char path[512];
+
+    /* Truncated XData: an <Item that never closes. The parser used to set
+     * item_end to the buffer's NUL terminator and then advance by
+     * strlen("</Item>"), reading 7 bytes past the allocation and scanning
+     * unbounded heap from there. Under ASan this aborts the run. */
+    snprintf(path, sizeof(path), "%s/BadProduction.cls", tmpdir);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        th_rmtree(tmpdir);
+        FAIL("fopen production");
+    }
+    fprintf(f, "Class MyApp.BadProduction Extends Ens.Production\n"
+               "{\n"
+               "XData ProductionDefinition\n"
+               "{\n"
+               "<Production Name=\"MyApp.BadProduction\">\n"
+               "  <Item Name=\"Orphan\" ClassName=\"MyApp.Orphan\" Enabled=\"true\">\n"
+               "</Production>\n"
+               "}\n"
+               "}\n");
+    fclose(f);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/ens.db", tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    /* The well-formed prefix is still honoured: the item is parsed and its
+     * Route node emitted. Malformed input degrades, it does not disappear. */
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_node_t *routes = NULL;
+    int route_count = 0;
+    cbm_store_find_nodes_by_label(s, project, "Route", &routes, &route_count);
+    int ens_route_count = 0;
+    for (int i = 0; i < route_count; i++) {
+        if (routes[i].qualified_name &&
+            strstr(routes[i].qualified_name, "__route__ensemble__") != NULL)
+            ens_route_count++;
+    }
+    ASSERT_EQ(ens_route_count, 1);
+    cbm_store_free_nodes(routes, route_count);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 TEST(pipeline_ensemble_routing_method_scoping) {
     /* Verifies scan_source_for_send_targets scopes to the calling method body.
      * Two methods in the same class each route to a different operation; each
@@ -12592,6 +12771,9 @@ SUITE(pipeline) {
     /* Ensemble routing pass */
     RUN_TEST(pipeline_ensemble_routing_edges);
     RUN_TEST(pipeline_ensemble_routing_method_scoping);
+    RUN_TEST(pipeline_ensemble_routing_attr_does_not_leak_across_items);
+    RUN_TEST(pipeline_ensemble_routing_settings_targets);
+    RUN_TEST(pipeline_ensemble_routing_unterminated_item_is_safe);
 }
 
 /* Focused semantic-manifest and publication contracts. Kept separate from the
