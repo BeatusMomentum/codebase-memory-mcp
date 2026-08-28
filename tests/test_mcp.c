@@ -7956,11 +7956,11 @@ typedef struct {
     const char *file_path;
 } compare_node_spec_t;
 
-static bool compare_write_coverage(cbm_store_t *store, const char *project,
-                                   const char *generation) {
+static bool compare_write_coverage_mode(cbm_store_t *store, const char *project,
+                                        const char *generation, const char *index_mode) {
     cbm_coverage_meta_t meta = {
         .generation = generation,
-        .index_mode = "full",
+        .index_mode = index_mode,
         .recorded_at = "2026-08-28T00:00:00Z",
         .recording_status = "complete",
         .ignored_files_stored = 0,
@@ -7969,6 +7969,11 @@ static bool compare_write_coverage(cbm_store_t *store, const char *project,
         .hash_records_complete = true,
     };
     return cbm_store_coverage_replace_ex(store, project, NULL, 0, &meta) == CBM_STORE_OK;
+}
+
+static bool compare_write_coverage(cbm_store_t *store, const char *project,
+                                   const char *generation) {
+    return compare_write_coverage_mode(store, project, generation, "full");
 }
 
 static bool compare_write_fixture_store(const char *path, const char *project, bool target) {
@@ -8248,10 +8253,11 @@ static bool compare_write_single_node_store(const char *path, const char *projec
 }
 
 static bool compare_write_identity_store(const char *path, const char *project,
-                                         const char *generation, const char *source_qn,
-                                         const char *source_label, const char *source_file,
-                                         const char *target_qn, const char *target_label,
-                                         const char *target_file, const char *edge_type) {
+                                         const char *generation, const char *index_mode,
+                                         const char *source_qn, const char *source_label,
+                                         const char *source_file, const char *target_qn,
+                                         const char *target_label, const char *target_file,
+                                         const char *edge_type) {
     cbm_store_t *store = cbm_store_open_path(path);
     if (!store ||
         cbm_store_upsert_project(store, project, "/tmp/compare-identity-525") != CBM_STORE_OK) {
@@ -8296,7 +8302,7 @@ static bool compare_write_identity_store(const char *path, const char *project,
         };
         ok = cbm_store_insert_edge(store, &edge) > 0;
     }
-    ok = ok && compare_write_coverage(store, project, generation) &&
+    ok = ok && compare_write_coverage_mode(store, project, generation, index_mode) &&
          cbm_store_prepare_for_publish(store) == CBM_STORE_OK;
     cbm_store_close(store);
     return ok;
@@ -8309,10 +8315,10 @@ TEST(tool_compare_graphs_normalizes_legacy_path_separators_issue525) {
     char target_path[768];
     snprintf(base_path, sizeof(base_path), "%s/sepbase525.db", fixture.cache);
     snprintf(target_path, sizeof(target_path), "%s/septarget525.db", fixture.cache);
-    ASSERT_TRUE(compare_write_identity_store(base_path, "sepbase525", "sep-base", "pkg.source",
-                                             "Function", "src\\same.c", "pkg.target", "Function",
-                                             "src\\target.c", "CALLS"));
-    ASSERT_TRUE(compare_write_identity_store(target_path, "septarget525", "sep-target",
+    ASSERT_TRUE(compare_write_identity_store(base_path, "sepbase525", "sep-base", "full",
+                                             "pkg.source", "Function", "src\\same.c", "pkg.target",
+                                             "Function", "src\\target.c", "CALLS"));
+    ASSERT_TRUE(compare_write_identity_store(target_path, "septarget525", "sep-target", "full",
                                              "pkg.source", "Function", "src/same.c", "pkg.target",
                                              "Function", "src/target.c", "CALLS"));
 
@@ -8358,6 +8364,14 @@ TEST(tool_compare_graphs_sanitizes_legacy_invalid_utf8_issue525) {
                                            "bad.c";
     static const char replacement_type[] = "\xEF\xBF\xBD"
                                            "EDGE";
+    static const char invalid_generation[] = "utf-\xFF"
+                                             "generation";
+    static const char invalid_index_mode[] = "\xFE"
+                                             "full";
+    static const char replacement_generation[] = "utf-\xEF\xBF\xBD"
+                                                 "generation";
+    static const char replacement_index_mode[] = "\xEF\xBF\xBD"
+                                                 "full";
 
     compare_graphs_fixture_t fixture;
     ASSERT_TRUE(compare_graphs_fixture_open(&fixture));
@@ -8365,11 +8379,11 @@ TEST(tool_compare_graphs_sanitizes_legacy_invalid_utf8_issue525) {
     char target_path[768];
     snprintf(base_path, sizeof(base_path), "%s/utfbase525.db", fixture.cache);
     snprintf(target_path, sizeof(target_path), "%s/utftarget525.db", fixture.cache);
-    ASSERT_TRUE(compare_write_identity_store(base_path, "utfbase525", "utf-base", NULL, NULL, NULL,
-                                             NULL, NULL, NULL, NULL));
-    ASSERT_TRUE(compare_write_identity_store(target_path, "utftarget525", "utf-target", invalid_qn,
-                                             invalid_label, invalid_file, safe_qn, "Function",
-                                             "src/sink.c", invalid_type));
+    ASSERT_TRUE(compare_write_identity_store(base_path, "utfbase525", "utf-base", "full", NULL,
+                                             NULL, NULL, NULL, NULL, NULL, NULL));
+    ASSERT_TRUE(compare_write_identity_store(
+        target_path, "utftarget525", invalid_generation, invalid_index_mode, invalid_qn,
+        invalid_label, invalid_file, safe_qn, "Function", "src/sink.c", invalid_type));
 
     cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(server);
@@ -8384,6 +8398,9 @@ TEST(tool_compare_graphs_sanitizes_legacy_invalid_utf8_issue525) {
     yyjson_doc *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
     ASSERT_NOT_NULL(doc);
     yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *target = yyjson_obj_get(root, "target");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(target, "generation")), replacement_generation);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(target, "index_mode")), replacement_index_mode);
     yyjson_val *items =
         yyjson_obj_get(yyjson_obj_get(yyjson_obj_get(root, "nodes"), "added"), "items");
     bool found_node = false;
@@ -8481,6 +8498,52 @@ TEST(tool_compare_graphs_midscan_cancel_restores_store_state_issue525) {
     ASSERT_NOT_NULL(success);
     ASSERT_NOT_NULL(strstr(success, "\"isError\":false"));
     free(success);
+    cbm_mcp_server_free(server);
+    ASSERT_TRUE(compare_graphs_fixture_close(&fixture));
+    PASS();
+}
+
+TEST(tool_compare_graphs_progress_cancel_clears_handler_issue525) {
+    compare_graphs_fixture_t fixture;
+    ASSERT_TRUE(compare_graphs_fixture_open(&fixture));
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(server);
+
+    cbm_store_compare_test_cancel_from_progress(true);
+    char *cancelled = compare_graphs_call(server, NULL);
+    ASSERT_NOT_NULL(cancelled);
+    ASSERT_NOT_NULL(strstr(cancelled, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(cancelled, "cancelled"));
+    char *inner = extract_text_content(cancelled);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, "\"nodes\""));
+    free(inner);
+    free(cancelled);
+
+    cbm_store_t *base_store = cbm_store_open_path_query(fixture.base_path);
+    cbm_store_t *target_store = cbm_store_open_path_query(fixture.target_path);
+    ASSERT_NOT_NULL(base_store);
+    ASSERT_NOT_NULL(target_store);
+    cbm_graph_compare_result_t result = {0};
+    ASSERT_EQ(cbm_store_compare_graphs(base_store, "base525", target_store, "target525", 100, NULL,
+                                       NULL, NULL, NULL, &result),
+              CBM_STORE_CANCELLED);
+    ASSERT_EQ(result.nodes_added_total, 0);
+    ASSERT_EQ(result.nodes_removed_total, 0);
+    ASSERT_EQ(result.edges_added_total, 0);
+    ASSERT_EQ(result.edges_removed_total, 0);
+
+    static const char expensive_query[] =
+        "WITH RECURSIVE sequence(value) AS (VALUES(0) UNION ALL "
+        "SELECT value+1 FROM sequence WHERE value<5000) SELECT sum(value) FROM sequence;";
+    int base_query_rc = cbm_store_exec(base_store, expensive_query);
+    int target_query_rc = cbm_store_exec(target_store, expensive_query);
+    cbm_store_compare_test_cancel_from_progress(false);
+    cbm_store_close(target_store);
+    cbm_store_close(base_store);
+    ASSERT_EQ(base_query_rc, CBM_STORE_OK);
+    ASSERT_EQ(target_query_rc, CBM_STORE_OK);
+
     cbm_mcp_server_free(server);
     ASSERT_TRUE(compare_graphs_fixture_close(&fixture));
     PASS();
@@ -12295,6 +12358,7 @@ SUITE(mcp) {
     RUN_TEST(tool_compare_graphs_sanitizes_legacy_invalid_utf8_issue525);
     RUN_TEST(tool_compare_graphs_bind_failures_are_atomic_issue525);
     RUN_TEST(tool_compare_graphs_midscan_cancel_restores_store_state_issue525);
+    RUN_TEST(tool_compare_graphs_progress_cancel_clears_handler_issue525);
     RUN_TEST(tool_compare_graphs_enforces_encoded_budget_issue525);
     RUN_TEST(tool_compare_graphs_validation_and_scan_cap_are_atomic_issue525);
     RUN_TEST(tool_compare_graphs_cancel_and_readonly_handles_release_issue525);

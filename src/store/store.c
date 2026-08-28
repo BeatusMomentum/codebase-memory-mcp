@@ -1213,7 +1213,10 @@ int cbm_store_rollback(cbm_store_t *s) {
 typedef struct {
     cbm_graph_compare_cancel_fn cancel;
     void *context;
+    bool progress_cancelled;
 } graph_compare_progress_t;
+
+enum { GRAPH_COMPARE_PROGRESS_INTERVAL = 1000 };
 
 typedef struct {
     sqlite3_stmt *stmt;
@@ -1230,6 +1233,7 @@ typedef struct {
 #ifdef CBM_ENABLE_TEST_SEAMS
 static atomic_int graph_compare_test_bind_countdown = ATOMIC_VAR_INIT(CBM_NOT_FOUND);
 static atomic_int graph_compare_test_cancel_countdown = ATOMIC_VAR_INIT(CBM_NOT_FOUND);
+static atomic_bool graph_compare_test_progress_cancel = ATOMIC_VAR_INIT(false);
 
 void cbm_store_compare_test_fail_bind_after(int successful_binds) {
     atomic_store(&graph_compare_test_bind_countdown, successful_binds);
@@ -1237,6 +1241,10 @@ void cbm_store_compare_test_fail_bind_after(int successful_binds) {
 
 void cbm_store_compare_test_cancel_after(int successful_checks) {
     atomic_store(&graph_compare_test_cancel_countdown, successful_checks);
+}
+
+void cbm_store_compare_test_cancel_from_progress(bool enabled) {
+    atomic_store(&graph_compare_test_progress_cancel, enabled);
 }
 
 static bool graph_compare_test_countdown_fires(atomic_int *countdown) {
@@ -1261,7 +1269,25 @@ static bool graph_compare_is_cancelled(const graph_compare_progress_t *progress)
 }
 
 static int graph_compare_progress(void *context) {
-    return graph_compare_is_cancelled((const graph_compare_progress_t *)context) ? 1 : 0;
+    graph_compare_progress_t *progress = (graph_compare_progress_t *)context;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (atomic_load(&graph_compare_test_progress_cancel)) {
+        progress->progress_cancelled = true;
+        return true;
+    }
+#endif
+    bool cancelled = graph_compare_is_cancelled(progress);
+    progress->progress_cancelled = cancelled;
+    return cancelled;
+}
+
+static int graph_compare_progress_interval(void) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (atomic_load(&graph_compare_test_progress_cancel)) {
+        return 1;
+    }
+#endif
+    return GRAPH_COMPARE_PROGRESS_INTERVAL;
 }
 
 static int graph_compare_bind_text(sqlite3_stmt *stmt, int column, const char *value) {
@@ -1594,8 +1620,10 @@ int cbm_store_compare_graphs(cbm_store_t *base_store, const char *base_project,
     int rc = CBM_STORE_OK;
     bool base_transaction = false;
     bool target_transaction = false;
-    sqlite3_progress_handler(base_store->db, 1000, graph_compare_progress, &progress);
-    sqlite3_progress_handler(target_store->db, 1000, graph_compare_progress, &progress);
+    int progress_interval = graph_compare_progress_interval();
+    sqlite3_progress_handler(base_store->db, progress_interval, graph_compare_progress, &progress);
+    sqlite3_progress_handler(target_store->db, progress_interval, graph_compare_progress,
+                             &progress);
 
     rc = exec_sql(base_store, "BEGIN;");
     if (rc == CBM_STORE_OK) {
@@ -1622,10 +1650,12 @@ int cbm_store_compare_graphs(cbm_store_t *base_store, const char *base_project,
         rc = graph_compare_edges(base_store, base_project, target_store, target_project, &progress,
                                  on_edge, out);
     }
-    if (rc == CBM_STORE_OK && graph_compare_is_cancelled(&progress)) {
+    if (rc == CBM_STORE_OK &&
+        (progress.progress_cancelled || graph_compare_is_cancelled(&progress))) {
         rc = CBM_STORE_CANCELLED;
     }
-    if (rc != CBM_STORE_OK && graph_compare_is_cancelled(&progress)) {
+    if (rc != CBM_STORE_OK &&
+        (progress.progress_cancelled || graph_compare_is_cancelled(&progress))) {
         rc = CBM_STORE_CANCELLED;
     }
 

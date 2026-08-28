@@ -3022,8 +3022,8 @@ static yyjson_mut_val *compare_project_json(yyjson_mut_doc *doc, const char *pro
                                             const cbm_graph_compare_project_t *metadata) {
     yyjson_mut_val *object = yyjson_mut_obj(doc);
     if (!object || !yyjson_mut_obj_add_strcpy(doc, object, "project", project) ||
-        !yyjson_mut_obj_add_strcpy(doc, object, "generation", metadata->generation) ||
-        !yyjson_mut_obj_add_strcpy(doc, object, "index_mode", metadata->index_mode) ||
+        !compare_add_identity_string(doc, object, "generation", metadata->generation) ||
+        !compare_add_identity_string(doc, object, "index_mode", metadata->index_mode) ||
         !yyjson_mut_obj_add_sint(doc, object, "node_count", metadata->node_count) ||
         !yyjson_mut_obj_add_sint(doc, object, "edge_count", metadata->edge_count)) {
         return NULL;

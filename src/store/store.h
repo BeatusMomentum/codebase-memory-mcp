@@ -317,6 +317,7 @@ int cbm_store_compare_graphs(cbm_store_t *base_store, const char *base_project,
  * the seam. */
 void cbm_store_compare_test_fail_bind_after(int successful_binds);
 void cbm_store_compare_test_cancel_after(int successful_checks);
+void cbm_store_compare_test_cancel_from_progress(bool enabled);
 #endif
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
