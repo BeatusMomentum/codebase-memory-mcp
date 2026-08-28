@@ -210,6 +210,18 @@ const GrammarCase CBM_GRAMMAR_CASES[] = {
      "  Row() {}\n}\n",
      2,
      {"Card", "build", "rowCard"}},
+    {"plsql",
+     CBM_LANG_PLSQL,
+     "emp_pkg.pkb",
+     "CREATE OR REPLACE PACKAGE BODY emp_pkg AS\n"
+     "  FUNCTION hire(p_name VARCHAR2) RETURN NUMBER IS\n"
+     "  BEGIN\n"
+     "    RETURN util_pkg.calc_salary(p_name);\n"
+     "  END;\n"
+     "END emp_pkg;\n"
+     "/\n",
+     2,
+     {"emp_pkg", "hire", NULL}},
     {"smali",
      CBM_LANG_SMALI,
      "A.smali",
