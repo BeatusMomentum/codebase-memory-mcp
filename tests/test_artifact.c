@@ -11,6 +11,8 @@
 
 #include <sys/stat.h>
 #include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
@@ -397,6 +399,9 @@ TEST(artifact_null_safety) {
     ASSERT_NEQ(cbm_artifact_import("/tmp", NULL), 0);
     ASSERT_FALSE(cbm_artifact_exists(NULL));
     ASSERT_NULL(cbm_artifact_commit(NULL));
+    ASSERT_EQ(cbm_artifact_reconcile_hashes(NULL, "/tmp/x.db", "p"), -1);
+    ASSERT_EQ(cbm_artifact_reconcile_hashes("/tmp", NULL, "p"), -1);
+    ASSERT_EQ(cbm_artifact_reconcile_hashes("/tmp", "/tmp/x.db", NULL), -1);
     PASS();
 }
 
@@ -543,6 +548,404 @@ TEST(store_deep_integrity_detects_page_corruption) {
     PASS();
 }
 
+
+/* ── Bootstrap reconciliation ─────────────────────────────────────────────────
+ *
+ * Ported from the contributor's stack (#868). Every git command below uses
+ * DOUBLE quotes, matching the production rule stated in artifact.c: cmd.exe
+ * does not honor single quotes, so `git -C '%s'` breaks on Windows. The same
+ * rule that fixes production applies to this harness. */
+
+/* printf-formatted system() wrapper; returns the exit status. */
+static int runf(const char *fmt, ...) {
+    char cmd[4096];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(cmd, sizeof(cmd), fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= sizeof(cmd)) {
+        return -1;
+    }
+    return system(cmd);
+}
+
+static void git_init(const char *repo) {
+    runf("git -C \"%s\" init -q", repo);
+    runf("git -C \"%s\" config user.email t@t.com", repo);
+    runf("git -C \"%s\" config user.name t", repo);
+    runf("git -C \"%s\" config commit.gpgsign false", repo);
+}
+
+/* Portable local mtime_ns for assertions (mirrors artifact.c's art_stat_mtime_ns
+ * and pipeline_incremental.c's stat_mtime_ns — all three must agree or a
+ * restamped row would never match the incremental classifier). */
+static int64_t t_mtime_ns(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        return -1;
+    }
+#ifdef __APPLE__
+    return (int64_t)st.st_mtimespec.tv_sec * 1000000000LL + (int64_t)st.st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    return (int64_t)st.st_mtime * 1000000000LL;
+#else
+    return (int64_t)st.st_mtim.tv_sec * 1000000000LL + (int64_t)st.st_mtim.tv_nsec;
+#endif
+}
+
+/* True iff <repo>/.codebase-memory/artifact.json contains substr. */
+static bool meta_contains(const char *repo, const char *substr) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/.codebase-memory/artifact.json", repo);
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        return false;
+    }
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    buf[n] = '\0';
+    return strstr(buf, substr) != NULL;
+}
+
+static int64_t row_mtime(cbm_file_hash_t *rows, int n, const char *rel) {
+    for (int i = 0; i < n; i++) {
+        if (strcmp(rows[i].rel_path, rel) == 0) {
+            return rows[i].mtime_ns;
+        }
+    }
+    return -1;
+}
+
+/* Overwrite one file_hashes row's mtime with a caller-chosen sentinel.
+ * Tests assert against this sentinel rather than against "a different
+ * wall-clock time": on Windows mtime_ns has ONE-SECOND resolution, so two
+ * writes in the same second are indistinguishable and an inequality
+ * assertion would be a coin flip (O9 — a verdict must not depend on
+ * filesystem timestamp granularity). */
+static bool stamp_row_mtime(const char *db, const char *proj, const char *rel, int64_t sentinel,
+                            const char *sha) {
+    cbm_store_t *s = cbm_store_open_path(db);
+    if (!s) {
+        return false;
+    }
+    int rc = cbm_store_upsert_file_hash(s, proj, rel, sha ? sha : "", sentinel, 1);
+    cbm_store_close(s);
+    return rc == CBM_STORE_OK;
+}
+
+/* Build a git repo at g_repo with 5 .rs files, full-index + export (clean tree
+ * -> reconcile_basis marker set), and commit .codebase-memory so a clone receives
+ * the artifact. Returns the derived project name (caller frees) or NULL. */
+static char *build_trusted_artifact_repo(void) {
+    git_init(g_repo);
+    const char *names[] = {"a.rs", "b.rs", "c.rs", "d.rs", "e.rs"};
+    for (int i = 0; i < 5; i++) {
+        char p[1024];
+        snprintf(p, sizeof(p), "%s/%s", g_repo, names[i]);
+        char body[128];
+        snprintf(body, sizeof(body), "pub fn f%d() {}\n", i);
+        write_text_file(p, body);
+    }
+    if (runf("git -C \"%s\" add -A && git -C \"%s\" commit -qm init", g_repo, g_repo) != 0) {
+        return NULL;
+    }
+    cbm_pipeline_t *p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    if (!p) {
+        return NULL;
+    }
+    cbm_pipeline_set_persistence(p, true);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    if (rc != 0) {
+        return NULL;
+    }
+    /* Clean source tree at export -> marker must be present. */
+    if (!meta_contains(g_repo, "\"reconcile_basis\"")) {
+        return NULL;
+    }
+    if (runf("git -C \"%s\" add -A && git -C \"%s\" commit -qm artifact", g_repo, g_repo) != 0) {
+        return NULL;
+    }
+    return cbm_project_name_from_path(g_repo);
+}
+
+/* Clones g_repo (A) into <tmp>/work/repo (B) so both share the basename "repo"
+ * and thus the derived project name — required for artifact bootstrap. */
+static bool clone_to_b(char *repoB_out, size_t repoB_sz) {
+    char work[1024];
+    snprintf(work, sizeof(work), "%s/work", g_tmpdir);
+    cbm_mkdir_p(work, 0755);
+    snprintf(repoB_out, repoB_sz, "%s/repo", work);
+    return runf("git clone -q \"%s\" \"%s\"", g_repo, repoB_out) == 0;
+}
+
+TEST(artifact_export_marks_clean_basis) {
+    setup_artifact_test();
+    git_init(g_repo);
+    char src[1024];
+    snprintf(src, sizeof(src), "%s/a.rs", g_repo);
+    write_text_file(src, "pub fn f0() {}\n");
+    ASSERT_EQ(runf("git -C \"%s\" add -A && git -C \"%s\" commit -qm init", g_repo, g_repo), 0);
+
+    char *proj = cbm_project_name_from_path(g_repo);
+    ASSERT_NOT_NULL(proj);
+
+    /* Full index + export on a clean source tree -> clean-basis marker set.
+     * This assert is the one that failed on Windows CI for the original patch:
+     * the single-quoted `:(exclude)` pathspec made tree_clean_for_reconcile
+     * always report dirty under cmd.exe, so the marker was never written. It is
+     * a PRODUCTION assert, not a harness artifact. */
+    cbm_pipeline_t *p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_persistence(p, true);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    ASSERT(meta_contains(g_repo, "\"reconcile_basis\""));
+
+    /* Dirty the source tree (uncommitted edit). Re-export must omit the marker:
+     * the tree is non-clean outside .codebase-memory (and the a.rs hash row no
+     * longer matches disk). */
+    write_text_file(src, "pub fn dirty() {}\n");
+    ASSERT_EQ(cbm_artifact_export(g_db, g_repo, proj, CBM_ARTIFACT_FAST), 0);
+    ASSERT_FALSE(meta_contains(g_repo, "\"reconcile_basis\""));
+
+    free(proj);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+TEST(artifact_reconcile_restamps_unchanged) {
+    setup_artifact_test();
+    char *proj = build_trusted_artifact_repo();
+    ASSERT_NOT_NULL(proj);
+
+    char repoB[1024];
+    ASSERT(clone_to_b(repoB, sizeof(repoB)));
+
+    /* B: modify 2 files + add 1, commit. (Clone gave B fresh mtimes.) */
+    char m1[1152], m2[1152], add[1152];
+    snprintf(m1, sizeof(m1), "%s/a.rs", repoB);
+    snprintf(m2, sizeof(m2), "%s/b.rs", repoB);
+    snprintf(add, sizeof(add), "%s/added.rs", repoB);
+    write_text_file(m1, "pub fn f0() { /* changed */ }\n");
+    write_text_file(m2, "pub fn f1() { /* changed */ }\n");
+    write_text_file(add, "pub fn new_fn() {}\n");
+    ASSERT_EQ(runf("git -C \"%s\" add -A && git -C \"%s\" commit -qm edits", repoB, repoB), 0);
+
+    /* Import A's artifact into a fresh cache DB for B. */
+    char dbB[1152];
+    snprintf(dbB, sizeof(dbB), "%s/b.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(repoB, dbB), 0);
+
+    /* Pin a.rs's row to a sentinel so "changed rows stay foreign" is a
+     * deterministic assertion instead of an mtime-granularity race. */
+    const int64_t foreign_mtime = 12345;
+    ASSERT(stamp_row_mtime(dbB, proj, "a.rs", foreign_mtime, ""));
+
+    /* Reconcile: 5 rows; a.rs+b.rs changed (left foreign), 3 unchanged restamped. */
+    int restamped = cbm_artifact_reconcile_hashes(repoB, dbB, proj);
+    ASSERT_EQ(restamped, 3);
+
+    /* Unchanged row (c.rs) now carries B's local mtime; the changed row (a.rs)
+     * still carries its foreign stamp — untouched. */
+    cbm_store_t *s = cbm_store_open_path(dbB);
+    ASSERT_NOT_NULL(s);
+    cbm_file_hash_t *rows = NULL;
+    int n = 0;
+    ASSERT_EQ(cbm_store_get_file_hashes(s, proj, &rows, &n), 0);
+    char c_path[1152];
+    snprintf(c_path, sizeof(c_path), "%s/c.rs", repoB);
+    ASSERT_EQ(row_mtime(rows, n, "c.rs"), t_mtime_ns(c_path));
+    ASSERT_EQ(row_mtime(rows, n, "a.rs"), foreign_mtime);
+    cbm_store_free_file_hashes(rows, n);
+    cbm_store_close(s);
+
+    free(proj);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+TEST(artifact_reconcile_skips_untracked_rows) {
+    setup_artifact_test();
+    char *proj = build_trusted_artifact_repo();
+    ASSERT_NOT_NULL(proj);
+    char repoB[1024];
+    ASSERT(clone_to_b(repoB, sizeof(repoB)));
+
+    /* B: a gitignored-yet-indexed file (the .cbmignore-negation shape, #500).
+     * git diff/ls-files are both blind to it, so without the tracked-at-commit
+     * gate it would be restamped as "unchanged" even though git cannot vouch
+     * for its content. */
+    char gen[1152], gi[1152];
+    snprintf(gen, sizeof(gen), "%s/gen.rs", repoB);
+    snprintf(gi, sizeof(gi), "%s/.gitignore", repoB);
+    write_text_file(gen, "pub fn generated_local() {}\n");
+    write_text_file(gi, "gen.rs\n");
+    ASSERT_EQ(runf("git -C \"%s\" add .gitignore && git -C \"%s\" commit -qm ignore", repoB, repoB),
+              0);
+
+    char dbB[1152];
+    snprintf(dbB, sizeof(dbB), "%s/b.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(repoB, dbB), 0);
+
+    /* Simulate the exporter having indexed gen.rs: insert a foreign-mtime row. */
+    const int64_t foreign_mtime = 12345;
+    ASSERT(stamp_row_mtime(dbB, proj, "gen.rs", foreign_mtime, ""));
+
+    /* Reconcile: the 5 tracked unchanged rows restamp; gen.rs must not. */
+    ASSERT_EQ(cbm_artifact_reconcile_hashes(repoB, dbB, proj), 5);
+
+    cbm_store_t *s = cbm_store_open_path(dbB);
+    ASSERT_NOT_NULL(s);
+    cbm_file_hash_t *rows = NULL;
+    int n = 0;
+    ASSERT_EQ(cbm_store_get_file_hashes(s, proj, &rows, &n), CBM_STORE_OK);
+    ASSERT_EQ(row_mtime(rows, n, "gen.rs"), foreign_mtime);
+    char c_path[1152];
+    snprintf(c_path, sizeof(c_path), "%s/c.rs", repoB);
+    ASSERT_EQ(row_mtime(rows, n, "c.rs"), t_mtime_ns(c_path));
+    cbm_store_free_file_hashes(rows, n);
+    cbm_store_close(s);
+
+    free(proj);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+TEST(artifact_reconcile_skips_untrusted_metadata) {
+    setup_artifact_test();
+    char *proj = build_trusted_artifact_repo();
+    ASSERT_NOT_NULL(proj);
+    char repoB[1024];
+    ASSERT(clone_to_b(repoB, sizeof(repoB)));
+
+    char dbB[1152];
+    snprintf(dbB, sizeof(dbB), "%s/b.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(repoB, dbB), 0);
+
+    /* Snapshot one foreign mtime, then strip the trust marker. */
+    cbm_store_t *s = cbm_store_open_path(dbB);
+    ASSERT_NOT_NULL(s);
+    cbm_file_hash_t *rows = NULL;
+    int n = 0;
+    ASSERT_EQ(cbm_store_get_file_hashes(s, proj, &rows, &n), CBM_STORE_OK);
+    int64_t before = row_mtime(rows, n, "c.rs");
+    cbm_store_free_file_hashes(rows, n);
+    cbm_store_close(s);
+
+    char meta[1152];
+    snprintf(meta, sizeof(meta), "%s/.codebase-memory/artifact.json", repoB);
+    /* Rewrite artifact.json without reconcile_basis (schema_version preserved). */
+    FILE *fp = fopen(meta, "w");
+    ASSERT_NOT_NULL(fp);
+    fprintf(fp, "{\"schema_version\":2,\"commit\":\"deadbeef\","
+                "\"original_size\":1000,\"indexed_at\":\"2026-01-01T00:00:00Z\"}");
+    fclose(fp);
+
+    ASSERT_EQ(cbm_artifact_reconcile_hashes(repoB, dbB, proj), -1);
+
+    /* Rows untouched: still the foreign value captured before. */
+    s = cbm_store_open_path(dbB);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_get_file_hashes(s, proj, &rows, &n), CBM_STORE_OK);
+    ASSERT_EQ(row_mtime(rows, n, "c.rs"), before);
+    cbm_store_free_file_hashes(rows, n);
+    cbm_store_close(s);
+
+    free(proj);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+TEST(artifact_reconcile_skips_unknown_commit) {
+    setup_artifact_test();
+    char *proj = build_trusted_artifact_repo();
+    ASSERT_NOT_NULL(proj);
+    char repoB[1024];
+    ASSERT(clone_to_b(repoB, sizeof(repoB)));
+
+    char dbB[1152];
+    snprintf(dbB, sizeof(dbB), "%s/b.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(repoB, dbB), 0);
+
+    /* Rewrite artifact.json: keep the marker but point commit at a hex-valid
+     * SHA that does not exist locally -> the object-existence gate fails. */
+    char meta[1152];
+    snprintf(meta, sizeof(meta), "%s/.codebase-memory/artifact.json", repoB);
+    FILE *fp = fopen(meta, "w");
+    ASSERT_NOT_NULL(fp);
+    fprintf(fp,
+            "{\"schema_version\":2,\"commit\":\"%s\","
+            "\"original_size\":1000,\"reconcile_basis\":\"git-clean-head\"}",
+            "1111111111111111111111111111111111111111");
+    fclose(fp);
+
+    ASSERT_EQ(cbm_artifact_reconcile_hashes(repoB, dbB, proj), -1);
+
+    free(proj);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+TEST(artifact_reconcile_skips_non_hex_commit) {
+    setup_artifact_test();
+    char *proj = build_trusted_artifact_repo();
+    ASSERT_NOT_NULL(proj);
+    char repoB[1024];
+    ASSERT(clone_to_b(repoB, sizeof(repoB)));
+
+    char dbB[1152];
+    snprintf(dbB, sizeof(dbB), "%s/b.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(repoB, dbB), 0);
+
+    /* A commit field carrying shell metacharacters must never reach a command
+     * string: is_hex_oid is the hard gate in front of every interpolation. */
+    char meta[1152];
+    snprintf(meta, sizeof(meta), "%s/.codebase-memory/artifact.json", repoB);
+    FILE *fp = fopen(meta, "w");
+    ASSERT_NOT_NULL(fp);
+    fprintf(fp, "{\"schema_version\":2,\"commit\":\"a$(touch pwned)b\","
+                "\"original_size\":1000,\"reconcile_basis\":\"git-clean-head\"}");
+    fclose(fp);
+
+    ASSERT_EQ(cbm_artifact_reconcile_hashes(repoB, dbB, proj), -1);
+
+    char pwned[1152];
+    snprintf(pwned, sizeof(pwned), "%s/pwned", repoB);
+    struct stat st;
+    ASSERT_NEQ(stat(pwned, &st), 0);
+
+    free(proj);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+TEST(artifact_reconcile_skips_without_git) {
+    setup_artifact_test();
+    char *proj = build_trusted_artifact_repo();
+    ASSERT_NOT_NULL(proj);
+    char repoB[1024];
+    ASSERT(clone_to_b(repoB, sizeof(repoB)));
+
+    char dbB[1152];
+    snprintf(dbB, sizeof(dbB), "%s/b.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(repoB, dbB), 0);
+
+    /* Disable the repo by renaming .git (portable; `rm -rf` is not a cmd.exe
+     * builtin). Marker + commit still present, but every git call now fails. */
+    char gitdir[1152], disabled[1152];
+    snprintf(gitdir, sizeof(gitdir), "%s/.git", repoB);
+    snprintf(disabled, sizeof(disabled), "%s/.git-disabled", repoB);
+    ASSERT_EQ(cbm_rename_replace(gitdir, disabled), 0);
+
+    ASSERT_EQ(cbm_artifact_reconcile_hashes(repoB, dbB, proj), -1);
+
+    free(proj);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
 SUITE(artifact) {
     RUN_TEST(artifact_fast_export_snapshots_live_wal_store);
     RUN_TEST(store_deep_integrity_detects_page_corruption);
@@ -560,4 +963,11 @@ SUITE(artifact) {
     RUN_TEST(pipeline_persistence_export_failure_returns_error);
     RUN_TEST(artifact_import_rejects_size_mismatch);
     RUN_TEST(artifact_null_safety);
+    RUN_TEST(artifact_export_marks_clean_basis);
+    RUN_TEST(artifact_reconcile_restamps_unchanged);
+    RUN_TEST(artifact_reconcile_skips_untracked_rows);
+    RUN_TEST(artifact_reconcile_skips_untrusted_metadata);
+    RUN_TEST(artifact_reconcile_skips_unknown_commit);
+    RUN_TEST(artifact_reconcile_skips_non_hex_commit);
+    RUN_TEST(artifact_reconcile_skips_without_git);
 }
