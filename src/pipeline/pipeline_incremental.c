@@ -1456,6 +1456,20 @@ static int run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_file
             return rc < 0 ? rc : CBM_NOT_FOUND;
         }
     }
+
+    /* Importance last, in EVERY mode — same ordering rule as the full path:
+     * it reads CALLS/USAGE (re-extraction, above) and TESTS (pass_tests, first
+     * in this function). The graph here is the rehydrated whole-project buffer,
+     * so nodes outside the changed set already carry an "importance" key from
+     * the previous run; cbm_pipeline_importance_append_prop overwrites it in
+     * place rather than appending a duplicate. */
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+    cbm_pipeline_pass_importance(ctx);
+    cbm_log_info("pass.timing", "pass", "incr_importance", "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(t)));
+    if (cbm_pipeline_check_cancel(ctx)) {
+        return CBM_NOT_FOUND;
+    }
     return 0;
 }
 /* Publish the test-only legacy partial result through the same atomic

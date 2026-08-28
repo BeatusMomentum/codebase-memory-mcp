@@ -630,6 +630,31 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx);
  * cycles (recursive). Runs on the graph buffer before the dump. */
 void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx);
 
+/* Pre-dump pass: per-symbol importance score (weighted degree).
+ *   importance = sqrt(num_refs) * priv * generic * distinct * test_penalty
+ * Stored as a numeric "importance" key inside the node's EXISTING
+ * properties_json — no schema change and no index-format bump; indexes written
+ * by older builds simply lack the key and consumers must tolerate its absence.
+ * MUST run after pass_tests and after CALLS/USAGE extraction — a pass ordered
+ * earlier would see zero TESTS edges and num_refs = 0 everywhere. It is
+ * therefore registered last in run_predump_passes and last in the incremental
+ * post-pass sequence. */
+void cbm_pipeline_pass_importance(cbm_pipeline_ctx_t *ctx);
+
+/* Write the numeric "importance" key into a node's properties JSON object.
+ * IDEMPOTENT: an existing key is overwritten in place, never appended twice —
+ * the incremental path re-scores nodes rehydrated from the store that already
+ * carry the key. Non-static so the idempotence contract is directly testable. */
+void cbm_pipeline_importance_append_prop(cbm_gbuf_node_t *node, double score);
+
+/* Work counters for the importance pass (pass_importance.c). Deltas are read
+ * by the complexity suite's linearity gate; never reset by the pass itself, so
+ * nested/repeated runs compose. g_importance_name_visits counts same-name-group
+ * member visits during distinct-file counting — the quantity that goes
+ * superlinear if the per-distinct-name memoization is ever lost. */
+extern _Atomic uint64_t g_importance_nodes;
+extern _Atomic uint64_t g_importance_name_visits;
+
 /* ── Env URL scanner (pass_envscan.c) ────────────────────────────── */
 
 typedef struct {
