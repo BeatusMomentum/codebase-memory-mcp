@@ -2285,19 +2285,19 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
             cbm_store_close(srv->store);
             srv->store = NULL;
             srv->store = cbm_store_open_path_query(path);
-            cbm_integrity_verdict_t verdict =
-                srv->store ? cbm_store_check_integrity_verdict(srv->store)
-                           : CBM_INTEGRITY_TRANSIENT;
+            cbm_integrity_verdict_t verdict = srv->store
+                                                  ? cbm_store_check_integrity_verdict(srv->store)
+                                                  : CBM_INTEGRITY_TRANSIENT;
             if (srv->store) {
                 cbm_store_close(srv->store);
                 srv->store = NULL;
             }
             if (verdict == CBM_INTEGRITY_CORRUPT) {
                 srv->readonly_resolve_hit_corrupt = true;
-                snprintf(srv->readonly_corrupt_project,
-                         sizeof(srv->readonly_corrupt_project), "%s", project);
-                cbm_log_warn("store.corrupt_readonly", "project", project, "path", path,
-                             "action", "left in place for a write-side rebuild");
+                snprintf(srv->readonly_corrupt_project, sizeof(srv->readonly_corrupt_project), "%s",
+                         project);
+                cbm_log_warn("store.corrupt_readonly", "project", project, "path", path, "action",
+                             "left in place for a write-side rebuild");
                 if (recovery_status) {
                     *recovery_status = STORE_RECOVERY_CORRUPT;
                 }
@@ -2555,15 +2555,15 @@ static char *build_no_store_error_checked(cbm_mcp_server_t *srv, const char *pro
 }
 
 /* Bail with the right error when no store is available. */
-#define REQUIRE_STORE(store, project)                                                    \
-    do {                                                                                 \
-        if (!(store)) {                                                                  \
-            char *_err = build_no_store_error_checked(srv, project);                     \
-            char *_res = cbm_mcp_text_result(_err, true);                                \
-            free(_err);                                                                  \
-            free(project);                                                               \
-            return _res;                                                                 \
-        }                                                                                \
+#define REQUIRE_STORE(store, project)                                \
+    do {                                                             \
+        if (!(store)) {                                              \
+            char *_err = build_no_store_error_checked(srv, project); \
+            char *_res = cbm_mcp_text_result(_err, true);            \
+            free(_err);                                              \
+            free(project);                                           \
+            return _res;                                             \
+        }                                                            \
     } while (0)
 
 static bool project_has_adr(cbm_store_t *store, const char *project, const char *root_path) {
@@ -12034,7 +12034,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
             /* module rollup: a quotient view of the blast radius */
             if (impact.visited_count > 0) {
                 cbm_sb_append(&sb, "impacted_modules: (rows: module count)\n");
-                char (*mods)[CBM_SZ_128] = malloc(DETECT_MODCAP * CBM_SZ_128);
+                char(*mods)[CBM_SZ_128] = malloc(DETECT_MODCAP * CBM_SZ_128);
                 int *mcnt = malloc(DETECT_MODCAP * sizeof(int));
                 if (mods && mcnt) {
                     int overflow = 0;
@@ -12097,7 +12097,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_val(doc, root_obj, "impacted", imp);
         /* Model parity with the tree encoding: the complete module rollup. */
         if (impact.visited_count > 0) {
-            char (*mods)[CBM_SZ_128] = malloc(DETECT_MODCAP * CBM_SZ_128);
+            char(*mods)[CBM_SZ_128] = malloc(DETECT_MODCAP * CBM_SZ_128);
             int *mcnt = malloc(DETECT_MODCAP * sizeof(int));
             if (mods && mcnt) {
                 int overflow = 0;
@@ -12461,8 +12461,8 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
      * backend the UI /api/adr endpoints use — so writes via the MCP tool and
      * the UI are visible to each other (#256). */
     store_recovery_status_t recovery_status = STORE_RECOVERY_NONE;
-    cbm_store_t *resolved = resolve_store_internal(srv, project, mutation_held, !write_request,
-                                                   &recovery_status, true);
+    cbm_store_t *resolved =
+        resolve_store_internal(srv, project, mutation_held, !write_request, &recovery_status, true);
     if (!resolved) {
         char *res = NULL;
         if (recovery_status == STORE_RECOVERY_BUSY) {
