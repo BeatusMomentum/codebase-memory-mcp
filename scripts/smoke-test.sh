@@ -838,15 +838,16 @@ else
   echo; echo "-- B3 first bytes (od) --"; echo "$IM_ARR" | od -c | head -6; exit 1
 fi
 
-# B4: STDIN — piped JSON resolves; this path must NOT emit a deprecation warning.
-IM_STDIN=$(echo "{\"project\":\"$PROJECT\"}" | "$BINARY" cli get_graph_schema 2>"$CLI_STDERR")
-if ! echo "$IM_STDIN" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if 'node_labels' in d else 1)" 2>/dev/null; then
-  echo "FAIL B4: stdin get_graph_schema did not resolve"; echo "$IM_STDIN" | head -c 300; cat "$CLI_STDERR"; exit 1
+# B4: STDIN + --json is the generated-client transport. It must return the
+# complete MCP result envelope and must NOT emit a deprecation warning.
+IM_STDIN=$(printf '%s' "{\"project\":\"$PROJECT\"}" | "$BINARY" cli --json get_graph_schema 2>"$CLI_STDERR")
+if ! printf '%s' "$IM_STDIN" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); c=d.get('content'); p=json.loads(c[0].get('text','')) if isinstance(c,list) and c and c[0].get('type') == 'text' else None; sys.exit(0 if d.get('isError') is not True and isinstance(p,dict) and isinstance(p.get('node_labels'),list) else 1)" 2>/dev/null; then
+  echo "FAIL B4: compact stdin + --json did not return a successful get_graph_schema MCP payload"; echo "$IM_STDIN" | head -c 300; cat "$CLI_STDERR"; exit 1
 fi
 if grep -qi 'deprecated' "$CLI_STDERR"; then
   echo "FAIL B4: stdin path wrongly emitted a deprecation warning"; cat "$CLI_STDERR"; exit 1
 fi
-echo "OK B4: STDIN input resolves, no deprecation warning"
+echo "OK B4: compact STDIN + --json returns a successful schema MCP envelope, no deprecation warning"
 
 # B5: --args-file — JSON read from a file resolves; must NOT warn deprecated.
 IM_ARGS_FILE=$(smoke_mktemp_file)
@@ -890,7 +891,8 @@ else
   echo "FAIL B6c: 'notatool --help' did not report 'unknown tool'"; cat "$CLI_STDERR"; exit 1
 fi
 
-# B7: DEPRECATION guard — one raw-JSON call MUST warn on stderr; flag form must NOT.
+# B7: DEPRECATION control — positional raw JSON MUST warn on stderr; this is
+# retained only to prove B4 is exercising the non-deprecated stdin transport.
 cli search_graph "{\"project\":\"$PROJECT\",\"name_pattern\":\"compute\"}" >/dev/null || true
 if grep -qi 'deprecated' "$CLI_STDERR"; then
   echo "OK B7a: raw-JSON cli emits deprecation warning on stderr"
@@ -2303,16 +2305,96 @@ if ! path_match "$CMD" "$SELF_PATH" ||
 fi
 echo "OK 8ak: custom KIMI_CODE_HOME MCP + durable context + UserPromptSubmit hook"
 
-# 8al: Pi has documented instructions and skill, but no invented MCP config.
+# 8al: Pi has documented instructions and skill, no invented MCP config, and
+# an installed generated extension that uses the non-deprecated stdin bridge.
 PI_INSTRUCTIONS="$FAKE_HOME/.pi/agent/AGENTS.md"
 PI_SKILL="$FAKE_HOME/.pi/agent/skills/codebase-memory/SKILL.md"
+PI_EXTENSION="$FAKE_HOME/.pi/agent/extensions/cbmem.ts"
 if ! grep -q 'search_graph' "$PI_INSTRUCTIONS" 2>/dev/null ||
    ! grep -q 'Sessions and Subagents' "$PI_SKILL" 2>/dev/null ||
+   ! grep -Fq "spawn(BIN, ['cli', '--json', tool], {" "$PI_EXTENSION" 2>/dev/null ||
+   ! grep -Fq "stdio: ['pipe', 'pipe', 'pipe']" "$PI_EXTENSION" 2>/dev/null ||
+   ! grep -Fq "child.stdin.on('error'" "$PI_EXTENSION" 2>/dev/null ||
+   ! grep -Fq 'child.stdin.end(JSON.stringify(args ?? {}));' "$PI_EXTENSION" 2>/dev/null ||
+   grep -Fq 'tool, JSON.stringify(args ?? {})]' "$PI_EXTENSION" 2>/dev/null ||
+   grep -Fq "stdio: ['ignore', 'pipe', 'pipe']" "$PI_EXTENSION" 2>/dev/null ||
    [ -e "$FAKE_HOME/.pi/agent/mcp.json" ]; then
-  echo "FAIL 8al: Pi durable context missing or unsupported MCP config created"
+  echo "FAIL 8al: Pi durable context or stdin client bridge missing, or unsupported MCP config created"
   exit 1
 fi
-echo "OK 8al: Pi durable context only (no MCP config)"
+echo "OK 8al: Pi durable context + stdin client bridge (no MCP config)"
+
+# 8al-node: execute the generated extension against a child that exits without
+# consuming a deliberately over-pipe-capacity payload. This is the lifecycle
+# Node implements: without an stdin error listener, the late EPIPE is an
+# unhandled EventEmitter error and crashes the Pi host. A second call emits a
+# valid MCP envelope before the same early exit, proving parsed JSON remains
+# authoritative over a retained stdin transport error.
+#
+# SKIP_WHITELIST: the minimal C-only Linux image intentionally has no Node.
+# What was tried: making Node a universal core-suite prerequisite would widen
+# the product's C build dependencies. The exact generated-source assertions
+# above still run there; this live probe gates every Node-equipped smoke venue.
+if command -v node >/dev/null 2>&1; then
+  PI_NODE=$(command -v node)
+  PI_PROBE_DIR="$TMPDIR/pi-node-probe"
+  mkdir -p "$PI_PROBE_DIR"
+  python3 - "$PI_EXTENSION" "$PI_PROBE_DIR/cbmem.mjs" <<'PYPIADAPTER'
+import pathlib
+import sys
+
+source, destination = map(pathlib.Path, sys.argv[1:])
+text = source.read_text(encoding="utf-8")
+lines = text.splitlines()
+matches = [i for i, line in enumerate(lines) if line.startswith("const BIN = ")]
+if len(matches) != 1:
+    raise SystemExit("generated Pi extension has no unique BIN declaration")
+lines[matches[0]] = "const BIN = process.execPath;"
+destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PYPIADAPTER
+  cat >"$PI_PROBE_DIR/cli" <<'PICHILD'
+const fs = require('node:fs');
+if (process.argv[3] === 'get_graph_schema') {
+  fs.writeSync(1, JSON.stringify({ content: [{ type: 'text', text: 'schema-ok' }] }) + '\n');
+}
+process.exit(0);
+PICHILD
+  if ! grep -Fxq 'const BIN = process.execPath;' "$PI_PROBE_DIR/cbmem.mjs" ||
+     ! grep -Fxq "const fs = require('node:fs');" "$PI_PROBE_DIR/cli"; then
+    echo "FAIL 8al-node: generated lifecycle probe is not portable across Node launch environments"
+    exit 1
+  fi
+  cat >"$PI_PROBE_DIR/probe.mjs" <<'PIPROBE'
+import extension from './cbmem.mjs';
+
+const tools = [];
+extension({ registerTool: (definition) => tools.push(definition) });
+const byName = (name) => tools.find((tool) => tool.name === name);
+const args = { padding: 'x'.repeat(16 * 1024 * 1024) };
+
+const successful = await byName('get_graph_schema').execute('probe-ok', args);
+if (successful?.content?.[0]?.text !== 'schema-ok') {
+  throw new Error('valid child JSON was not authoritative over stdin EPIPE');
+}
+
+let transportError = '';
+try {
+  await byName('search_graph').execute('probe-error', args);
+} catch (error) {
+  transportError = String(error?.message ?? error);
+}
+if (!/(EPIPE|broken pipe|write)/i.test(transportError)) {
+  throw new Error(`missing surfaced stdin transport error: ${transportError || '<none>'}`);
+}
+PIPROBE
+  if ! (cd "$PI_PROBE_DIR" && "$PI_NODE" probe.mjs); then
+    echo "FAIL 8al-node: generated Pi extension did not contain early-exit stdin errors"
+    exit 1
+  fi
+  echo "OK 8al-node: generated Pi extension contains EPIPE and keeps valid JSON authoritative"
+else
+  echo "SKIP 8al-node: Node unavailable in this C-only smoke venue (whitelisted above)"
+fi
 
 # 8am: Warp receives the documented shared skill; MCP remains user/UI-managed.
 WARP_SKILL="$FAKE_HOME/.agents/skills/codebase-memory/SKILL.md"
