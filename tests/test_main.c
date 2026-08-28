@@ -609,8 +609,15 @@ static int tf_maybe_run_mcp_idxfailclosed_probe(int argc, char **argv) {
                                                              const char *cache_dir);
     alarm(20);
     return mcp_test_idxfailclosed_supervisor_start_check(argv[2], argv[3]);
+#else
+    (void)argc;
+    (void)argv;
+    return -1;
+#endif
+}
+
 static int tf_maybe_run_deleted_self_probe(int argc, char **argv) {
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
     if (argc != 5 || strcmp(argv[1], "__cbm_deleted_self_probe") != 0) {
         return -1;
     }
@@ -625,10 +632,32 @@ static int tf_maybe_run_deleted_self_probe(int argc, char **argv) {
         return 42;
     }
     char resolved[1024];
-    if (!cbm_http_server_resolve_binary_path(NULL, resolved, sizeof(resolved))) {
+    bool ok = cbm_http_server_resolve_binary_path(NULL, resolved, sizeof(resolved));
+#if defined(__linux__)
+    /* Contract (#1204 strategy ruling): after a rename-over, the resolver
+     * hands back the /proc/self/exe magic link — the in-memory OLD build,
+     * the only spawn the worker's build-fingerprint gate accepts. First
+     * prove we really are in the deleted state, or the assertions below
+     * would pass vacuously on an intact image. */
+    char link_target[1024];
+    ssize_t n = readlink("/proc/self/exe", link_target, sizeof(link_target) - 1);
+    if (n <= 0) {
+        return 45;
+    }
+    link_target[n] = '\0';
+    if (strstr(link_target, " (deleted)") == NULL) {
+        return 46;
+    }
+    if (!ok) {
         return 43;
     }
-    return strcmp(resolved, argv[4]) == 0 && access(resolved, X_OK) == 0 ? 0 : 44;
+    return strcmp(resolved, "/proc/self/exe") == 0 && access(resolved, X_OK) == 0 ? 0 : 44;
+#else
+    /* macOS has no magic link: the ruling is fail-closed. Success here is
+     * the resolver REFUSING, so the supervisor logs no_self_path instead of
+     * spawning a missing or mismatched binary. */
+    return ok ? 44 : 0;
+#endif
 #else
     (void)argc;
     (void)argv;
@@ -887,6 +916,7 @@ int main(int argc, char **argv) {
     int daemon_ipc_probe_rc = tf_maybe_run_daemon_ipc_lock_probe(argc, argv);
     if (daemon_ipc_probe_rc >= 0) {
         return daemon_ipc_probe_rc;
+    }
     int deleted_self_rc = tf_maybe_run_deleted_self_probe(argc, argv);
     if (deleted_self_rc >= 0) {
         return deleted_self_rc;

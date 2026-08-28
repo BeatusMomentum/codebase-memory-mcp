@@ -11,6 +11,9 @@
  *      RPC dispatch, transport limits, receive deadline, clean shutdown.
  */
 #include "../src/foundation/compat.h"
+#if defined(__APPLE__)
+#include <mach-o/dyld.h> /* _NSGetExecutablePath — deleted-self driver */
+#endif
 #include "../src/foundation/compat_fs.h"
 #include "../src/foundation/compat_thread.h"
 #include "../src/foundation/log.h"
@@ -457,17 +460,22 @@ TEST(httpd_resolves_bare_binary_path_from_path) {
 #endif
 }
 
-TEST(httpd_resolves_deleted_self_to_replaced_launch_path) {
-#if defined(__linux__)
+TEST(httpd_deleted_self_spawn_path_follows_platform_ruling) {
+#if defined(__linux__) || defined(__APPLE__)
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_httpd_deleted_self_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
 
     char current[1024];
+#if defined(__linux__)
     ssize_t current_len = readlink("/proc/self/exe", current, sizeof(current) - 1);
     ASSERT_GT(current_len, 0);
     ASSERT_LT(current_len, (ssize_t)(sizeof(current) - 1));
     current[current_len] = '\0';
+#else
+    uint32_t current_sz = sizeof(current);
+    ASSERT_EQ(_NSGetExecutablePath(current, &current_sz), 0);
+#endif
 
     char launch_path[512];
     char replacement_path[512];
@@ -501,9 +509,21 @@ TEST(httpd_resolves_deleted_self_to_replaced_launch_path) {
     ASSERT_EQ(read(ready_pipe[0], &ready, 1), 1);
     ASSERT_EQ(ready, 'R');
 
+#if defined(__linux__)
+    /* Atomic rename-over: the installer's real move. /proc/self/exe now reads
+     * "(deleted)" in the child, which is the state the magic-link contract
+     * covers. */
     ASSERT_EQ(cbm_copy_file(current, replacement_path), 0);
     ASSERT_EQ(chmod(replacement_path, 0755), 0);
     ASSERT_EQ(rename(replacement_path, launch_path), 0);
+#else
+    /* macOS: a rename-over leaves a VALID executable at the launch path, which
+     * resolve is right to return (the worker's build-fingerprint gate is the
+     * layer that refuses a mismatched build — covered by its own tests). The
+     * fail-closed branch guards the image-GONE case, so remove the image. */
+    (void)replacement_path;
+    ASSERT_EQ(unlink(launch_path), 0);
+#endif
     ASSERT_EQ(write(continue_pipe[1], "G", 1), 1);
     close(ready_pipe[0]);
     close(continue_pipe[1]);
@@ -2341,7 +2361,7 @@ SUITE(httpd) {
     RUN_TEST(httpd_query_param_edge_cases);
     RUN_TEST(httpd_path_match_matrix);
     RUN_TEST(httpd_resolves_bare_binary_path_from_path);
-    RUN_TEST(httpd_resolves_deleted_self_to_replaced_launch_path);
+    RUN_TEST(httpd_deleted_self_spawn_path_follows_platform_ruling);
     RUN_TEST(repo_info_web_base_normalizes_to_https);
     RUN_TEST(repo_info_strips_credentials_from_remote);
 
