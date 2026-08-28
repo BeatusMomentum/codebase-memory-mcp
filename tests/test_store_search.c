@@ -1008,10 +1008,8 @@ TEST(store_bfs_reachability_is_not_trail_capped) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "test", "/tmp/test");
 
-    cbm_node_t root = {.project = "test",
-                       .label = "Function",
-                       .name = "Root",
-                       .qualified_name = "test.Root"};
+    cbm_node_t root = {
+        .project = "test", .label = "Function", .name = "Root", .qualified_name = "test.Root"};
     int64_t root_id = cbm_store_upsert_node(s, &root);
 
     enum { NODE_COUNT = 4200 };
@@ -1083,18 +1081,12 @@ TEST(store_bfs_trail_preserves_deeper_match_under_hub_budget) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "test", "/tmp/test");
 
-    cbm_node_t root = {.project = "test",
-                       .label = "Function",
-                       .name = "root",
-                       .qualified_name = "test.root"};
-    cbm_node_t branch = {.project = "test",
-                         .label = "Function",
-                         .name = "branch",
-                         .qualified_name = "test.branch"};
-    cbm_node_t target = {.project = "test",
-                         .label = "Function",
-                         .name = "target",
-                         .qualified_name = "test.target"};
+    cbm_node_t root = {
+        .project = "test", .label = "Function", .name = "root", .qualified_name = "test.root"};
+    cbm_node_t branch = {
+        .project = "test", .label = "Function", .name = "branch", .qualified_name = "test.branch"};
+    cbm_node_t target = {
+        .project = "test", .label = "Function", .name = "target", .qualified_name = "test.target"};
     int64_t root_id = cbm_store_upsert_node(s, &root);
     int64_t branch_id = cbm_store_upsert_node(s, &branch);
     int64_t target_id = cbm_store_upsert_node(s, &target);
@@ -1112,10 +1104,8 @@ TEST(store_bfs_trail_preserves_deeper_match_under_hub_budget) {
     for (int i = 0; i < LEAF_COUNT; i++) {
         char name[32];
         snprintf(name, sizeof(name), "leaf-%d", i);
-        cbm_node_t leaf = {.project = "test",
-                           .label = "Function",
-                           .name = name,
-                           .qualified_name = name};
+        cbm_node_t leaf = {
+            .project = "test", .label = "Function", .name = name, .qualified_name = name};
         int64_t leaf_id = cbm_store_upsert_node(s, &leaf);
         edge.source_id = root_id;
         edge.target_id = leaf_id;
@@ -1658,8 +1648,8 @@ static void seed_prose_nodes(cbm_store_t *s) {
                       .name = "Installation",
                       .qualified_name = "p.README.Installation",
                       .file_path = "README.md",
-                      .properties_json =
-                          "{\"docstring\":\"provisions an ephemeral workstation runner\"}"};
+                      .properties_json = "{\"docstring\":\"provisions an ephemeral "
+                                         "workstation runner via getUserById\"}"};
     cbm_store_upsert_node(s, &sec);
     cbm_node_t fn = {.project = "p",
                      .label = "Function",
@@ -1688,6 +1678,17 @@ TEST(store_fts_rebuild_indexes_docstring_as_body_issue518) {
     ASSERT_EQ(fts_match_count(s, "body:plainFunction"), 0);
     /* Identifier indexing is untouched. */
     ASSERT_EQ(fts_match_count(s, "name:plainFunction"), 1);
+
+    /* `body` is PROSE and must be indexed RAW — only `name` gets the camelCase
+     * splitter. cbm_camel_split("getUserById") yields "getUserById get User By
+     * Id", so a split body would additionally match the fragment "User".
+     * Asserting the fragment does NOT match is what makes this test fail if
+     * anyone ever wraps the body expression in cbm_camel_split(). */
+    ASSERT_EQ(fts_match_count(s, "body:getUserById"), 1);
+    ASSERT_EQ(fts_match_count(s, "body:User"), 0);
+    /* ...and the mirror image: `name` IS split, so its fragment DOES match.
+     * Together these pin both halves of the invariant. */
+    ASSERT_EQ(fts_match_count(s, "name:plain"), 1);
 
     cbm_store_close(s);
     PASS();
