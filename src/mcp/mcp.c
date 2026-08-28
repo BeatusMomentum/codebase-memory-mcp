@@ -6498,7 +6498,16 @@ static bool bfs_edge_evidence_for_hop(cbm_traverse_result_t *tr, int64_t hop_nod
         if (conf) {
             const char *colon = strchr(conf, ':');
             if (colon) {
-                *confidence_out = strtod(colon + 1, NULL);
+                /* strtod answers 0.0 for text it cannot read, and the caller
+                 * publishes any value >= 0 as a recorded confidence. So a
+                 * malformed value used to print as 0.00 — the one number the
+                 * surrounding code works to keep meaningful. Keep the -1 when
+                 * the end pointer never moved: nothing was read. */
+                char *end = NULL;
+                double parsed = strtod(colon + 1, &end);
+                if (end != colon + 1) {
+                    *confidence_out = parsed;
+                }
             }
         }
         return true;
