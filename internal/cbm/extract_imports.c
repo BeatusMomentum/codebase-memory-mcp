@@ -1588,8 +1588,18 @@ static void parse_embedded_imports(CBMExtractCtx *ctx) {
         embedded_collect_content_nodes(ctx->root, e, hits, &hit_count, MAX_EMBEDDED_BLOCKS);
         for (int i = 0; i < hit_count; i++) {
             CBMLanguage embedded_language = e->embedded_language;
-            bool extract_structure = ctx->language == CBM_LANG_VUE;
-            if (extract_structure &&
+            /* Structure (defs + calls), not just imports, for hosts whose
+             * embedded language carries real code. Vue since #1852; CFML's
+             * <cfscript> since the #1412 distillation. */
+            bool extract_structure =
+                ctx->language == CBM_LANG_VUE || ctx->language == CBM_LANG_CFML;
+            /* The attribute resolver is Vue's: it inspects <script lang=/src=>
+             * and OVERRIDES the spec's embedded language (JS default, TS on
+             * lang="ts", bail on src=). CFML's cf_script_tag carries no such
+             * attributes and its embedded language is fixed by the spec row
+             * (CFSCRIPT) — running the resolver would silently rewrite it to
+             * JavaScript. Resolve only for Vue. */
+            if (ctx->language == CBM_LANG_VUE &&
                 !vue_embedded_language(ctx, hits[i].script, &embedded_language)) {
                 continue;
             }
@@ -3083,6 +3093,9 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
     case CBM_LANG_SVELTE:
     case CBM_LANG_VUE:
     case CBM_LANG_ASTRO:
+    /* Tag-dialect CFML: <cfscript> bodies are opaque cf_script_content to the
+     * cfml grammar; the embedded spec re-parses them as CFSCRIPT (#1412). */
+    case CBM_LANG_CFML:
         parse_embedded_imports(ctx);
         break;
     default:
