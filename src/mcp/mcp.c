@@ -12034,7 +12034,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
             /* module rollup: a quotient view of the blast radius */
             if (impact.visited_count > 0) {
                 cbm_sb_append(&sb, "impacted_modules: (rows: module count)\n");
-                char(*mods)[CBM_SZ_128] = malloc(DETECT_MODCAP * CBM_SZ_128);
+                char (*mods)[CBM_SZ_128] = malloc(DETECT_MODCAP * CBM_SZ_128);
                 int *mcnt = malloc(DETECT_MODCAP * sizeof(int));
                 if (mods && mcnt) {
                     int overflow = 0;
@@ -12097,7 +12097,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_val(doc, root_obj, "impacted", imp);
         /* Model parity with the tree encoding: the complete module rollup. */
         if (impact.visited_count > 0) {
-            char(*mods)[CBM_SZ_128] = malloc(DETECT_MODCAP * CBM_SZ_128);
+            char (*mods)[CBM_SZ_128] = malloc(DETECT_MODCAP * CBM_SZ_128);
             int *mcnt = malloc(DETECT_MODCAP * sizeof(int));
             if (mods && mcnt) {
                 int overflow = 0;
