@@ -259,13 +259,12 @@ char *cbm_client_adapter_opencode(const char *binary_path) {
 
     adapter_sb_t sb = {0};
     emit_header(&sb, "OpenCode");
-    sb_append(&sb,
-              "// OpenCode already reaches every tool over MCP; this module adds the\n"
-              "// context surfaces other clients get through hook configuration: graph\n"
-              "// lookup after grep/glob, index-coverage notes after read, session-start\n"
-              "// tier routing (carried on the first tool result of each session, since\n"
-              "// OpenCode documents no context-output lifecycle hook), and reinjection\n"
-              "// after compaction via the documented experimental surface.\n");
+    sb_append(&sb, "// OpenCode already reaches every tool over MCP; this module adds the\n"
+                   "// context surfaces other clients get through hook configuration: graph\n"
+                   "// lookup after grep/glob, index-coverage notes after read, session-start\n"
+                   "// tier routing (carried on the first tool result of each session, since\n"
+                   "// OpenCode documents no context-output lifecycle hook), and reinjection\n"
+                   "// after compaction via the documented experimental surface.\n");
     sb_append(&sb, "import { spawn } from 'node:child_process';\n\n");
     sb_append(&sb, "const BIN = '");
     sb_append(&sb, bin);
@@ -276,25 +275,24 @@ char *cbm_client_adapter_opencode(const char *binary_path) {
      * SessionStart lifecycle event — and emits the Claude JSON envelope, so
      * the plugin unwraps additionalContext instead of pasting raw JSON into
      * the tool output. Every failure path resolves to '' (fail open). */
-    sb_append(&sb,
-              "function augment(payload) {\n"
-              "  return new Promise((resolve) => {\n"
-              "    const child = spawn(BIN, ['hook-augment'], {\n"
-              "      stdio: ['pipe', 'pipe', 'ignore'],\n"
-              "      env: { ...process.env, CBM_LOG_LEVEL: 'error' },\n"
-              "    });\n"
-              "    let out = '';\n"
-              "    child.stdout.on('data', (d) => (out += d.toString()));\n"
-              "    child.on('error', () => resolve(''));\n"
-              "    child.on('close', () => {\n"
-              "      try {\n"
-              "        const ctx = JSON.parse(out)?.hookSpecificOutput?.additionalContext;\n"
-              "        resolve(typeof ctx === 'string' ? ctx : '');\n"
-              "      } catch { resolve(''); }\n"
-              "    });\n"
-              "    child.stdin.end(JSON.stringify(payload));\n"
-              "  });\n"
-              "}\n\n");
+    sb_append(&sb, "function augment(payload) {\n"
+                   "  return new Promise((resolve) => {\n"
+                   "    const child = spawn(BIN, ['hook-augment'], {\n"
+                   "      stdio: ['pipe', 'pipe', 'ignore'],\n"
+                   "      env: { ...process.env, CBM_LOG_LEVEL: 'error' },\n"
+                   "    });\n"
+                   "    let out = '';\n"
+                   "    child.stdout.on('data', (d) => (out += d.toString()));\n"
+                   "    child.on('error', () => resolve(''));\n"
+                   "    child.on('close', () => {\n"
+                   "      try {\n"
+                   "        const ctx = JSON.parse(out)?.hookSpecificOutput?.additionalContext;\n"
+                   "        resolve(typeof ctx === 'string' ? ctx : '');\n"
+                   "      } catch { resolve(''); }\n"
+                   "    });\n"
+                   "    child.stdin.end(JSON.stringify(payload));\n"
+                   "  });\n"
+                   "}\n\n");
 
     sb_append(&sb,
               "export const CodebaseMemory = async (ctx) => {\n"
