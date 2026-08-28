@@ -1791,6 +1791,24 @@ int main(int argc, char **argv) {
 #ifndef _WIN32
         cbm_hook_augment_arm_deadline();
 #endif
+        /* Read stdin now and bail before executable-identity hashing when the
+         * event can never produce output (an un-forced PreToolUse Bash call
+         * that is not a search). The identity hash costs ~1.1 s of user CPU
+         * per invocation, and with Bash in the installed matcher nearly every
+         * agent command would pay it for nothing. A no-op touches no shared
+         * state, so it needs no identity. Anything else is handed back via
+         * the prefetch so downstream readers see stdin exactly once. */
+        if (!hook_event) {
+            char *hook_input = cbm_hook_augment_read_stdin();
+            if (!hook_input) {
+                return EXIT_SUCCESS; /* fail open, nothing to augment */
+            }
+            if (cbm_hook_augment_input_is_noop_bash(hook_input)) {
+                free(hook_input);
+                return EXIT_SUCCESS;
+            }
+            cbm_hook_augment_prefetch_stdin(hook_input);
+        }
     }
 
     if (role == CBM_DAEMON_PROCESS_STATELESS) {

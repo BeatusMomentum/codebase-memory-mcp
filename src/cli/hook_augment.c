@@ -154,7 +154,22 @@ void cbm_hook_augment_arm_deadline(void) {
 
 /* ── stdin ────────────────────────────────────────────────────────── */
 
+/* main() reads stdin EARLY on the hook-client path so the no-op gate can run
+ * before executable-identity hashing; the consumed bytes are handed back here
+ * so every downstream reader sees them exactly once. */
+static char *g_ha_prefetched_stdin = NULL;
+
+void cbm_hook_augment_prefetch_stdin(char *owned) {
+    free(g_ha_prefetched_stdin);
+    g_ha_prefetched_stdin = owned;
+}
+
 char *cbm_hook_augment_read_stdin(void) {
+    if (g_ha_prefetched_stdin) {
+        char *out = g_ha_prefetched_stdin;
+        g_ha_prefetched_stdin = NULL;
+        return out;
+    }
     char *buf = malloc(HA_STDIN_CAP + 1);
     if (!buf) {
         return NULL;
@@ -1617,6 +1632,40 @@ char *cbm_hook_augment_process_for(cbm_mcp_server_t *srv, const char *input_json
     return ha_process(srv, input_json, forced_event, dialect);
 }
 
+/* TRUE iff `input` is an un-forced PreToolUse Bash event whose command can
+ * never produce augmentation output: not a recognised search, or no queryable
+ * token. Pure string work — safe to run BEFORE executable-identity hashing,
+ * cohort admission, or any daemon contact, which is the point: agents issue
+ * far more Bash calls than Grep/Glob and nearly all are not searches, while
+ * the identity hash alone costs ~1.1 s of user CPU per invocation on a
+ * production binary (measured 2026-08-28). Uses the exact parser pair
+ * ha_process uses, so the gate and the augmenter cannot disagree about what
+ * counts as a search. Anything uncertain returns false and pays full fare:
+ * lifecycle events, other tools, coverage adapters, oversized stdin. */
+bool cbm_hook_augment_input_is_noop_bash(const char *input) {
+    if (!input || strlen(input) > HA_STDIN_CAP) {
+        return false;
+    }
+    yyjson_doc *doc = yyjson_read(input, strlen(input), 0);
+    if (!doc) {
+        return false;
+    }
+    bool noop = false;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    const char *event = ha_hook_event_name(root);
+    const char *tool = ha_obj_str(root, "tool_name");
+    if (event && tool && strcmp(event, "PreToolUse") == 0 && strcmp(tool, "Bash") == 0) {
+        yyjson_val *tin = yyjson_obj_get(root, "tool_input");
+        const char *cmd = ha_obj_str(tin, "command");
+        char pat[HA_BASH_TOK_SZ];
+        char tok[HA_MAX_TOKEN + 1];
+        noop = !ha_parse_bash_search_pattern(cmd, pat, sizeof(pat)) ||
+               !ha_extract_token(pat, tok, sizeof(tok));
+    }
+    yyjson_doc_free(doc);
+    return noop;
+}
+
 int cbm_cmd_hook_augment(int argc, char **argv) {
     cbm_hook_augment_arm_deadline();
 
@@ -1640,6 +1689,10 @@ int cbm_cmd_hook_augment(int argc, char **argv) {
 
     char *input = cbm_hook_augment_read_stdin();
     if (!input) {
+        return 0;
+    }
+    if (!forced_event && cbm_hook_augment_input_is_noop_bash(input)) {
+        free(input);
         return 0;
     }
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);

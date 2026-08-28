@@ -477,6 +477,10 @@ char *cbm_hook_augment_lifecycle_json_for(const char *input, const char *forced_
  * hard fail-open deadline without constructing a local MCP/store instance. */
 void cbm_hook_augment_arm_deadline(void);
 char *cbm_hook_augment_read_stdin(void);
+/* Pure no-op gate for the hook-client fast path (see hook_augment.c). */
+bool cbm_hook_augment_input_is_noop_bash(const char *input);
+/* Hand back stdin bytes main() consumed early; the next read returns them. */
+void cbm_hook_augment_prefetch_stdin(char *owned);
 
 /* Process one already-read hook payload using a caller-owned MCP session.
  * Returns a malloc-owned hook output JSON string, or NULL for fail-open/no
