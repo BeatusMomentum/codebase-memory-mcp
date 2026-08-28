@@ -6013,6 +6013,208 @@ TEST(iris_export_xml_multi_class) {
     PASS();
 }
 
+/* ── #518 / #519: prose that BM25 can index ────────────────────────
+ *
+ * A Section carried only its heading and a config Module only its path, so a
+ * question asked in words could not reach either. Both now carry the prose in
+ * `docstring`, which is what nodes_fts indexes into its `body` column. */
+
+/* First Module-labelled definition, or NULL. */
+static const CBMDefinition *find_module_def(CBMFileResult *r) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].label, "Module") == 0) {
+            return &r->defs.items[i];
+        }
+    }
+    return NULL;
+}
+
+TEST(markdown_section_body_becomes_docstring_issue518) {
+    CBMFileResult *r = extract("# Installation\n"
+                               "Run the bootstrap script to provision a workstation.\n"
+                               "It installs the toolchain and seeds the cache.\n",
+                               CBM_LANG_MARKDOWN, "t", "README.md");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = find_def_by_name(r, "Installation");
+    ASSERT_NOT_NULL(d);
+    ASSERT_STR_EQ(d->label, "Section");
+    ASSERT_NOT_NULL(d->docstring);
+    /* The prose — not the heading — is what makes the section findable. */
+    ASSERT_NOT_NULL(strstr(d->docstring, "bootstrap script"));
+    ASSERT_NOT_NULL(strstr(d->docstring, "seeds the cache"));
+    /* Newlines collapse to single spaces so the 500-byte cap buys real words. */
+    ASSERT_NULL(strchr(d->docstring, '\n'));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(markdown_section_body_stops_at_next_heading_issue518) {
+    CBMFileResult *r = extract("# Alpha\n"
+                               "alphatext belongs to the first section.\n"
+                               "\n"
+                               "# Beta\n"
+                               "betatext belongs to the second section.\n",
+                               CBM_LANG_MARKDOWN, "t", "README.md");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *alpha = find_def_by_name(r, "Alpha");
+    const CBMDefinition *beta = find_def_by_name(r, "Beta");
+    ASSERT_NOT_NULL(alpha);
+    ASSERT_NOT_NULL(beta);
+    ASSERT_NOT_NULL(alpha->docstring);
+    ASSERT_NOT_NULL(beta->docstring);
+    /* Each section owns ITS body: bleeding across the boundary would make every
+     * heading match every word in the file. */
+    ASSERT_NOT_NULL(strstr(alpha->docstring, "alphatext"));
+    ASSERT_NULL(strstr(alpha->docstring, "betatext"));
+    ASSERT_NOT_NULL(strstr(beta->docstring, "betatext"));
+    ASSERT_NULL(strstr(beta->docstring, "alphatext"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(markdown_section_body_heading_only_has_no_docstring_issue518) {
+    CBMFileResult *r = extract("# Lonely\n", CBM_LANG_MARKDOWN, "t", "README.md");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = find_def_by_name(r, "Lonely");
+    ASSERT_NOT_NULL(d);
+    /* An empty body stays NULL rather than "": append_json_string drops empty
+     * values, so an empty string would be a difference with no observable
+     * meaning — and a docstring key that promises prose it does not have. */
+    ASSERT_NULL(d->docstring);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(markdown_section_body_capped_utf8_safe_issue518) {
+    /* 400 three-byte codepoints (1200 bytes) guarantees the 500-byte cut lands
+     * mid-sequence unless the backoff works. */
+    char src[4096];
+    int pos = snprintf(src, sizeof(src), "# Unicode\n");
+    for (int i = 0; i < 400; i++) {
+        pos += snprintf(src + pos, sizeof(src) - (size_t)pos, "\xe2\x9c\x93");
+    }
+    snprintf(src + pos, sizeof(src) - (size_t)pos, "\n");
+
+    CBMFileResult *r = extract(src, CBM_LANG_MARKDOWN, "t", "README.md");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = find_def_by_name(r, "Unicode");
+    ASSERT_NOT_NULL(d);
+    ASSERT_NOT_NULL(d->docstring);
+    size_t n = strlen(d->docstring);
+    ASSERT_LTE((int)n, 500); /* MAX_COMMENT_LEN — fits the 2 KB properties buffer */
+    ASSERT_GT((int)n, 0);
+    /* Every byte must belong to a COMPLETE sequence: walk the string and check
+     * each lead byte is followed by its full continuation run. */
+    for (size_t i = 0; i < n;) {
+        unsigned char c = (unsigned char)d->docstring[i];
+        size_t need;
+        if ((c & 0x80) == 0) {
+            need = 1;
+        } else if ((c & 0xE0) == 0xC0) {
+            need = 2;
+        } else if ((c & 0xF0) == 0xE0) {
+            need = 3;
+        } else if ((c & 0xF8) == 0xF0) {
+            need = 4;
+        } else {
+            FAIL("stray UTF-8 continuation byte at a sequence start");
+        }
+        ASSERT_LTE((int)(i + need), (int)n); /* no truncated tail sequence */
+        i += need;
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(yaml_toplevel_description_promoted_to_module_issue519) {
+    CBMFileResult *r = extract("name: my-action\n"
+                               "description: Provisions an ephemeral build runner.\n"
+                               "runs:\n"
+                               "  using: node20\n",
+                               CBM_LANG_YAML, "t", "META.yaml");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *mod = find_module_def(r);
+    ASSERT_NOT_NULL(mod);
+    ASSERT_NOT_NULL(mod->docstring);
+    ASSERT_NOT_NULL(strstr(mod->docstring, "ephemeral build runner"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(yaml_block_scalar_description_promoted_issue519) {
+    CBMFileResult *r = extract("name: my-action\n"
+                               "description: |\n"
+                               "  Provisions an ephemeral build runner\n"
+                               "  and tears it down afterwards.\n",
+                               CBM_LANG_YAML, "t", "META.yaml");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *mod = find_module_def(r);
+    ASSERT_NOT_NULL(mod);
+    ASSERT_NOT_NULL(mod->docstring);
+    /* The `|` indicator itself must not survive into the indexed text. */
+    ASSERT_NOT_NULL(strstr(mod->docstring, "tears it down"));
+    ASSERT_NULL(strchr(mod->docstring, '|'));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(yaml_summary_promoted_when_no_description_issue519) {
+    CBMFileResult *r = extract("name: thing\n"
+                               "summary: Aggregates telemetry from every shard.\n",
+                               CBM_LANG_YAML, "t", "META.yaml");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *mod = find_module_def(r);
+    ASSERT_NOT_NULL(mod);
+    ASSERT_NOT_NULL(mod->docstring);
+    ASSERT_NOT_NULL(strstr(mod->docstring, "every shard"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(json_toplevel_description_promoted_to_module_issue519) {
+    CBMFileResult *r = extract("{\n"
+                               "  \"name\": \"widget\",\n"
+                               "  \"description\": \"Renders dashboards from graph queries.\"\n"
+                               "}\n",
+                               CBM_LANG_JSON, "t", "package.json");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *mod = find_module_def(r);
+    ASSERT_NOT_NULL(mod);
+    ASSERT_NOT_NULL(mod->docstring);
+    ASSERT_NOT_NULL(strstr(mod->docstring, "Renders dashboards"));
+    /* The JSON string quotes are stripped — they are not part of the value. */
+    ASSERT_NULL(strchr(mod->docstring, '"'));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(config_description_only_at_top_level_issue519) {
+    /* A nested `description` describes the nested thing, not the file. */
+    CBMFileResult *r = extract("name: chart\n"
+                               "values:\n"
+                               "  description: nestedonly\n",
+                               CBM_LANG_YAML, "t", "META.yaml");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *mod = find_module_def(r);
+    ASSERT_NOT_NULL(mod);
+    ASSERT(mod->docstring == NULL || strstr(mod->docstring, "nestedonly") == NULL);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(non_config_language_module_has_no_promoted_description_issue519) {
+    /* The promotion is config-only: a Python file's Module node must not pick
+     * up a variable that merely happens to be called `description`. */
+    CBMFileResult *r =
+        extract("description = 'not a config file'\n", CBM_LANG_PYTHON, "t", "conf.py");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *mod = find_module_def(r);
+    ASSERT_NOT_NULL(mod);
+    ASSERT_NULL(mod->docstring);
+    cbm_free_result(r);
+    PASS();
+}
+
 SUITE(extraction) {
     /* Initialize extraction library */
     cbm_init();
@@ -6365,6 +6567,18 @@ SUITE(extraction) {
     RUN_TEST(extract_python_method_test_dir_marks_is_test_issue1294);
     RUN_TEST(docstring_utf8_truncation_boundary_issue1017);
     RUN_TEST(extract_ts_decorators_survive_interleaved_comment);
+
+    /* #518/#519 — prose carried into docstring so nodes_fts can index it */
+    RUN_TEST(markdown_section_body_becomes_docstring_issue518);
+    RUN_TEST(markdown_section_body_stops_at_next_heading_issue518);
+    RUN_TEST(markdown_section_body_heading_only_has_no_docstring_issue518);
+    RUN_TEST(markdown_section_body_capped_utf8_safe_issue518);
+    RUN_TEST(yaml_toplevel_description_promoted_to_module_issue519);
+    RUN_TEST(yaml_block_scalar_description_promoted_issue519);
+    RUN_TEST(yaml_summary_promoted_when_no_description_issue519);
+    RUN_TEST(json_toplevel_description_promoted_to_module_issue519);
+    RUN_TEST(config_description_only_at_top_level_issue519);
+    RUN_TEST(non_config_language_module_has_no_promoted_description_issue519);
 
     cbm_shutdown();
 }

@@ -912,4 +912,20 @@ int cbm_store_count_vectors(cbm_store_t *s, const char *project);
  * Returns CBM_STORE_OK on success. */
 int cbm_store_exec(cbm_store_t *s, const char *sql);
 
+/* Populate nodes_fts from the `nodes` table — the single writer for the BM25
+ * index.  Every backfill site routes through it so the column list is decided
+ * in exactly ONE place: a hand-written INSERT that names only the identifier
+ * columns silently leaves `body` NULL for every node it writes, which looks
+ * perfect after a full reindex and de-indexes prose on the warm path.
+ *
+ *   project == NULL → wholesale rebuild: clears the index, then reindexes
+ *                     every node in the database.
+ *   project != NULL → incremental: indexes only that project's nodes with
+ *                     id > after_id and leaves existing rows untouched.
+ *
+ * Returns CBM_STORE_OK on success; CBM_STORE_NOT_FOUND when nodes_fts cannot
+ * be written at all (FTS5 compiled out — the caller decides whether that is
+ * fatal); CBM_STORE_ERR on a genuine write failure. */
+int cbm_store_fts_rebuild(cbm_store_t *s, const char *project, int64_t after_id);
+
 #endif /* CBM_STORE_H */

@@ -1524,22 +1524,6 @@ static void discard_generation_stage(const char *stage_path) {
     cbm_remove_db_sidecars(stage_path);
 }
 
-static int generation_rebuild_fts(cbm_store_t *store) {
-    if (cbm_store_exec(store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');") !=
-        CBM_STORE_OK) {
-        return CBM_STORE_ERR;
-    }
-    if (cbm_store_exec(store,
-                       "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                       "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
-                       "FROM nodes;") == CBM_STORE_OK) {
-        return CBM_STORE_OK;
-    }
-    return cbm_store_exec(store,
-                          "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                          "SELECT id, name, qualified_name, label, file_path FROM nodes;");
-}
-
 typedef struct {
     bool quarantined;
     char backup_path[CBM_SZ_4K];
@@ -1809,7 +1793,10 @@ int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_
     cbm_log_info("publish.timing", "block", "coverage_replace", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t_pub)));
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_pub);
-    if (fts_wholesale && generation_rebuild_fts(store) != CBM_STORE_OK) {
+    /* The column list lives in cbm_store_fts_rebuild() alone — see the delta
+     * merge, which must index the SAME columns or prose goes missing on the
+     * warm path while a full reindex looks perfect. */
+    if (fts_wholesale && cbm_store_fts_rebuild(store, NULL, 0) != CBM_STORE_OK) {
         ok = false;
     }
     cbm_log_info("publish.timing", "block", "fts", "elapsed_ms", itoa_buf((int)elapsed_ms(t_pub)));

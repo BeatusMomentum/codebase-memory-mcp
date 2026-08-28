@@ -11460,7 +11460,249 @@ TEST(index_repository_supervisor_uses_canonical_session_path) {
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
+/* ── BM25 prose search (#518 / #519) ───────────────────────────────
+ *
+ * Section and Module used to be filtered out of BM25 results outright, which
+ * made the prose they carry unreachable no matter how it was indexed. These
+ * cover the query side: prose is findable, the excluded labels come back, and
+ * the ranked query and the count query still agree. */
+
+static cbm_mcp_server_t *setup_prose_search_server(const char *proj) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return NULL;
+    }
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/prose");
+
+    cbm_node_t section = {.project = proj,
+                          .label = "Section",
+                          .name = "Installation",
+                          .qualified_name = "prose.README.Installation",
+                          .file_path = "README.md",
+                          .start_line = 1,
+                          .end_line = 20,
+                          .properties_json = "{\"docstring\":\"provisions an ephemeral "
+                                             "workstation runner and seeds the cache\"}"};
+    cbm_store_upsert_node(st, &section);
+
+    cbm_node_t module = {.project = proj,
+                         .label = "Module",
+                         .name = "action.yml",
+                         .qualified_name = "prose.action_yml",
+                         .file_path = "action.yml",
+                         .start_line = 1,
+                         .end_line = 40,
+                         .properties_json =
+                             "{\"docstring\":\"aggregates telemetry from every shard\"}"};
+    cbm_store_upsert_node(st, &module);
+
+    cbm_node_t fn = {.project = proj,
+                     .label = "Function",
+                     .name = "telemetryCollector",
+                     .qualified_name = "prose.src.telemetryCollector",
+                     .file_path = "src/collect.c",
+                     .start_line = 3,
+                     .end_line = 9};
+    cbm_store_upsert_node(st, &fn);
+
+    cbm_store_fts_rebuild(st, NULL, 0);
+    return srv;
+}
+
+static char *prose_search(cbm_mcp_server_t *srv, const char *proj, const char *query) {
+    char req[512];
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":518,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"%s\",\"query\":\"%s\",\"limit\":10}}}",
+             proj, query);
+    char *resp = cbm_mcp_server_handle(srv, req);
+    if (!resp) {
+        return NULL;
+    }
+    char *inner = extract_text_content(resp);
+    free(resp);
+    return inner;
+}
+
+TEST(bm25_finds_section_by_its_prose_issue518) {
+    cbm_mcp_server_t *srv = setup_prose_search_server("prose518");
+    ASSERT_NOT_NULL(srv);
+
+    /* "ephemeral" appears NOWHERE in any identifier — only in the section's
+     * body. Before the body column it was unfindable. */
+    char *inner = prose_search(srv, "prose518", "ephemeral");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "search_mode: bm25"));
+    ASSERT_NOT_NULL(strstr(inner, "prose.README.Installation"));
+    ASSERT_NOT_NULL(strstr(inner, "Section"));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(bm25_finds_module_by_promoted_description_issue519) {
+    cbm_mcp_server_t *srv = setup_prose_search_server("prose519");
+    ASSERT_NOT_NULL(srv);
+
+    /* A config file's own description, promoted onto its Module node. Module
+     * was one of the labels the BM25 filter used to drop unconditionally. */
+    char *inner = prose_search(srv, "prose519", "shard");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "prose.action_yml"));
+    ASSERT_NOT_NULL(strstr(inner, "Module"));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(bm25_results_and_total_stay_consistent_issue518) {
+    /* The ranked query and the count query share an inner candidate window and
+     * MIRROR each other's filter. Changing the label exclusion (or the weights)
+     * in only one silently reports a total that does not describe the rows. */
+    cbm_mcp_server_t *srv = setup_prose_search_server("prosecount");
+    ASSERT_NOT_NULL(srv);
+
+    char *inner = prose_search(srv, "prosecount", "telemetry");
+    ASSERT_NOT_NULL(inner);
+    /* Both the Module (body: "aggregates telemetry...") and the Function
+     * (name: telemetryCollector) match, and both are now eligible. */
+    const char *total = strstr(inner, "total: ");
+    const char *results = strstr(inner, "results: ");
+    ASSERT_NOT_NULL(total);
+    ASSERT_NOT_NULL(results);
+    int total_n = atoi(total + strlen("total: "));
+    int results_n = atoi(results + strlen("results: "));
+    ASSERT_EQ(total_n, 2);
+    ASSERT_EQ(results_n, total_n);
+    ASSERT_NOT_NULL(strstr(inner, "prose.action_yml"));
+    ASSERT_NOT_NULL(strstr(inner, "prose.src.telemetryCollector"));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(bm25_identifier_match_outranks_prose_only_match_issue518) {
+    /* The 0.3 body weight is what keeps prose from drowning identifiers. Both
+     * candidates carry the same label boost, so the ordering here is decided by
+     * the column weights alone. */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "prose-rank";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/prose-rank");
+
+    cbm_node_t by_name = {.project = proj,
+                          .label = "Function",
+                          .name = "reconcile",
+                          .qualified_name = "pr.a.reconcile",
+                          .file_path = "a.c"};
+    ASSERT_TRUE(cbm_store_upsert_node(st, &by_name) > 0);
+
+    cbm_node_t by_body = {.project = proj,
+                          .label = "Function",
+                          .name = "zzz",
+                          .qualified_name = "pr.b.zzz",
+                          .file_path = "b.c",
+                          .properties_json = "{\"docstring\":\"reconcile the ledger\"}"};
+    ASSERT_TRUE(cbm_store_upsert_node(st, &by_body) > 0);
+    ASSERT_EQ(cbm_store_fts_rebuild(st, NULL, 0), CBM_STORE_OK);
+
+    char *inner = prose_search(srv, proj, "reconcile");
+    ASSERT_NOT_NULL(inner);
+    const char *name_hit = strstr(inner, "pr.a.reconcile");
+    const char *body_hit = strstr(inner, "pr.b.zzz");
+    ASSERT_NOT_NULL(name_hit);        /* the identifier match */
+    ASSERT_NOT_NULL(body_hit);        /* the prose-only match still SURFACES ... */
+    ASSERT_TRUE(name_hit < body_hit); /* ... but never above the identifier */
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(bm25_searches_legacy_four_column_fts_without_error_issue518) {
+    /* No index-format bump means a database whose nodes_fts predates the body
+     * column is opened by the current binary. bm25()'s fifth weight must be
+     * inert there, not an error: FTS5 reads a weight only for a column an
+     * instance actually landed in. */
+    char *td = th_mktempdir("cbm_mcp_legacy_fts");
+    ASSERT_NOT_NULL(td);
+    /* cbm_mcp_server_new(project) opens <cache_dir>/<project>.db, so seeding
+     * the legacy table THERE is what puts the server on a pre-body database —
+     * the same way a real upgrade finds one. */
+    char saved_cache[512] = {0};
+    const char *prev = getenv("CBM_CACHE_DIR");
+    if (prev) {
+        snprintf(saved_cache, sizeof(saved_cache), "%s", prev);
+    }
+    cbm_setenv("CBM_CACHE_DIR", td, 1);
+
+    const char *proj = "legacyfts";
+    char dbpath[600];
+    snprintf(dbpath, sizeof(dbpath), "%s/%s.db", td, proj);
+
+    sqlite3 *raw = NULL;
+    ASSERT_EQ(sqlite3_open(dbpath, &raw), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(raw,
+                           "CREATE VIRTUAL TABLE nodes_fts USING fts5("
+                           "  name, qualified_name, label, file_path,"
+                           "  content='', tokenize='unicode61 remove_diacritics 2');",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    sqlite3_close(raw);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(proj);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, td);
+
+    cbm_node_t fn = {.project = proj,
+                     .label = "Function",
+                     .name = "reconcile",
+                     .qualified_name = "legacy.a.reconcile",
+                     .file_path = "a.c",
+                     .properties_json = "{\"docstring\":\"prose that cannot be indexed here\"}"};
+    ASSERT_TRUE(cbm_store_upsert_node(st, &fn) > 0);
+    ASSERT_EQ(cbm_store_fts_rebuild(st, NULL, 0), CBM_STORE_OK);
+
+    char *inner = prose_search(srv, proj, "reconcile");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "search_mode: bm25"));
+    ASSERT_NOT_NULL(strstr(inner, "legacy.a.reconcile"));
+    free(inner);
+
+    /* Prose is absent rather than broken — a degrade, not a failure. */
+    inner = prose_search(srv, proj, "indexed");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, "legacy.a.reconcile"));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    if (saved_cache[0]) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(td);
+    PASS();
+}
+
 SUITE(mcp) {
+    /* #518/#519 — BM25 prose search */
+    RUN_TEST(bm25_finds_section_by_its_prose_issue518);
+    RUN_TEST(bm25_finds_module_by_promoted_description_issue519);
+    RUN_TEST(bm25_results_and_total_stay_consistent_issue518);
+    RUN_TEST(bm25_identifier_match_outranks_prose_only_match_issue518);
+    RUN_TEST(bm25_searches_legacy_four_column_fts_without_error_issue518);
     RUN_TEST(mcp_path_within_root_rejects_escape);
     RUN_TEST(detect_changes_rejects_option_like_base_branch);
     RUN_TEST(detect_changes_rejects_windows_cmd_metacharacters_in_base_branch);
