@@ -170,10 +170,14 @@ static inline CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegist
     }
 }
 
-/* Borrow the (thread-local) Rust Cargo manifest the cross-file LSP pass set for
- * cross-crate (#56) routing. The Tier-2 prebuilt Rust resolve reads it so it sees
- * exactly what the per-file fallback (cbm_pxc_run_one) would on the same thread. */
+/* Build and borrow the Rust Cargo manifest used for cross-crate (#56) routing.
+ * The manifest owns strings in manifest_arena; callers keep that arena alive
+ * until every resolver worker has joined.  Each worker must install the shared
+ * immutable pointer in its own TLS slot before dispatch and clear it afterward. */
 struct CBMCargoManifest;
+bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *manifest_arena,
+                                 struct CBMCargoManifest *out_manifest);
+void cbm_pxc_set_rust_manifest(const struct CBMCargoManifest *manifest);
 const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void);
 
 /* Run the cross-file LSP resolver for non-TS languages. Appends
