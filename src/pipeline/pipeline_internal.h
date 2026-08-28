@@ -641,11 +641,38 @@ void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx);
  * post-pass sequence. */
 void cbm_pipeline_pass_importance(cbm_pipeline_ctx_t *ctx);
 
-/* Write the numeric "importance" key into a node's properties JSON object.
- * IDEMPOTENT: an existing key is overwritten in place, never appended twice —
- * the incremental path re-scores nodes rehydrated from the store that already
- * carry the key. Non-static so the idempotence contract is directly testable. */
+/* Gathered inputs for one symbol. Each scoring route fills this its own way
+ * (gbuf lookups, or SQL aggregates) and then calls the ONE rule below. */
+typedef struct {
+    const char *name;
+    const char *file_path;
+    int num_refs;            /* incoming CALLS + USAGE */
+    int name_distinct_files; /* distinct files the NAME is defined in */
+    bool tests_target;       /* has an incoming TESTS edge */
+} cbm_importance_inputs_t;
+
+/* THE scoring rule — single definition, shared by every route, so the two
+ * gathering strategies cannot drift apart in what a score means. */
+double cbm_pipeline_importance_score(const cbm_importance_inputs_t *in);
+
+/* Produce a copy of `json` with the numeric "importance" key set to `score`,
+ * or NULL when `json` is not a JSON object or allocation fails. Caller owns
+ * the result. IDEMPOTENT: an existing key is overwritten in place, never
+ * appended twice — every re-scoring route sees nodes that already carry it.
+ * Single definition, shared by the in-memory and SQL writers alike. */
+char *cbm_pipeline_importance_set_prop(const char *json, double score);
+
+/* gbuf-node convenience wrapper around cbm_pipeline_importance_set_prop. */
 void cbm_pipeline_importance_append_prop(cbm_gbuf_node_t *node, double score);
+
+/* Recompute importance for an ENTIRE project directly in a store, in SQL.
+ * Used by the closure-delta incremental route, whose in-RAM graph is a proxy
+ * buffer with no project-wide edges — scoring there would persist a near-zero
+ * in-degree for heavily-referenced symbols in the changed files. Must be
+ * called on the STAGING store AFTER cbm_delta_patch has merged nodes and
+ * re-linked inbound edges. Returns 0 on success; the caller treats failure as
+ * a delta-route failure and falls back to a full rebuild. */
+int cbm_pipeline_importance_recompute_store(cbm_store_t *store, const char *project);
 
 /* Work counters for the importance pass (pass_importance.c). Deltas are read
  * by the complexity suite's linearity gate; never reset by the pass itself, so
@@ -654,6 +681,9 @@ void cbm_pipeline_importance_append_prop(cbm_gbuf_node_t *node, double score);
  * superlinear if the per-distinct-name memoization is ever lost. */
 extern _Atomic uint64_t g_importance_nodes;
 extern _Atomic uint64_t g_importance_name_visits;
+/* Rows rescored by the SQL-level store recompute. Lets a test prove the
+ * closure-delta route actually took that path instead of passing vacuously. */
+extern _Atomic uint64_t g_importance_store_rows;
 
 /* ── Env URL scanner (pass_envscan.c) ────────────────────────────── */
 

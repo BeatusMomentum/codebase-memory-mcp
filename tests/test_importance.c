@@ -101,6 +101,97 @@ static int imp_check_label(cbm_store_t *s, const char *project, const char *labe
     return bad == 0 ? count : -1;
 }
 
+/* ── Store-level score readout (for the closure-delta tests) ──────────── */
+
+typedef struct {
+    char **qns;
+    double *scores;
+    int count;
+} ImpScoreSet;
+
+static void imp_scores_free(ImpScoreSet *set) {
+    for (int i = 0; i < set->count; i++) {
+        free(set->qns[i]);
+    }
+    free(set->qns);
+    free(set->scores);
+    set->qns = NULL;
+    set->scores = NULL;
+    set->count = 0;
+}
+
+/* Collect (qualified_name -> importance) for every scored label in a store. */
+static int imp_collect_scores(const char *db_path, const char *project, ImpScoreSet *out) {
+    static const char *const kLabels[] = {"Function", "Method", "Class"};
+    memset(out, 0, sizeof(*out));
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        return -1;
+    }
+    int rc = 0;
+    for (int li = 0; li < 3; li++) {
+        cbm_node_t *nodes = NULL;
+        int n = 0;
+        if (cbm_store_find_nodes_by_label(s, project, kLabels[li], &nodes, &n) != CBM_STORE_OK) {
+            rc = -1;
+            break;
+        }
+        char **qns = realloc(out->qns, (size_t)(out->count + n) * sizeof(*qns));
+        double *sc = realloc(out->scores, (size_t)(out->count + n) * sizeof(*sc));
+        if (n > 0 && (!qns || !sc)) {
+            cbm_store_free_nodes(nodes, n);
+            rc = -1;
+            break;
+        }
+        if (qns) {
+            out->qns = qns;
+        }
+        if (sc) {
+            out->scores = sc;
+        }
+        for (int i = 0; i < n; i++) {
+            out->qns[out->count] = strdup(nodes[i].qualified_name ? nodes[i].qualified_name : "");
+            out->scores[out->count] = imp_value(nodes[i].properties_json);
+            out->count++;
+        }
+        cbm_store_free_nodes(nodes, n);
+    }
+    cbm_store_close(s);
+    return rc;
+}
+
+static double imp_score_of(const ImpScoreSet *set, const char *qn_suffix) {
+    for (int i = 0; i < set->count; i++) {
+        size_t l = strlen(set->qns[i]);
+        size_t k = strlen(qn_suffix);
+        if (l >= k && strcmp(set->qns[i] + (l - k), qn_suffix) == 0) {
+            return set->scores[i];
+        }
+    }
+    return -999.0;
+}
+
+/* Write a fixture whose `helper` in hot.py is called from `callers` other
+ * files — the inbound edges that only exist project-wide, never in a delta
+ * buffer. `tag` lets the caller perturb hot.py to force a re-parse. */
+static int imp_write_hot_fixture(const char *root, int callers, const char *tag) {
+    char body[256];
+    snprintf(body, sizeof(body), "%sdef helper():\n    return 1\n", tag);
+    if (th_write_file(TH_PATH(root, "hot.py"), body) != 0) {
+        return -1;
+    }
+    for (int i = 0; i < callers; i++) {
+        char rel[64];
+        char src[192];
+        snprintf(rel, sizeof(rel), "c%d.py", i);
+        snprintf(src, sizeof(src), "import hot\n\ndef use%d():\n    return hot.helper()\n", i);
+        if (th_write_file(TH_PATH(root, rel), src) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 /* ── Registration: the pass must actually execute ─────────────────────── */
 
 /* A miscounted PREDUMP_PASS_COUNT silently drops the last-registered pass.
@@ -577,6 +668,181 @@ TEST(importance_second_index_run_keeps_exactly_one_key) {
     PASS();
 }
 
+/* ── Closure-delta route: the graph is only complete in the store ─────── */
+
+/* REGRESSION. `helper` lives in hot.py and is called from 25 other files. Edit
+ * hot.py and re-index: the closure-delta route purges hot.py's rows, rebuilds
+ * them from a PROXY buffer that holds no project-wide edges, and persists what
+ * it computed. Scoring off that buffer sees in-degree 0 and stores 0.0 for a
+ * symbol with 25 real callers. The fix rescores in SQL after cbm_delta_patch
+ * has re-linked the snapshotted inbound edges. */
+TEST(importance_closure_delta_keeps_referenced_symbol_sane) {
+    enum { CALLERS = 25 };
+    char *tmp = th_mktempdir("cbm_imp_delta");
+    if (!tmp) {
+        FAIL("tmpdir");
+    }
+    char root[512];
+    snprintf(root, sizeof(root), "%s", tmp);
+    char *tmp2 = th_mktempdir("cbm_imp_deltadb");
+    if (!tmp2) {
+        th_rmtree(root);
+        FAIL("tmpdir2");
+    }
+    char dbdir[512];
+    snprintf(dbdir, sizeof(dbdir), "%s", tmp2);
+
+    ASSERT_EQ(imp_write_hot_fixture(root, CALLERS, ""), 0);
+
+    char db_path[600];
+    snprintf(db_path, sizeof(db_path), "%s/graph.db", dbdir);
+    cbm_pipeline_t *p1 = cbm_pipeline_new(root, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p1));
+    cbm_pipeline_free(p1);
+
+    ImpScoreSet before = {0};
+    ASSERT_EQ(imp_collect_scores(db_path, project, &before), 0);
+    double full_score = imp_score_of(&before, "helper");
+    printf("    full-index helper score %.6f (expect sqrt(%d) = %.6f)\n", full_score, CALLERS,
+           sqrt((double)CALLERS));
+    /* Non-vacuous: the callers really produced edges. If this is 0 the fixture
+     * stopped exercising the bug and the test below would prove nothing. */
+    ASSERT_TRUE(full_score > 1.0);
+    imp_scores_free(&before);
+
+    /* Touch hot.py so the delta route has exactly one file to repair. */
+    ASSERT_EQ(imp_write_hot_fixture(root, CALLERS, "# touched\n"), 0);
+
+    uint64_t sql0 = atomic_load_explicit(&g_importance_store_rows, memory_order_relaxed);
+    cbm_pipeline_t *p2 = cbm_pipeline_new(root, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    ASSERT_EQ(cbm_pipeline_run(p2), 0);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(p2);
+    uint64_t sql_rows = atomic_load_explicit(&g_importance_store_rows, memory_order_relaxed) - sql0;
+
+    /* Route proof — without it a fall-back to a full reindex would repair the
+     * score for the wrong reason and the test would pass vacuously. */
+    printf("    route=%d (closure_repair=%d)  sql_rescored_rows=%llu\n", (int)route,
+           (int)CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR, (unsigned long long)sql_rows);
+    ASSERT_EQ((int)route, (int)CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+
+    ImpScoreSet after = {0};
+    ASSERT_EQ(imp_collect_scores(db_path, project, &after), 0);
+    double delta_score = imp_score_of(&after, "helper");
+    printf("    after closure-delta helper score %.6f\n", delta_score);
+    imp_scores_free(&after);
+
+    th_rmtree(root);
+    th_rmtree(dbdir);
+    /* THE SYMPTOM, asserted before any mechanism guard: the graph is unchanged,
+     * so the score must be unchanged. Scoring off the proxy buffer yields 0.0. */
+    ASSERT_FLOAT_EQ(delta_score, full_score, 1e-6);
+    /* Mechanism guard second, so a regression fails on the wrong score rather
+     * than on bookkeeping. */
+    ASSERT_GT((long long)sql_rows, 0);
+    PASS();
+}
+
+/* EQUIVALENCE. A full index and an incremental index that converge on the same
+ * tree must produce the same scores — for every symbol, not just the hot one.
+ * Same directory and therefore the same project name and qualified names, so
+ * the two score maps are directly comparable. */
+TEST(importance_full_and_incremental_converge_on_same_scores) {
+    enum { CALLERS = 12 };
+    char *tmp = th_mktempdir("cbm_imp_equiv");
+    if (!tmp) {
+        FAIL("tmpdir");
+    }
+    char root[512];
+    snprintf(root, sizeof(root), "%s", tmp);
+    char *tmp2 = th_mktempdir("cbm_imp_equivdb");
+    if (!tmp2) {
+        th_rmtree(root);
+        FAIL("tmpdir2");
+    }
+    char dbdir[512];
+    snprintf(dbdir, sizeof(dbdir), "%s", tmp2);
+
+    /* v1: every caller but c0 calls helper. c0 imports hot but does not. */
+    ASSERT_EQ(imp_write_hot_fixture(root, CALLERS, ""), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "c0.py"), "import hot\n\ndef use0():\n    return 1\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "extra.py"),
+                            "import hot\n\ndef load_user_profile():\n    return hot.helper()\n"),
+              0);
+
+    char db_incr[600];
+    snprintf(db_incr, sizeof(db_incr), "%s/incr.db", dbdir);
+    cbm_pipeline_t *p1 = cbm_pipeline_new(root, db_incr, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p1));
+    cbm_pipeline_free(p1);
+
+    /* v2: c0's BODY starts calling helper. Body-only, so c0's surface is
+     * unchanged and the closure planner accepts the delta — but the in-degree
+     * of `helper`, which lives in the UNCHANGED hot.py, goes up by one. That
+     * is the case a changed-files-only rescore gets wrong: the symbol whose
+     * score moved is not in the changed set at all. */
+    ASSERT_EQ(th_write_file(TH_PATH(root, "c0.py"),
+                            "import hot\n\ndef use0():\n    return hot.helper()\n"),
+              0);
+
+    uint64_t sql0 = atomic_load_explicit(&g_importance_store_rows, memory_order_relaxed);
+    cbm_pipeline_t *p2 = cbm_pipeline_new(root, db_incr, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    ASSERT_EQ(cbm_pipeline_run(p2), 0);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(p2);
+    uint64_t sql_rows = atomic_load_explicit(&g_importance_store_rows, memory_order_relaxed) - sql0;
+    printf("    route=%d (closure_repair=%d)  sql_rescored_rows=%llu\n", (int)route,
+           (int)CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR, (unsigned long long)sql_rows);
+    ASSERT_EQ((int)route, (int)CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+
+    /* Same tree, indexed cold into a separate database. */
+    char db_full[600];
+    snprintf(db_full, sizeof(db_full), "%s/full.db", dbdir);
+    cbm_pipeline_t *p3 = cbm_pipeline_new(root, db_full, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p3);
+    ASSERT_EQ(cbm_pipeline_run(p3), 0);
+    cbm_pipeline_free(p3);
+
+    ImpScoreSet incr = {0};
+    ImpScoreSet full = {0};
+    ASSERT_EQ(imp_collect_scores(db_incr, project, &incr), 0);
+    ASSERT_EQ(imp_collect_scores(db_full, project, &full), 0);
+    printf("    scored symbols: incremental=%d full=%d\n", incr.count, full.count);
+
+    int mismatches = 0;
+    for (int i = 0; i < full.count; i++) {
+        double a = full.scores[i];
+        double b = imp_score_of(&incr, full.qns[i]);
+        if (!(fabs(a - b) < 1e-6)) {
+            mismatches++;
+            if (mismatches <= 5) {
+                printf("    MISMATCH %s: full=%.6f incremental=%.6f\n", full.qns[i], a, b);
+            }
+        }
+    }
+    int count_full = full.count;
+    int count_incr = incr.count;
+    imp_scores_free(&incr);
+    imp_scores_free(&full);
+    th_rmtree(root);
+    th_rmtree(dbdir);
+
+    ASSERT_GT(count_full, 5); /* non-vacuous: there really are symbols to compare */
+    ASSERT_EQ(count_incr, count_full);
+    ASSERT_EQ(mismatches, 0);          /* the symptom */
+    ASSERT_GT((long long)sql_rows, 0); /* mechanism guard, asserted second */
+    PASS();
+}
+
 /* ── Cost shape ───────────────────────────────────────────────────────── */
 
 /* The distinct-file count must be computed once per distinct NAME. Computing
@@ -635,6 +901,10 @@ SUITE(importance) {
     RUN_TEST(importance_pass_is_idempotent_across_reruns);
     RUN_TEST(importance_rehydrated_node_keeps_exactly_one_key);
     RUN_TEST(importance_second_index_run_keeps_exactly_one_key);
+
+    /* Closure-delta route — the store-level recompute. */
+    RUN_TEST(importance_closure_delta_keeps_referenced_symbol_sane);
+    RUN_TEST(importance_full_and_incremental_converge_on_same_scores);
 
     /* Cost shape. */
     RUN_TEST(importance_distinct_file_count_is_linear_in_group_size);

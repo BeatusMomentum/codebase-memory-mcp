@@ -60,7 +60,9 @@
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
+#include "store/store.h"
 #include "cbm.h"
+#include "sqlite3.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -75,6 +77,7 @@
  * Never reset here: callers snapshot before/after so nested runs compose. */
 _Atomic uint64_t g_importance_nodes = 0;
 _Atomic uint64_t g_importance_name_visits = 0;
+_Atomic uint64_t g_importance_store_rows = 0;
 
 enum {
     CBM_IMPORTANCE_GENERIC_MIN_FILES = 5, /* name defined in >= N files -> generic */
@@ -212,37 +215,39 @@ static const char *imp_find_key(const char *json, const char *key) {
     return NULL;
 }
 
-/* Write the numeric "importance" key into a node's properties JSON object.
+/* Produce a copy of `json` carrying the numeric "importance" key set to
+ * `score`, or NULL if `json` is not a JSON object (caller leaves it alone) or
+ * on allocation failure. Caller owns the result.
  *
- * IDEMPOTENT BY CONTRACT. The incremental path rehydrates nodes straight out
- * of the store (cbm_gbuf_load_from_db), and those nodes ALREADY carry an
- * "importance" key from the previous run. A pure append would emit
- * {"importance":1.0,...,"importance":2.0} — silent property corruption that
- * no build or schema check would catch. So: overwrite an existing key in
- * place, append only when the key is genuinely absent.
+ * IDEMPOTENT BY CONTRACT. Nodes reach this function already carrying an
+ * "importance" key on every re-scoring route: the legacy-partial incremental
+ * path rehydrates them via cbm_gbuf_load_from_db, and the store-level
+ * recompute reads them straight out of SQLite. A pure append would emit
+ * {"importance":1.0,...,"importance":2.0} — silent property corruption that no
+ * build or schema check would catch. So: overwrite an existing key in place,
+ * append only when the key is genuinely absent.
  *
- * A properties_json that is not a JSON object is left untouched. */
-void cbm_pipeline_importance_append_prop(cbm_gbuf_node_t *node, double score) {
-    if (!node) {
-        return;
-    }
-    const char *old = node->properties_json ? node->properties_json : "{}";
+ * SINGLE DEFINITION. Both scoring routes (the in-memory gbuf pass and the
+ * SQL-level store recompute) write through this one function, so the JSON
+ * shape cannot drift between them. */
+char *cbm_pipeline_importance_set_prop(const char *json, double score) {
+    const char *old = json ? json : "{}";
     size_t olen = strlen(old);
     if (olen < 2 || old[olen - 1] != '}') {
-        return; /* not a JSON object — leave untouched */
+        return NULL; /* not a JSON object — leave untouched */
     }
 
     char val[CBM_SZ_32];
     int vn = snprintf(val, sizeof(val), "%.6f", score);
     if (vn < 0 || (size_t)vn >= sizeof(val)) {
-        return;
+        return NULL;
     }
 
     const char *k = imp_find_key(old, "importance");
     if (k) {
         const char *colon = strchr(k, ':');
         if (!colon) {
-            return; /* imp_find_key guarantees one, but never trust a raw scan */
+            return NULL; /* imp_find_key guarantees one, but never trust a raw scan */
         }
         const char *v = colon + 1;
         while (isspace((unsigned char)*v)) {
@@ -250,35 +255,75 @@ void cbm_pipeline_importance_append_prop(cbm_gbuf_node_t *node, double score) {
         }
         const char *vend = imp_value_end(v);
         if (!vend) {
-            return;
+            return NULL;
         }
         size_t head = (size_t)(v - old);
         size_t tail = strlen(vend);
         char *neu = malloc(head + (size_t)vn + tail + 1);
         if (!neu) {
-            return;
+            return NULL;
         }
         memcpy(neu, old, head);
         memcpy(neu + head, val, (size_t)vn);
         memcpy(neu + head + (size_t)vn, vend, tail + 1);
-        free(node->properties_json);
-        node->properties_json = neu;
-        return;
+        return neu;
     }
 
     char frag[CBM_SZ_64];
     int fn = snprintf(frag, sizeof(frag), "%s\"importance\":%s}", (olen == 2) ? "" : ",", val);
     if (fn < 0 || (size_t)fn >= sizeof(frag)) {
-        return;
+        return NULL;
     }
     char *neu = malloc(olen - 1 + (size_t)fn + 1);
     if (!neu) {
-        return;
+        return NULL;
     }
     memcpy(neu, old, olen - 1); /* copy without the trailing '}' */
     memcpy(neu + olen - 1, frag, (size_t)fn + 1);
+    return neu;
+}
+
+/* gbuf-node convenience wrapper around cbm_pipeline_importance_set_prop. */
+void cbm_pipeline_importance_append_prop(cbm_gbuf_node_t *node, double score) {
+    if (!node) {
+        return;
+    }
+    char *neu = cbm_pipeline_importance_set_prop(node->properties_json, score);
+    if (!neu) {
+        return;
+    }
     free(node->properties_json);
     node->properties_json = neu;
+}
+
+/* ── The scoring rule ─────────────────────────────────────────────────
+ *
+ * SINGLE DEFINITION, deliberately. There are two routes that score nodes —
+ * the in-memory gbuf pass (full index, legacy-partial incremental) and the
+ * SQL-level recompute over the staging store (closure-delta incremental) —
+ * and they gather their inputs very differently. Only the GATHERING differs;
+ * the rule itself lives here alone, so the two routes cannot drift apart in
+ * what a score means. The equivalence test in tests/test_importance.c guards
+ * the remaining freedom: that both gatherings produce the same inputs for the
+ * same graph. */
+double cbm_pipeline_importance_score(const cbm_importance_inputs_t *in) {
+    if (!in) {
+        return 0.0;
+    }
+    double score = sqrt((double)(in->num_refs > 0 ? in->num_refs : 0));
+    if (name_is_private(in->name)) {
+        score *= CBM_IMPORTANCE_PRIV_MUL;
+    }
+    if (in->name_distinct_files >= CBM_IMPORTANCE_GENERIC_MIN_FILES) {
+        score *= CBM_IMPORTANCE_GENERIC_MUL;
+    }
+    if (name_is_distinctive(in->name)) {
+        score *= CBM_IMPORTANCE_DISTINCT_MUL;
+    }
+    if (cbm_is_test_path(in->file_path) || in->tests_target) {
+        score *= CBM_IMPORTANCE_TEST_MUL;
+    }
+    return score;
 }
 
 /* ── Distinct-file counting (the linear core) ─────────────────────────── */
@@ -367,24 +412,16 @@ void cbm_pipeline_pass_importance(cbm_pipeline_ctx_t *ctx) {
         for (int i = 0; i < count; i++) {
             cbm_gbuf_node_t *n = (cbm_gbuf_node_t *)nodes[i];
 
-            int num_refs =
-                incoming_edge_count(gb, n->id, "CALLS") + incoming_edge_count(gb, n->id, "USAGE");
-            double score = sqrt((double)num_refs);
-
-            if (name_is_private(n->name)) {
-                score *= CBM_IMPORTANCE_PRIV_MUL;
-            }
-            if (imp_distinct_file_count(gb, n->name, &ix) >= CBM_IMPORTANCE_GENERIC_MIN_FILES) {
-                score *= CBM_IMPORTANCE_GENERIC_MUL;
-            }
-            if (name_is_distinctive(n->name)) {
-                score *= CBM_IMPORTANCE_DISTINCT_MUL;
-            }
-            if (cbm_is_test_path(n->file_path) || incoming_edge_count(gb, n->id, "TESTS") > 0) {
-                score *= CBM_IMPORTANCE_TEST_MUL;
-            }
-
-            cbm_pipeline_importance_append_prop(n, score);
+            /* Gather only — the rule itself lives in one place. */
+            cbm_importance_inputs_t in = {
+                .name = n->name,
+                .file_path = n->file_path,
+                .num_refs = incoming_edge_count(gb, n->id, "CALLS") +
+                            incoming_edge_count(gb, n->id, "USAGE"),
+                .name_distinct_files = imp_distinct_file_count(gb, n->name, &ix),
+                .tests_target = incoming_edge_count(gb, n->id, "TESTS") > 0,
+            };
+            cbm_pipeline_importance_append_prop(n, cbm_pipeline_importance_score(&in));
             updated++;
         }
     }
@@ -393,4 +430,127 @@ void cbm_pipeline_pass_importance(cbm_pipeline_ctx_t *ctx) {
     cbm_ht_free(ix.counts);
     atomic_fetch_add_explicit(&g_importance_nodes, updated, memory_order_relaxed);
     cbm_log_info("pass.importance", "symbols", itoa_imp(updated));
+}
+
+/* ── Store-level recompute (closure-delta incremental) ────────────────
+ *
+ * WHY THIS EXISTS. The closure-delta route never materialises the project
+ * graph in RAM: cbm_delta_preseed fills the delta gbuf with *proxy* nodes
+ * (id, label, name, qn, file_path — no edges, empty properties), and only the
+ * re-extracted files' symbols carry real edges. Scoring there reads a
+ * near-zero in-degree for a symbol referenced hundreds of times project-wide,
+ * and cbm_delta_patch then persists exactly those fresh rows. Loading the full
+ * graph to fix that would give back the point of the delta route, so the
+ * recompute runs where the complete graph already exists: in SQL, over the
+ * staging store, AFTER cbm_delta_patch has inserted the new nodes and
+ * re-linked the snapshotted inbound edges.
+ *
+ * WHY IT CANNOT DRIFT FROM THE IN-MEMORY PASS. The scoring rule and the JSON
+ * write-back are not reimplemented here. They are registered as SQLite
+ * user-defined functions that call cbm_pipeline_importance_score() and
+ * cbm_pipeline_importance_set_prop() — the same C code the gbuf pass runs.
+ * SQL supplies only the three aggregates (in-degree, TESTS presence, distinct
+ * files per name), each one indexed GROUP BY. What remains free is the
+ * GATHERING, and the full-vs-incremental equivalence test guards that.
+ *
+ * The whole project is rescored, not just the changed files: distinct-files-
+ * per-name is a global input, so editing one file can legitimately move a name
+ * across the generic-name threshold for every other definition of that name. A
+ * scoped recompute would leave those stale — and would fail the equivalence
+ * test, correctly. */
+
+/* UDF: cbm_imp_score(name, file_path, num_refs, name_files, tests_target). */
+static void sql_importance_score(sqlite3_context *c, int argc, sqlite3_value **argv) {
+    if (argc != 5) {
+        sqlite3_result_error(c, "cbm_imp_score arity", -1);
+        return;
+    }
+    cbm_importance_inputs_t in = {
+        .name = (const char *)sqlite3_value_text(argv[0]),
+        .file_path = (const char *)sqlite3_value_text(argv[1]),
+        .num_refs = sqlite3_value_int(argv[2]),
+        .name_distinct_files = sqlite3_value_int(argv[3]),
+        .tests_target = sqlite3_value_int(argv[4]) != 0,
+    };
+    sqlite3_result_double(c, cbm_pipeline_importance_score(&in));
+}
+
+/* UDF: cbm_imp_set(properties, score) → properties with "importance" set.
+ * A non-object blob yields NULL; the UPDATE's COALESCE then leaves that row
+ * untouched — the same tolerance the in-memory writer has. */
+static void sql_importance_set(sqlite3_context *c, int argc, sqlite3_value **argv) {
+    if (argc != 2) {
+        sqlite3_result_error(c, "cbm_imp_set arity", -1);
+        return;
+    }
+    const char *props = (const char *)sqlite3_value_text(argv[0]);
+    char *neu = cbm_pipeline_importance_set_prop(props, sqlite3_value_double(argv[1]));
+    if (!neu) {
+        sqlite3_result_null(c);
+        return;
+    }
+    sqlite3_result_text(c, neu, -1, SQLITE_TRANSIENT);
+    free(neu);
+}
+
+/* The aggregate CTE is MATERIALIZED on purpose: it reads `nodes` while the
+ * UPDATE writes `nodes`, and materialising settles that ordering explicitly
+ * rather than relying on the planner to choose it. */
+static const char *const kImportanceRecomputeSQL =
+    "WITH agg AS MATERIALIZED ("
+    "  SELECT n.id AS id,"
+    "         cbm_imp_score(n.name, n.file_path, COALESCE(d.refs, 0),"
+    "                       COALESCE(f.files, 0), COALESCE(d.tests, 0)) AS score"
+    "  FROM nodes n"
+    "  LEFT JOIN (SELECT target_id AS id,"
+    "                    SUM(CASE WHEN type IN ('CALLS','USAGE') THEN 1 ELSE 0 END) AS refs,"
+    "                    SUM(CASE WHEN type = 'TESTS' THEN 1 ELSE 0 END) AS tests"
+    "             FROM edges WHERE project = ?1 GROUP BY target_id) d ON d.id = n.id"
+    "  LEFT JOIN (SELECT name, COUNT(DISTINCT file_path) AS files"
+    "             FROM nodes WHERE project = ?1 GROUP BY name) f ON f.name = n.name"
+    "  WHERE n.project = ?1 AND n.label IN ('Function','Method','Class')"
+    ")"
+    "UPDATE nodes SET properties = COALESCE(cbm_imp_set(properties, agg.score), properties)"
+    " FROM agg WHERE nodes.id = agg.id";
+
+int cbm_pipeline_importance_recompute_store(cbm_store_t *store, const char *project) {
+    if (!store || !project) {
+        return -1;
+    }
+    sqlite3 *db = cbm_store_get_db(store);
+    if (!db) {
+        return -1;
+    }
+    if (sqlite3_create_function(db, "cbm_imp_score", 5, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL,
+                                sql_importance_score, NULL, NULL) != SQLITE_OK ||
+        sqlite3_create_function(db, "cbm_imp_set", 2, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL,
+                                sql_importance_set, NULL, NULL) != SQLITE_OK) {
+        cbm_log_error("importance.store_udf_failed", "err", sqlite3_errmsg(db));
+        return -1;
+    }
+    if (cbm_store_begin(store) != CBM_STORE_OK) {
+        return -1;
+    }
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, kImportanceRecomputeSQL, -1, &st, NULL) != SQLITE_OK) {
+        cbm_log_error("importance.store_prepare_failed", "err", sqlite3_errmsg(db));
+        cbm_store_rollback(store);
+        return -1;
+    }
+    sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
+    int step_rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (step_rc != SQLITE_DONE) {
+        cbm_log_error("importance.store_step_failed", "err", sqlite3_errmsg(db));
+        cbm_store_rollback(store);
+        return -1;
+    }
+    int changed = sqlite3_changes(db);
+    if (cbm_store_commit(store) != CBM_STORE_OK) {
+        return -1;
+    }
+    uint64_t rows = (uint64_t)(changed > 0 ? changed : 0);
+    atomic_fetch_add_explicit(&g_importance_store_rows, rows, memory_order_relaxed);
+    cbm_log_info("pass.importance_store", "symbols", itoa_imp(rows));
+    return 0;
 }
