@@ -7595,6 +7595,11 @@ TEST(tool_corrupt_store_cleanup_guard_is_balanced_and_not_nested) {
         mcp_find_corrupt_backups(cache, project, query_backup_path, sizeof(query_backup_path));
     bool query_quarantined =
         !cbm_file_exists(db_path) && query_backup_count == 1 && query_backup_path[0] != '\0';
+    /* Snapshot the on-disk state HERE: the manage_adr branch below replants
+     * and then quarantines this same path, and the suite's cleanup unlinks
+     * it before the assertions run — a later cbm_file_exists() would observe
+     * that teardown, not the query-only resolve this check pins. */
+    bool query_db_left_in_place = cbm_file_exists(db_path);
 
     /* Replant the same deterministic corruption to exercise manage_adr's
      * already-held lease independently from the query server above. */
@@ -7628,7 +7633,7 @@ TEST(tool_corrupt_store_cleanup_guard_is_balanced_and_not_nested) {
      * and its sidecars stay in place, and the reply names the corruption
      * instead of "project not found". */
     ASSERT_FALSE(query_quarantined);
-    ASSERT_TRUE(cbm_file_exists(db_path));
+    ASSERT_TRUE(query_db_left_in_place);
     ASSERT_TRUE(query_reports_corruption);
     ASSERT_EQ(query_probe.begin_count, 0);
     ASSERT_EQ(query_probe.end_count, 0);
