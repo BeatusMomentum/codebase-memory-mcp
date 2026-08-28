@@ -892,6 +892,14 @@ static const char *graphql_field_types[] = {"field_definition", "input_value_def
 // the generic embedded-imports walker re-parse that slice with the JS grammar
 // so the existing ES import extractor sees real import_statement nodes.
 // Terminator: an entry whose script_node_type is NULL.
+static const CBMEmbeddedLangSpec cfml_embedded_imports[] = {
+    /* Tag-dialect CFML keeps <cfscript> bodies as opaque cf_script_content;
+     * re-parse them with the cfscript grammar through the shared included-
+     * ranges machinery so defs (and calls) inside legacy components extract
+     * with absolute coordinates. Distilled from #1412. */
+    {"cf_script_tag", "cf_script_content", CBM_LANG_CFSCRIPT},
+    {NULL, NULL, 0},
+};
 static const CBMEmbeddedLangSpec vue_embedded_imports[] = {
     {"script_element", "raw_text", CBM_LANG_JAVASCRIPT},
     {NULL, NULL, 0},
@@ -2119,7 +2127,7 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
     [CBM_LANG_CFML] = {CBM_LANG_CFML, cfml_func_types, empty_types, empty_types, cfml_module_types,
                        cfml_call_types, empty_types, empty_types, cfml_branch_types, empty_types,
                        empty_types, empty_types, NULL, empty_types, NULL, NULL, tree_sitter_cfml,
-                       NULL},
+                       cfml_embedded_imports},
 
     // CBM_LANG_GLEAM
     [CBM_LANG_GLEAM] = {CBM_LANG_GLEAM, gleam_func_types, gleam_class_types, gleam_field_types,
