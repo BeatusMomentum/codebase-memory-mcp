@@ -914,6 +914,7 @@ TEST(mcp_tools_have_behavior_annotations) {
         {"trace_path", false, true, true, false},
         {"get_code_snippet", false, true, true, false},
         {"get_graph_schema", false, true, true, false},
+        {"compare_graphs", true, false, true, false},
         {"get_architecture", false, true, true, false},
         {"search_code", false, true, true, false},
         {"list_projects", true, false, true, false},
@@ -1359,9 +1360,9 @@ TEST(server_handle_analysis_profile_filters_and_rejects_mutators) {
     resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":220,\"method\":\"tools/list\"}");
     ASSERT_NOT_NULL(resp);
     static const char *const analysis_tools[] = {
-        "search_graph",     "query_graph",          "trace_path",     "get_code_snippet",
-        "get_graph_schema", "get_architecture",     "search_code",    "list_projects",
-        "index_status",     "check_index_coverage", "detect_changes",
+        "search_graph",     "query_graph",    "trace_path",           "get_code_snippet",
+        "get_graph_schema", "compare_graphs", "get_architecture",     "search_code",
+        "list_projects",    "index_status",   "check_index_coverage", "detect_changes",
     };
     ASSERT_EQ(mcp_response_tool_count(resp), sizeof(analysis_tools) / sizeof(analysis_tools[0]));
     for (size_t i = 0U; i < sizeof(analysis_tools) / sizeof(analysis_tools[0]); i++) {
@@ -1411,6 +1412,7 @@ TEST(server_handle_scout_profile_exposes_only_the_fast_tier) {
     ASSERT_FALSE(mcp_response_has_exact_tool(resp, "query_graph"));
     ASSERT_FALSE(mcp_response_has_exact_tool(resp, "search_code"));
     ASSERT_FALSE(mcp_response_has_exact_tool(resp, "get_graph_schema"));
+    ASSERT_FALSE(mcp_response_has_exact_tool(resp, "compare_graphs"));
     ASSERT_FALSE(mcp_response_has_exact_tool(resp, "detect_changes"));
     ASSERT_FALSE(mcp_response_has_exact_tool(resp, "index_repository"));
     free(resp);
@@ -1664,6 +1666,24 @@ TEST(tool_unknown_tool) {
     ASSERT_NOT_NULL(resp);
     /* Should return result with isError */
     ASSERT_NOT_NULL(strstr(resp, "isError"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Issue #525: compare_graphs is a first-class analysis tool. The frozen base
+ * routes this call to the unknown-tool fallback; production registration is
+ * therefore required before any compare semantics can accidentally look green. */
+TEST(tool_compare_graphs_registered_issue525) {
+    cbm_mcp_server_t *srv = setup_mcp_with_data();
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":525,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"compare_graphs\",\"arguments\":{"
+             "\"base_project\":\"base525\",\"target_project\":\"target525\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "unknown tool: compare_graphs"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -7923,6 +7943,485 @@ static char *extract_text_content(const char *mcp_result) {
     return result;
 }
 
+typedef struct {
+    char cache[512];
+    char base_path[768];
+    char target_path[768];
+    char *saved_cache;
+} compare_graphs_fixture_t;
+
+typedef struct {
+    const char *qualified_name;
+    const char *label;
+    const char *file_path;
+} compare_node_spec_t;
+
+static bool compare_write_coverage(cbm_store_t *store, const char *project,
+                                   const char *generation) {
+    cbm_coverage_meta_t meta = {
+        .generation = generation,
+        .index_mode = "full",
+        .recorded_at = "2026-08-28T00:00:00Z",
+        .recording_status = "complete",
+        .ignored_files_stored = 0,
+        .ignored_files_total = 0,
+        .coverage_version = 1,
+        .hash_records_complete = true,
+    };
+    return cbm_store_coverage_replace_ex(store, project, NULL, 0, &meta) == CBM_STORE_OK;
+}
+
+static bool compare_write_fixture_store(const char *path, const char *project, bool target) {
+    static const compare_node_spec_t base_nodes[] = {
+        {"pkg.common", "Function", "src/common.c"}, {"pkg.base", "Function", "src/base.c"},
+        {"pkg.changed", "Function", "src/old.c"},   {"pkg.source", "Module", "src/source.c"},
+        {"pkg.sink", "Module", "src/sink.c"},
+    };
+    static const compare_node_spec_t target_nodes[] = {
+        {"pkg.common", "Function", "src/common.c"}, {"pkg.target", "Function", "src/target.c"},
+        {"pkg.changed", "Method", "src/new.c"},     {"pkg.source", "Module", "src/source.c"},
+        {"pkg.sink", "Module", "src/sink.c"},
+    };
+    static const int base_order[] = {3, 2, 0, 4, 1};
+    static const int target_order[] = {1, 4, 0, 2, 3};
+    const compare_node_spec_t *nodes = target ? target_nodes : base_nodes;
+    const int *order = target ? target_order : base_order;
+
+    cbm_store_t *store = cbm_store_open_path(path);
+    if (!store ||
+        cbm_store_upsert_project(store, project, "/tmp/compare-graphs-525") != CBM_STORE_OK) {
+        cbm_store_close(store);
+        return false;
+    }
+    int64_t ids[5] = {0};
+    bool ok = true;
+    for (size_t position = 0; position < 5; position++) {
+        int index = order[position];
+        cbm_node_t node = {
+            .project = project,
+            .label = nodes[index].label,
+            .name = nodes[index].qualified_name,
+            .qualified_name = nodes[index].qualified_name,
+            .file_path = nodes[index].file_path,
+            .properties_json = "{}",
+        };
+        ids[index] = cbm_store_upsert_node(store, &node);
+        ok = ok && ids[index] > 0;
+    }
+
+    cbm_edge_t common_call = {
+        .project = project,
+        .source_id = ids[3],
+        .target_id = ids[4],
+        .type = "CALLS",
+        .properties_json = "{}",
+    };
+    cbm_edge_t common_import = {
+        .project = project,
+        .source_id = ids[3],
+        .target_id = ids[4],
+        .type = "IMPORTS",
+        .properties_json = "{\"local_name\":\"Alpha\"}",
+    };
+    cbm_edge_t changed_import = {
+        .project = project,
+        .source_id = ids[3],
+        .target_id = ids[4],
+        .type = "IMPORTS",
+        .properties_json = target ? "{\"local_name\":\"Gamma\"}" : "{\"local_name\":\"Beta\"}",
+    };
+    cbm_edge_t side_edge = {
+        .project = project,
+        .source_id = ids[1],
+        .target_id = ids[0],
+        .type = "USES",
+        .properties_json = "{}",
+    };
+    if (target) {
+        ok = ok && cbm_store_insert_edge(store, &side_edge) > 0 &&
+             cbm_store_insert_edge(store, &changed_import) > 0 &&
+             cbm_store_insert_edge(store, &common_call) > 0 &&
+             cbm_store_insert_edge(store, &common_import) > 0;
+    } else {
+        ok = ok && cbm_store_insert_edge(store, &common_import) > 0 &&
+             cbm_store_insert_edge(store, &common_call) > 0 &&
+             cbm_store_insert_edge(store, &side_edge) > 0 &&
+             cbm_store_insert_edge(store, &changed_import) > 0;
+    }
+    ok = ok &&
+         compare_write_coverage(store, project,
+                                target ? "target-generation-525" : "base-generation-525") &&
+         cbm_store_prepare_for_publish(store) == CBM_STORE_OK;
+    cbm_store_close(store);
+    return ok;
+}
+
+static bool compare_graphs_fixture_open(compare_graphs_fixture_t *fixture) {
+    memset(fixture, 0, sizeof(*fixture));
+    snprintf(fixture->cache, sizeof(fixture->cache), "%s/cbm-compare-525-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(fixture->cache)) {
+        return false;
+    }
+    const char *saved = getenv("CBM_CACHE_DIR");
+    fixture->saved_cache = saved ? strdup(saved) : NULL;
+    if ((saved && !fixture->saved_cache) || cbm_setenv("CBM_CACHE_DIR", fixture->cache, 1) != 0) {
+        free(fixture->saved_cache);
+        fixture->saved_cache = NULL;
+        (void)th_rmtree(fixture->cache);
+        return false;
+    }
+    snprintf(fixture->base_path, sizeof(fixture->base_path), "%s/base525.db", fixture->cache);
+    snprintf(fixture->target_path, sizeof(fixture->target_path), "%s/target525.db", fixture->cache);
+    if (!compare_write_fixture_store(fixture->base_path, "base525", false) ||
+        !compare_write_fixture_store(fixture->target_path, "target525", true)) {
+        restore_cache_dir(fixture->saved_cache);
+        free(fixture->saved_cache);
+        fixture->saved_cache = NULL;
+        (void)th_rmtree(fixture->cache);
+        return false;
+    }
+    return true;
+}
+
+static bool compare_graphs_fixture_close(compare_graphs_fixture_t *fixture) {
+    restore_cache_dir(fixture->saved_cache);
+    free(fixture->saved_cache);
+    fixture->saved_cache = NULL;
+    return th_rmtree(fixture->cache) == 0;
+}
+
+static char *compare_graphs_call(cbm_mcp_server_t *server, const char *extra_arguments) {
+    char arguments[1024];
+    snprintf(arguments, sizeof(arguments),
+             "{\"base_project\":\"base525\",\"target_project\":\"target525\"%s}",
+             extra_arguments ? extra_arguments : "");
+    return cbm_mcp_handle_tool(server, "compare_graphs", arguments);
+}
+
+static bool compare_set_has(const yyjson_val *set, uint64_t total, uint64_t returned,
+                            bool truncated, const char *reason) {
+    if (!set || !yyjson_is_obj(set)) {
+        return false;
+    }
+    yyjson_val *items = yyjson_obj_get(set, "items");
+    yyjson_val *reasons = yyjson_obj_get(set, "truncation_reasons");
+    return items && yyjson_is_arr(items) && yyjson_arr_size(items) == returned && reasons &&
+           yyjson_is_arr(reasons) && yyjson_get_uint(yyjson_obj_get(set, "total")) == total &&
+           yyjson_get_uint(yyjson_obj_get(set, "returned")) == returned &&
+           yyjson_get_bool(yyjson_obj_get(set, "truncated")) == truncated &&
+           ((!reason && yyjson_arr_size(reasons) == 0) ||
+            (reason && yyjson_arr_size(reasons) == 1 &&
+             strcmp(yyjson_get_str(yyjson_arr_get(reasons, 0)), reason) == 0));
+}
+
+TEST(tool_compare_graphs_streams_stable_deltas_issue525) {
+    compare_graphs_fixture_t fixture;
+    ASSERT_TRUE(compare_graphs_fixture_open(&fixture));
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(server);
+    cbm_mcp_server_set_tool_profile(server, CBM_MCP_TOOL_PROFILE_ANALYSIS);
+
+    char *first = compare_graphs_call(server, NULL);
+    char *second = compare_graphs_call(server, NULL);
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(second);
+    ASSERT_STR_EQ(first, second);
+    ASSERT_NOT_NULL(strstr(first, "\"isError\":false"));
+    char *inner = extract_text_content(first);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "schema_version")), 1);
+
+    yyjson_val *base = yyjson_obj_get(root, "base");
+    yyjson_val *target = yyjson_obj_get(root, "target");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(base, "project")), "base525");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(base, "generation")), "base-generation-525");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(base, "index_mode")), "full");
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(base, "node_count")), 5);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(base, "edge_count")), 4);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(target, "project")), "target525");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(target, "generation")), "target-generation-525");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(target, "index_mode")), "full");
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(target, "node_count")), 5);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(target, "edge_count")), 4);
+
+    yyjson_val *nodes = yyjson_obj_get(root, "nodes");
+    yyjson_val *nodes_added = yyjson_obj_get(nodes, "added");
+    yyjson_val *nodes_removed = yyjson_obj_get(nodes, "removed");
+    ASSERT_TRUE(compare_set_has(nodes_added, 2, 2, false, NULL));
+    ASSERT_TRUE(compare_set_has(nodes_removed, 2, 2, false, NULL));
+    yyjson_val *added_items = yyjson_obj_get(nodes_added, "items");
+    yyjson_val *removed_items = yyjson_obj_get(nodes_removed, "items");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(added_items, 0), "qualified_name")),
+                  "pkg.changed");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(added_items, 0), "label")),
+                  "Method");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(added_items, 0), "file_path")),
+                  "src/new.c");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(added_items, 1), "qualified_name")),
+                  "pkg.target");
+    ASSERT_STR_EQ(
+        yyjson_get_str(yyjson_obj_get(yyjson_arr_get(removed_items, 0), "qualified_name")),
+        "pkg.base");
+    ASSERT_STR_EQ(
+        yyjson_get_str(yyjson_obj_get(yyjson_arr_get(removed_items, 1), "qualified_name")),
+        "pkg.changed");
+
+    yyjson_val *edges = yyjson_obj_get(root, "edges");
+    yyjson_val *edges_added = yyjson_obj_get(edges, "added");
+    yyjson_val *edges_removed = yyjson_obj_get(edges, "removed");
+    ASSERT_TRUE(compare_set_has(edges_added, 2, 2, false, NULL));
+    ASSERT_TRUE(compare_set_has(edges_removed, 2, 2, false, NULL));
+    yyjson_val *edge_add_items = yyjson_obj_get(edges_added, "items");
+    yyjson_val *edge_remove_items = yyjson_obj_get(edges_removed, "items");
+    ASSERT_STR_EQ(
+        yyjson_get_str(yyjson_obj_get(yyjson_arr_get(edge_add_items, 0), "local_name_gen")),
+        "Gamma");
+    ASSERT_STR_EQ(
+        yyjson_get_str(yyjson_obj_get(yyjson_arr_get(edge_remove_items, 1), "local_name_gen")),
+        "Beta");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(edge_add_items, 1), "type")),
+                  "USES");
+    ASSERT_STR_EQ(
+        yyjson_get_str(yyjson_obj_get(yyjson_arr_get(edge_add_items, 1), "local_name_gen")), "");
+    yyjson_val *edge_source = yyjson_obj_get(yyjson_arr_get(edge_add_items, 0), "source");
+    yyjson_val *edge_target = yyjson_obj_get(yyjson_arr_get(edge_add_items, 0), "target");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(edge_source, "qualified_name")), "pkg.source");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(edge_target, "qualified_name")), "pkg.sink");
+
+    yyjson_val *limits = yyjson_obj_get(root, "limits");
+    ASSERT_EQ(yyjson_get_uint(yyjson_obj_get(limits, "limit")), 200);
+    ASSERT_EQ(yyjson_get_uint(yyjson_obj_get(limits, "scan_limit")), 2000000);
+    ASSERT_EQ(yyjson_get_uint(yyjson_obj_get(limits, "encoded_byte_budget")), 512U * 1024U);
+    yyjson_doc_free(doc);
+    free(inner);
+    free(second);
+    free(first);
+
+    char *limited = compare_graphs_call(server, ",\"limit\":1");
+    ASSERT_NOT_NULL(limited);
+    inner = extract_text_content(limited);
+    doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    root = yyjson_doc_get_root(doc);
+    nodes = yyjson_obj_get(root, "nodes");
+    edges = yyjson_obj_get(root, "edges");
+    ASSERT_TRUE(compare_set_has(yyjson_obj_get(nodes, "added"), 2, 1, true, "limit"));
+    ASSERT_TRUE(compare_set_has(yyjson_obj_get(nodes, "removed"), 2, 1, true, "limit"));
+    ASSERT_TRUE(compare_set_has(yyjson_obj_get(edges, "added"), 2, 1, true, "limit"));
+    ASSERT_TRUE(compare_set_has(yyjson_obj_get(edges, "removed"), 2, 1, true, "limit"));
+    yyjson_doc_free(doc);
+    free(inner);
+    free(limited);
+
+    cbm_mcp_server_free(server);
+    ASSERT_TRUE(compare_graphs_fixture_close(&fixture));
+    PASS();
+}
+
+static bool compare_write_single_node_store(const char *path, const char *project,
+                                            const char *generation, const char *qualified_name) {
+    cbm_store_t *store = cbm_store_open_path(path);
+    if (!store ||
+        cbm_store_upsert_project(store, project, "/tmp/compare-budget-525") != CBM_STORE_OK) {
+        cbm_store_close(store);
+        return false;
+    }
+    bool ok = true;
+    if (qualified_name) {
+        cbm_node_t node = {
+            .project = project,
+            .label = "Function",
+            .name = "large",
+            .qualified_name = qualified_name,
+            .file_path = "src/large.c",
+            .properties_json = "{}",
+        };
+        ok = cbm_store_upsert_node(store, &node) > 0;
+    }
+    ok = ok && compare_write_coverage(store, project, generation) &&
+         cbm_store_prepare_for_publish(store) == CBM_STORE_OK;
+    cbm_store_close(store);
+    return ok;
+}
+
+TEST(tool_compare_graphs_enforces_encoded_budget_issue525) {
+    compare_graphs_fixture_t fixture;
+    ASSERT_TRUE(compare_graphs_fixture_open(&fixture));
+    char base_path[768];
+    char target_path[768];
+    snprintf(base_path, sizeof(base_path), "%s/budgetbase525.db", fixture.cache);
+    snprintf(target_path, sizeof(target_path), "%s/budgettarget525.db", fixture.cache);
+    size_t name_length = 530000U;
+    char *large_name = malloc(name_length + 1U);
+    ASSERT_NOT_NULL(large_name);
+    memset(large_name, 'x', name_length);
+    large_name[0] = 'z';
+    large_name[name_length] = '\0';
+    ASSERT_TRUE(compare_write_single_node_store(base_path, "budgetbase525", "budget-base", NULL));
+    ASSERT_TRUE(compare_write_single_node_store(target_path, "budgettarget525", "budget-target",
+                                                large_name));
+    free(large_name);
+
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(server);
+    char *response = cbm_mcp_handle_tool(
+        server, "compare_graphs",
+        "{\"base_project\":\"budgetbase525\",\"target_project\":\"budgettarget525\","
+        "\"limit\":1000}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_LT(strlen(response), 10000U);
+    char *inner = extract_text_content(response);
+    yyjson_doc *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *nodes = yyjson_obj_get(yyjson_doc_get_root(doc), "nodes");
+    ASSERT_TRUE(compare_set_has(yyjson_obj_get(nodes, "added"), 1, 0, true, "encoded_byte_budget"));
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(server);
+    ASSERT_TRUE(compare_graphs_fixture_close(&fixture));
+    PASS();
+}
+
+TEST(tool_compare_graphs_validation_and_scan_cap_are_atomic_issue525) {
+    compare_graphs_fixture_t fixture;
+    ASSERT_TRUE(compare_graphs_fixture_open(&fixture));
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(server);
+
+    char equal_path[768];
+    char equal_wal[800];
+    char equal_shm[800];
+    snprintf(equal_path, sizeof(equal_path), "%s/same525.db", fixture.cache);
+    snprintf(equal_wal, sizeof(equal_wal), "%s-wal", equal_path);
+    snprintf(equal_shm, sizeof(equal_shm), "%s-shm", equal_path);
+    ASSERT_FALSE(cbm_file_exists(equal_path));
+
+    static const char *const invalid_arguments[] = {
+        "{}",
+        "{\"base_project\":\"same525\",\"target_project\":\"same525\"}",
+        "{\"base_project\":\"base525\",\"target_project\":\"target525\",\"limit\":0}",
+        "{\"base_project\":\"base525\",\"target_project\":\"target525\",\"limit\":1001}",
+        "{\"base_project\":\"base525\",\"target_project\":\"target525\",\"scan_limit\":0}",
+        ("{\"base_project\":\"base525\",\"target_project\":\"target525\","
+         "\"scan_limit\":10000001}"),
+        "{\"base_project\":\"base525\",\"target_project\":\"target525\",\"extra\":1}",
+        "{",
+    };
+    for (size_t index = 0; index < sizeof(invalid_arguments) / sizeof(invalid_arguments[0]);
+         index++) {
+        char *response = cbm_mcp_handle_tool(server, "compare_graphs", invalid_arguments[index]);
+        ASSERT_NOT_NULL(response);
+        ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+        char *inner = extract_text_content(response);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NULL(strstr(inner, "\"nodes\""));
+        free(inner);
+        free(response);
+    }
+    ASSERT_FALSE(cbm_file_exists(equal_path));
+    ASSERT_FALSE(cbm_file_exists(equal_wal));
+    ASSERT_FALSE(cbm_file_exists(equal_shm));
+
+    char ghost_path[768];
+    char ghost_wal[800];
+    char ghost_shm[800];
+    snprintf(ghost_path, sizeof(ghost_path), "%s/ghost525.db", fixture.cache);
+    snprintf(ghost_wal, sizeof(ghost_wal), "%s-wal", ghost_path);
+    snprintf(ghost_shm, sizeof(ghost_shm), "%s-shm", ghost_path);
+    ASSERT_FALSE(cbm_file_exists(ghost_path));
+    char *missing = cbm_mcp_handle_tool(
+        server, "compare_graphs", "{\"base_project\":\"base525\",\"target_project\":\"ghost525\"}");
+    ASSERT_NOT_NULL(missing);
+    ASSERT_NOT_NULL(strstr(missing, "project_not_indexed"));
+    ASSERT_FALSE(cbm_file_exists(ghost_path));
+    ASSERT_FALSE(cbm_file_exists(ghost_wal));
+    ASSERT_FALSE(cbm_file_exists(ghost_shm));
+    free(missing);
+
+    char *scan_limited = compare_graphs_call(server, ",\"scan_limit\":1");
+    ASSERT_NOT_NULL(scan_limited);
+    ASSERT_NOT_NULL(strstr(scan_limited, "scan_limit_exceeded"));
+    char *scan_inner = extract_text_content(scan_limited);
+    ASSERT_NOT_NULL(scan_inner);
+    ASSERT_NULL(strstr(scan_inner, "\"nodes\""));
+    free(scan_inner);
+    free(scan_limited);
+
+    char *malformed_rpc = cbm_mcp_server_handle(server, "{");
+    ASSERT_NOT_NULL(malformed_rpc);
+    ASSERT_NOT_NULL(strstr(malformed_rpc, "-32700"));
+    free(malformed_rpc);
+    cbm_mcp_server_free(server);
+    ASSERT_TRUE(compare_graphs_fixture_close(&fixture));
+    PASS();
+}
+
+TEST(tool_compare_graphs_cancel_and_readonly_handles_release_issue525) {
+    compare_graphs_fixture_t fixture;
+    ASSERT_TRUE(compare_graphs_fixture_open(&fixture));
+    long base_length = 0;
+    long target_length = 0;
+    unsigned char *base_before = mcp_read_file_bytes(fixture.base_path, &base_length);
+    unsigned char *target_before = mcp_read_file_bytes(fixture.target_path, &target_length);
+    ASSERT_NOT_NULL(base_before);
+    ASSERT_NOT_NULL(target_before);
+    char base_wal[800];
+    char base_shm[800];
+    char target_wal[800];
+    char target_shm[800];
+    snprintf(base_wal, sizeof(base_wal), "%s-wal", fixture.base_path);
+    snprintf(base_shm, sizeof(base_shm), "%s-shm", fixture.base_path);
+    snprintf(target_wal, sizeof(target_wal), "%s-wal", fixture.target_path);
+    snprintf(target_shm, sizeof(target_shm), "%s-shm", fixture.target_path);
+    ASSERT_FALSE(cbm_file_exists(base_wal));
+    ASSERT_FALSE(cbm_file_exists(base_shm));
+    ASSERT_FALSE(cbm_file_exists(target_wal));
+    ASSERT_FALSE(cbm_file_exists(target_shm));
+
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(server);
+    ASSERT_TRUE(cbm_mcp_server_request_scope_begin(server));
+    ASSERT_TRUE(cbm_mcp_server_cancel_active(server));
+    char *cancelled = compare_graphs_call(server, NULL);
+    ASSERT_NOT_NULL(cancelled);
+    ASSERT_NOT_NULL(strstr(cancelled, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(cancelled, "cancelled"));
+    char *cancelled_inner = extract_text_content(cancelled);
+    ASSERT_NOT_NULL(cancelled_inner);
+    ASSERT_NULL(strstr(cancelled_inner, "\"nodes\""));
+    free(cancelled_inner);
+    free(cancelled);
+    cbm_mcp_server_request_scope_end(server);
+
+    char moved_path[800];
+    snprintf(moved_path, sizeof(moved_path), "%s/base525.moved", fixture.cache);
+    ASSERT_EQ(rename(fixture.base_path, moved_path), 0);
+    ASSERT_EQ(rename(moved_path, fixture.base_path), 0);
+
+    char *success = compare_graphs_call(server, NULL);
+    ASSERT_NOT_NULL(success);
+    ASSERT_NOT_NULL(strstr(success, "\"isError\":false"));
+    free(success);
+    ASSERT_EQ(rename(fixture.base_path, moved_path), 0);
+    ASSERT_EQ(rename(moved_path, fixture.base_path), 0);
+    ASSERT_TRUE(mcp_file_matches_snapshot(fixture.base_path, base_before, base_length));
+    ASSERT_TRUE(mcp_file_matches_snapshot(fixture.target_path, target_before, target_length));
+    ASSERT_FALSE(cbm_file_exists(base_wal));
+    ASSERT_FALSE(cbm_file_exists(base_shm));
+    ASSERT_FALSE(cbm_file_exists(target_wal));
+    ASSERT_FALSE(cbm_file_exists(target_shm));
+
+    free(base_before);
+    free(target_before);
+    cbm_mcp_server_free(server);
+    ASSERT_TRUE(compare_graphs_fixture_close(&fixture));
+    PASS();
+}
+
 /* Call get_code_snippet and extract inner text content.
  * Caller must free returned string. */
 static char *call_snippet(cbm_mcp_server_t *srv, const char *args_json) {
@@ -11551,6 +12050,11 @@ SUITE(mcp) {
     RUN_TEST(tool_list_projects_empty);
     RUN_TEST(tool_get_graph_schema_empty);
     RUN_TEST(tool_unknown_tool);
+    RUN_TEST(tool_compare_graphs_registered_issue525);
+    RUN_TEST(tool_compare_graphs_streams_stable_deltas_issue525);
+    RUN_TEST(tool_compare_graphs_enforces_encoded_budget_issue525);
+    RUN_TEST(tool_compare_graphs_validation_and_scan_cap_are_atomic_issue525);
+    RUN_TEST(tool_compare_graphs_cancel_and_readonly_handles_release_issue525);
     RUN_TEST(tool_search_graph_basic);
     RUN_TEST(tool_search_graph_semantic_only_skips_structural_results_issue1295);
     RUN_TEST(tool_trace_totals_respect_test_filter);
