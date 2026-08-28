@@ -10,7 +10,7 @@
  *
  * QUALITY_ANALYSIS.md gap #6 reports 27 languages failing this.  This file
  * is the "large breadth table" — one per-language case, table-driven, asserting
- * the invariant across 26 languages.
+ * the invariant across 27 languages.
  *
  * Fixture design rule:
  *   Each fixture defines exactly TWO functions: a callee (helper) and a caller
@@ -26,6 +26,9 @@
  *   RED (module-sourced or no CALLS at all -- reproduces the gap):
  *     r, julia, dart, groovy, commonlisp, powershell, ada, clojure,
  *     fsharp, racket, rescript, scheme  (12 cases)
+ *
+ *   Added after the original snapshot:
+ *     chialisp  (1 case, expected GREEN — lisp-family scope attribution)
  *
  * Note: the "suspicious" group (r, julia, ...) from QUALITY_ANALYSIS may be
  * GREEN because the calls-breadth table (test_lang_contract.c) already shows
@@ -51,19 +54,17 @@
 
 /* ---- helper: count CALLS edges by source-node label --------------------- */
 
-static int ib_calls_from_label(cbm_store_t *store, const char *project,
-                                const char *label) {
+static int ib_calls_from_label(cbm_store_t *store, const char *project, const char *label) {
     cbm_edge_t *edges = NULL;
     int edge_count = 0;
-    if (cbm_store_find_edges_by_type(store, project, "CALLS",
-                                     &edges, &edge_count) != CBM_STORE_OK) {
+    if (cbm_store_find_edges_by_type(store, project, "CALLS", &edges, &edge_count) !=
+        CBM_STORE_OK) {
         return -1;
     }
     int total = 0;
     for (int i = 0; i < edge_count; i++) {
         cbm_node_t src = {0};
-        if (cbm_store_find_node_by_id(store, edges[i].source_id,
-                                      &src) != CBM_STORE_OK) {
+        if (cbm_store_find_node_by_id(store, edges[i].source_id, &src) != CBM_STORE_OK) {
             continue;
         }
         if (src.label && strcmp(src.label, label) == 0) {
@@ -135,42 +136,40 @@ static const IBCase IB_CASES[] = {
     /* CALLS edge is produced -- but it may still be Module-sourced.       */
     /* ------------------------------------------------------------------ */
 
-    {
-        "r", "a.R",
-        "helper <- function(x) {\n"
-        "  x * 2\n"
-        "}\n"
-        "\n"
-        "run <- function() {\n"
-        "  helper(21)\n"
-        "}\n",
-        /*
-         * R: extract_calls.c has an R branch that reads the callee from the
-         * call node's first child.  However, enclosing-function detection
-         * for R may fall back to Module if func_kinds_for_lang does not
-         * include R's "function_definition" node type.  RED when the CALLS
-         * edge is sourced at Module instead of the "run" Function node.
-         */
-        0, "R enclosing-function detection likely missing from func_kinds_for_lang; "
-           "call may be sourced at Module"
-    },
+    {"r", "a.R",
+     "helper <- function(x) {\n"
+     "  x * 2\n"
+     "}\n"
+     "\n"
+     "run <- function() {\n"
+     "  helper(21)\n"
+     "}\n",
+     /*
+      * R: extract_calls.c has an R branch that reads the callee from the
+      * call node's first child.  However, enclosing-function detection
+      * for R may fall back to Module if func_kinds_for_lang does not
+      * include R's "function_definition" node type.  RED when the CALLS
+      * edge is sourced at Module instead of the "run" Function node.
+      */
+     0,
+     "R enclosing-function detection likely missing from func_kinds_for_lang; "
+     "call may be sourced at Module"},
 
-    {
-        "julia", "a.jl",
-        "function helper(x)\n"
-        "    return x + 1\n"
-        "end\n"
-        "\n"
-        "function run(n)\n"
-        "    return helper(n)\n"
-        "end\n",
-        /*
-         * Julia: same issue -- function body extraction may not detect the
-         * enclosing Julia function node correctly, sourcing the call at Module.
-         */
-        0, "Julia enclosing-function detection may not map function_definition to "
-           "a callable QN; call sourced at Module"
-    },
+    {"julia", "a.jl",
+     "function helper(x)\n"
+     "    return x + 1\n"
+     "end\n"
+     "\n"
+     "function run(n)\n"
+     "    return helper(n)\n"
+     "end\n",
+     /*
+      * Julia: same issue -- function body extraction may not detect the
+      * enclosing Julia function node correctly, sourcing the call at Module.
+      */
+     0,
+     "Julia enclosing-function detection may not map function_definition to "
+     "a callable QN; call sourced at Module"},
 
     /* ------------------------------------------------------------------ */
     /* EXPECTED-GREEN GROUP (regression guards)                            */
@@ -179,191 +178,163 @@ static const IBCase IB_CASES[] = {
     /* them will turn the corresponding case RED.                          */
     /* ------------------------------------------------------------------ */
 
-    {
-        "elixir", "a.ex",
-        "defmodule Sample do\n"
-        "  def helper(x) do\n"
-        "    x + 1\n"
-        "  end\n"
-        "\n"
-        "  def run do\n"
-        "    helper(41)\n"
-        "  end\n"
-        "end\n",
-        1, NULL
-    },
+    {"elixir", "a.ex",
+     "defmodule Sample do\n"
+     "  def helper(x) do\n"
+     "    x + 1\n"
+     "  end\n"
+     "\n"
+     "  def run do\n"
+     "    helper(41)\n"
+     "  end\n"
+     "end\n",
+     1, NULL},
 
-    {
-        "ocaml", "a.ml",
-        "let helper x = x + 1\n"
-        "\n"
-        "let run () =\n"
-        "  let result = helper 41 in\n"
-        "  print_int result\n",
-        1, NULL
-    },
+    {"ocaml", "a.ml",
+     "let helper x = x + 1\n"
+     "\n"
+     "let run () =\n"
+     "  let result = helper 41 in\n"
+     "  print_int result\n",
+     1, NULL},
 
-    {
-        "fortran", "a.f90",
-        "function helper(x) result(y)\n"
-        "    integer, intent(in) :: x\n"
-        "    integer :: y\n"
-        "    y = x + 1\n"
-        "end function helper\n"
-        "\n"
-        "function run(n) result(total)\n"
-        "    integer, intent(in) :: n\n"
-        "    integer :: total\n"
-        "    total = helper(n) + helper(n + 1)\n"
-        "end function run\n",
-        1, NULL
-    },
+    {"fortran", "a.f90",
+     "function helper(x) result(y)\n"
+     "    integer, intent(in) :: x\n"
+     "    integer :: y\n"
+     "    y = x + 1\n"
+     "end function helper\n"
+     "\n"
+     "function run(n) result(total)\n"
+     "    integer, intent(in) :: n\n"
+     "    integer :: total\n"
+     "    total = helper(n) + helper(n + 1)\n"
+     "end function run\n",
+     1, NULL},
 
-    {
-        "pascal", "a.pas",
-        "procedure Helper(x: Integer);\n"
-        "begin\n"
-        "  WriteLn(x);\n"
-        "end;\n"
-        "\n"
-        "procedure Run;\n"
-        "begin\n"
-        "  Helper(1);\n"
-        "end;\n",
-        1, NULL
-    },
+    {"pascal", "a.pas",
+     "procedure Helper(x: Integer);\n"
+     "begin\n"
+     "  WriteLn(x);\n"
+     "end;\n"
+     "\n"
+     "procedure Run;\n"
+     "begin\n"
+     "  Helper(1);\n"
+     "end;\n",
+     1, NULL},
 
-    {
-        "cuda", "a.cu",
-        "__device__ int helper(int x) {\n"
-        "    return x * 2;\n"
-        "}\n"
-        "\n"
-        "__global__ void run(int *out) {\n"
-        "    out[0] = helper(21);\n"
-        "}\n",
-        1, NULL
-    },
+    {"cuda", "a.cu",
+     "__device__ int helper(int x) {\n"
+     "    return x * 2;\n"
+     "}\n"
+     "\n"
+     "__global__ void run(int *out) {\n"
+     "    out[0] = helper(21);\n"
+     "}\n",
+     1, NULL},
 
-    {
-        "d", "a.d",
-        "int helper(int x)\n"
-        "{\n"
-        "    return x + 1;\n"
-        "}\n"
-        "\n"
-        "void run()\n"
-        "{\n"
-        "    int y = helper(41);\n"
-        "}\n",
-        1, NULL
-    },
+    {"d", "a.d",
+     "int helper(int x)\n"
+     "{\n"
+     "    return x + 1;\n"
+     "}\n"
+     "\n"
+     "void run()\n"
+     "{\n"
+     "    int y = helper(41);\n"
+     "}\n",
+     1, NULL},
 
-    {
-        "glsl", "a.glsl",
-        "float helper(float x) {\n"
-        "    return x * 2.0;\n"
-        "}\n"
-        "\n"
-        "void run() {\n"
-        "    float y = helper(3.0);\n"
-        "}\n",
-        1, NULL
-    },
+    {"glsl", "a.glsl",
+     "float helper(float x) {\n"
+     "    return x * 2.0;\n"
+     "}\n"
+     "\n"
+     "void run() {\n"
+     "    float y = helper(3.0);\n"
+     "}\n",
+     1, NULL},
 
-    {
-        "hlsl", "a.hlsl",
-        "float helper(float x)\n"
-        "{\n"
-        "    return x * 2.0;\n"
-        "}\n"
-        "\n"
-        "float run(float v)\n"
-        "{\n"
-        "    return helper(v) + 1.0;\n"
-        "}\n",
-        1, NULL
-    },
+    {"hlsl", "a.hlsl",
+     "float helper(float x)\n"
+     "{\n"
+     "    return x * 2.0;\n"
+     "}\n"
+     "\n"
+     "float run(float v)\n"
+     "{\n"
+     "    return helper(v) + 1.0;\n"
+     "}\n",
+     1, NULL},
 
-    {
-        "ispc", "a.ispc",
-        "static inline uniform float helper(uniform float x) {\n"
-        "    return x * 2.0f;\n"
-        "}\n"
-        "\n"
-        "export void run(uniform float in[], uniform float out[],\n"
-        "                uniform int n) {\n"
-        "    foreach (i = 0 ... n) {\n"
-        "        out[i] = helper(in[i]);\n"
-        "    }\n"
-        "}\n",
-        1, NULL
-    },
+    {"ispc", "a.ispc",
+     "static inline uniform float helper(uniform float x) {\n"
+     "    return x * 2.0f;\n"
+     "}\n"
+     "\n"
+     "export void run(uniform float in[], uniform float out[],\n"
+     "                uniform int n) {\n"
+     "    foreach (i = 0 ... n) {\n"
+     "        out[i] = helper(in[i]);\n"
+     "    }\n"
+     "}\n",
+     1, NULL},
 
-    {
-        "odin", "a.odin",
-        "package fixture\n"
-        "\n"
-        "helper :: proc() -> int {\n"
-        "\treturn 42\n"
-        "}\n"
-        "\n"
-        "run :: proc() {\n"
-        "\tx := helper()\n"
-        "\t_ = x\n"
-        "}\n",
-        1, NULL
-    },
+    {"odin", "a.odin",
+     "package fixture\n"
+     "\n"
+     "helper :: proc() -> int {\n"
+     "\treturn 42\n"
+     "}\n"
+     "\n"
+     "run :: proc() {\n"
+     "\tx := helper()\n"
+     "\t_ = x\n"
+     "}\n",
+     1, NULL},
 
-    {
-        "slang", "a.slang",
-        "void helper()\n"
-        "{\n"
-        "    int x = 1;\n"
-        "}\n"
-        "\n"
-        "void run()\n"
-        "{\n"
-        "    helper();\n"
-        "}\n",
-        1, NULL
-    },
+    {"slang", "a.slang",
+     "void helper()\n"
+     "{\n"
+     "    int x = 1;\n"
+     "}\n"
+     "\n"
+     "void run()\n"
+     "{\n"
+     "    helper();\n"
+     "}\n",
+     1, NULL},
 
-    {
-        "squirrel", "a.nut",
-        "function helper(x) {\n"
-        "    return x + 1;\n"
-        "}\n"
-        "\n"
-        "function run() {\n"
-        "    return helper(41);\n"
-        "}\n",
-        1, NULL
-    },
+    {"squirrel", "a.nut",
+     "function helper(x) {\n"
+     "    return x + 1;\n"
+     "}\n"
+     "\n"
+     "function run() {\n"
+     "    return helper(41);\n"
+     "}\n",
+     1, NULL},
 
-    {
-        "vimscript", "a.vim",
-        "function! Helper() abort\n"
-        "  return 1\n"
-        "endfunction\n"
-        "\n"
-        "function! Run() abort\n"
-        "  call Helper()\n"
-        "endfunction\n",
-        1, NULL
-    },
+    {"vimscript", "a.vim",
+     "function! Helper() abort\n"
+     "  return 1\n"
+     "endfunction\n"
+     "\n"
+     "function! Run() abort\n"
+     "  call Helper()\n"
+     "endfunction\n",
+     1, NULL},
 
-    {
-        "cairo", "a.cairo",
-        "fn helper(x: felt252) -> felt252 {\n"
-        "    x + 1\n"
-        "}\n"
-        "\n"
-        "fn run() -> felt252 {\n"
-        "    helper(41)\n"
-        "}\n",
-        1, NULL
-    },
+    {"cairo", "a.cairo",
+     "fn helper(x: felt252) -> felt252 {\n"
+     "    x + 1\n"
+     "}\n"
+     "\n"
+     "fn run() -> felt252 {\n"
+     "    helper(41)\n"
+     "}\n",
+     1, NULL},
 
     /* ------------------------------------------------------------------ */
     /* KNOWN-GAP GROUP                                                     */
@@ -374,163 +345,169 @@ static const IBCase IB_CASES[] = {
     /* calls >= 1 AND module_calls == 0.                                   */
     /* ------------------------------------------------------------------ */
 
-    {
-        "dart", "a.dart",
-        "void helper() {\n"
-        "  print('helper');\n"
-        "}\n"
-        "\n"
-        "void run() {\n"
-        "  helper();\n"
-        "}\n",
-        /*
-         * Dart: selector call node carries no callee field and the first child
-         * is not an identifier; no dart branch in extract_calls.c.  No CALLS
-         * edge is produced at all, so callable-sourcing cannot be tested
-         * independently.  Both gaps (no CALLS + callable-sourcing) are RED.
-         */
-        0, "selector call node: no callee field, first child not identifier; "
-           "no dart branch in extract_calls.c"
-    },
+    {"dart", "a.dart",
+     "void helper() {\n"
+     "  print('helper');\n"
+     "}\n"
+     "\n"
+     "void run() {\n"
+     "  helper();\n"
+     "}\n",
+     /*
+      * Dart: selector call node carries no callee field and the first child
+      * is not an identifier; no dart branch in extract_calls.c.  No CALLS
+      * edge is produced at all, so callable-sourcing cannot be tested
+      * independently.  Both gaps (no CALLS + callable-sourcing) are RED.
+      */
+     0,
+     "selector call node: no callee field, first child not identifier; "
+     "no dart branch in extract_calls.c"},
 
-    {
-        "groovy", "a.groovy",
-        "def helper() {\n"
-        "    println 'helping'\n"
-        "}\n"
-        "\n"
-        "def run() {\n"
-        "    helper()\n"
-        "}\n",
-        /*
-         * Groovy: function_call callee not on a function/name field and first
-         * child is not 'identifier'; no groovy branch in extract_calls.c.
-         */
-        0, "function_call callee not on function/name field; "
-           "first child is not identifier; no groovy branch in extract_calls.c"
-    },
+    {"groovy", "a.groovy",
+     "def helper() {\n"
+     "    println 'helping'\n"
+     "}\n"
+     "\n"
+     "def run() {\n"
+     "    helper()\n"
+     "}\n",
+     /*
+      * Groovy: function_call callee not on a function/name field and first
+      * child is not 'identifier'; no groovy branch in extract_calls.c.
+      */
+     0,
+     "function_call callee not on function/name field; "
+     "first child is not identifier; no groovy branch in extract_calls.c"},
 
-    {
-        "commonlisp", "a.lisp",
-        "(defun helper (x)\n"
-        "  (* x 2))\n"
-        "\n"
-        "(defun run ()\n"
-        "  (helper 21))\n",
-        /*
-         * Common Lisp: list_lit call head is sym_lit not identifier;
-         * no commonlisp branch in extract_callee_name.
-         */
-        0, "list_lit call head is sym_lit not identifier; "
-           "no commonlisp branch in extract_callee_name"
-    },
+    {"commonlisp", "a.lisp",
+     "(defun helper (x)\n"
+     "  (* x 2))\n"
+     "\n"
+     "(defun run ()\n"
+     "  (helper 21))\n",
+     /*
+      * Common Lisp: list_lit call head is sym_lit not identifier;
+      * no commonlisp branch in extract_callee_name.
+      */
+     0,
+     "list_lit call head is sym_lit not identifier; "
+     "no commonlisp branch in extract_callee_name"},
 
-    {
-        "powershell", "a.ps1",
-        "function helper {\n"
-        "    Write-Output 'hi'\n"
-        "}\n"
-        "\n"
-        "function run {\n"
-        "    helper\n"
-        "}\n",
-        /*
-         * PowerShell: command node child is command_name not identifier;
-         * extract_scripting_callee handles MATLAB not PowerShell.
-         */
-        0, "command node child is command_name not identifier; "
-           "extract_scripting_callee handles MATLAB not PowerShell"
-    },
+    {"powershell", "a.ps1",
+     "function helper {\n"
+     "    Write-Output 'hi'\n"
+     "}\n"
+     "\n"
+     "function run {\n"
+     "    helper\n"
+     "}\n",
+     /*
+      * PowerShell: command node child is command_name not identifier;
+      * extract_scripting_callee handles MATLAB not PowerShell.
+      */
+     0,
+     "command node child is command_name not identifier; "
+     "extract_scripting_callee handles MATLAB not PowerShell"},
 
-    {
-        "ada", "a.adb",
-        "procedure Run is\n"
-        "   procedure Helper is\n"
-        "   begin\n"
-        "      null;\n"
-        "   end Helper;\n"
-        "begin\n"
-        "   Helper;\n"
-        "end Run;\n",
-        /*
-         * Ada: procedure_call_statement callee did not resolve to a CALLS edge;
-         * no Ada branch in extract_calls.c.
-         */
-        0, "procedure_call_statement callee not resolved; "
-           "no Ada branch in extract_calls.c"
-    },
+    {"ada", "a.adb",
+     "procedure Run is\n"
+     "   procedure Helper is\n"
+     "   begin\n"
+     "      null;\n"
+     "   end Helper;\n"
+     "begin\n"
+     "   Helper;\n"
+     "end Run;\n",
+     /*
+      * Ada: procedure_call_statement callee did not resolve to a CALLS edge;
+      * no Ada branch in extract_calls.c.
+      */
+     0,
+     "procedure_call_statement callee not resolved; "
+     "no Ada branch in extract_calls.c"},
 
-    {
-        "clojure", "a.clj",
-        "(defn helper [] 42)\n"
-        "\n"
-        "(defn run [] (helper))\n",
-        /*
-         * Clojure: lisp call is a list_lit whose head is a sym_lit (not a
-         * field, not a first-child 'identifier'); no lisp branch in
-         * extract_callee_name.
-         */
-        0, "list_lit head is sym_lit not identifier; "
-           "no lisp/clojure branch in extract_callee_name"
-    },
+    {"clojure", "a.clj",
+     "(defn helper [] 42)\n"
+     "\n"
+     "(defn run [] (helper))\n",
+     /*
+      * Clojure: lisp call is a list_lit whose head is a sym_lit (not a
+      * field, not a first-child 'identifier'); no lisp branch in
+      * extract_callee_name.
+      */
+     0,
+     "list_lit head is sym_lit not identifier; "
+     "no lisp/clojure branch in extract_callee_name"},
 
-    {
-        "fsharp", "a.fs",
-        "let helper x = x + 1\n"
-        "\n"
-        "let run () = helper 41\n",
-        /*
-         * F#: application_expression callee head is a long_identifier_or_op
-         * wrapper, not a bare identifier/field; no fsharp callee branch.
-         */
-        0, "application_expression callee head is long_identifier_or_op wrapper; "
-           "no fsharp callee branch in extract_callee_name"
-    },
+    {"fsharp", "a.fs",
+     "let helper x = x + 1\n"
+     "\n"
+     "let run () = helper 41\n",
+     /*
+      * F#: application_expression callee head is a long_identifier_or_op
+      * wrapper, not a bare identifier/field; no fsharp callee branch.
+      */
+     0,
+     "application_expression callee head is long_identifier_or_op wrapper; "
+     "no fsharp callee branch in extract_callee_name"},
 
-    {
-        "racket", "a.rkt",
-        "#lang racket\n"
-        "\n"
-        "(define (helper x)\n"
-        "  (+ x 1))\n"
-        "\n"
-        "(define (run)\n"
-        "  (helper 41))\n",
-        /*
-         * Racket: lisp call is a 'list' whose head is a 'symbol' (grammar has
-         * no 'identifier' node); no racket branch in extract_callee_name.
-         */
-        0, "list head is symbol not identifier; "
-           "no racket branch in extract_callee_name"
-    },
+    {"racket", "a.rkt",
+     "#lang racket\n"
+     "\n"
+     "(define (helper x)\n"
+     "  (+ x 1))\n"
+     "\n"
+     "(define (run)\n"
+     "  (helper 41))\n",
+     /*
+      * Racket: lisp call is a 'list' whose head is a 'symbol' (grammar has
+      * no 'identifier' node); no racket branch in extract_callee_name.
+      */
+     0,
+     "list head is symbol not identifier; "
+     "no racket branch in extract_callee_name"},
 
-    {
-        "rescript", "a.res",
-        "let helper = (x) => x + 1\n"
-        "\n"
-        "let run = () => helper(41)\n",
-        /*
-         * ReScript: call_expression 'function' field is a 'value_identifier'
-         * (not in extract_callee_from_fields' accepted type list).
-         */
-        0, "call_expression function field is value_identifier; "
-           "not in extract_callee_from_fields accepted type list"
-    },
+    {"rescript", "a.res",
+     "let helper = (x) => x + 1\n"
+     "\n"
+     "let run = () => helper(41)\n",
+     /*
+      * ReScript: call_expression 'function' field is a 'value_identifier'
+      * (not in extract_callee_from_fields' accepted type list).
+      */
+     0,
+     "call_expression function field is value_identifier; "
+     "not in extract_callee_from_fields accepted type list"},
 
-    {
-        "scheme", "a.scm",
-        "(define (helper x)\n"
-        "  (* x 2))\n"
-        "\n"
-        "(define (run)\n"
-        "  (helper 21))\n",
-        /*
-         * Scheme: lisp call is a 'list' whose head is a 'symbol';
-         * no scheme branch in extract_callee_name.
-         */
-        0, "list head is symbol not identifier; "
-           "no scheme branch in extract_callee_name"
-    },
+    {"scheme", "a.scm",
+     "(define (helper x)\n"
+     "  (* x 2))\n"
+     "\n"
+     "(define (run)\n"
+     "  (helper 21))\n",
+     /*
+      * Scheme: lisp call is a 'list' whose head is a 'symbol';
+      * no scheme branch in extract_callee_name.
+      */
+     0,
+     "list head is symbol not identifier; "
+     "no scheme branch in extract_callee_name"},
+
+    {"chialisp", "a.clsp",
+     "(mod ()\n"
+     "  (defun helper (x)\n"
+     "    (* x 2))\n"
+     "  (defun run ()\n"
+     "    (helper 21))\n"
+     ")\n",
+     /*
+      * Chialisp: EXPECTED-GREEN. Every def is nested inside the top-level
+      * `(mod ...)`, so the in-body call can only be Function-sourced if
+      * compute_lisp_func_qn pushes a scope for the inner `(defun run ...)`
+      * rather than stopping at the module. That is exactly what would
+      * regress if the Chialisp def-head set drifted from the defs walk.
+      */
+     1, NULL},
 };
 
 enum { IB_CASES_COUNT = (int)(sizeof(IB_CASES) / sizeof(IB_CASES[0])) };
@@ -564,17 +541,14 @@ TEST(repro_invariant_breadth_callable_sourcing) {
         const IBCase *c = &IB_CASES[i];
         IBMetrics m = ib_metrics(c->filename, c->src);
 
-        int pass = (m.ok && m.calls >= 1 && m.callable_calls >= 1 &&
-                    m.module_calls == 0);
+        int pass = (m.ok && m.calls >= 1 && m.callable_calls >= 1 && m.module_calls == 0);
 
         if (!pass) {
             fprintf(stderr,
                     "  [INV-BREADTH] FAIL %-12s  ok=%d calls=%d "
                     "callable=%d module=%d%s%s\n",
-                    c->lang, m.ok, m.calls, m.callable_calls,
-                    m.module_calls,
-                    c->gap_note ? " -- " : "",
-                    c->gap_note ? c->gap_note : "");
+                    c->lang, m.ok, m.calls, m.callable_calls, m.module_calls,
+                    c->gap_note ? " -- " : "", c->gap_note ? c->gap_note : "");
             failures++;
         } else {
             fprintf(stderr,

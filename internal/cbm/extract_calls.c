@@ -735,7 +735,94 @@ static bool call_node_is_definition_container(CBMLanguage lang, TSNode node, con
 // Lisp dialects: a call is a list (`list` / `list_lit`) whose head (first named
 // child) is the function symbol (`symbol` / `sym_lit`). Generic field/first-child
 // extraction misses it because the head is not an `identifier` node.
-static char *extract_lisp_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+/* Chialisp: a head atom that is a CLVM primitive/opcode, or a Chialisp
+ * syntax/binding/def keyword, is NOT a call — emit no CALLS edge. Sourced from
+ * the clvm_tools_rs keyword set and the clvm_rs operator set. The def and
+ * include heads are here too so `(defun ...)`/`(include ...)` never mint a
+ * phantom call to their own keyword. `export` and `namespace` are in THIS set
+ * even though they are deliberately NOT definition heads: `(export foo)` names
+ * a function already defined in the same file, so it is neither a call nor a
+ * second definition of it. Real helpers that merely look primitive —
+ * sha256tree, the curry helpers — are deliberately absent, so they pass through
+ * and resolve normally. */
+static bool chialisp_head_is_not_call(const char *t) {
+    if (!t) {
+        return true;
+    }
+    static const char *filtered[] = {
+        /* --- CLVM primitives (VM ops) --- */
+        "q", "a", "i", "c", "f", "r", "l", "x", "=", ">s", "sha256", "substr", "strlen", "concat",
+        "+", "-", "*", "/", "divmod", ">", "ash", "lsh", "logand", "logior", "logxor", "lognot",
+        "point_add", "pubkey_for_exp", "not", "any", "all", "softfork", "coinid", "g1_subtract",
+        "g1_multiply", "g1_negate", "g2_add", "g2_subtract", "g2_multiply", "g2_negate", "g1_map",
+        "g2_map", "bls_pairing_identity", "bls_verify", "modpow", "%", "secp256k1_verify",
+        "secp256r1_verify", "keccak256",
+        /* --- Chialisp syntax / binding / intrinsics (not calls or defs) --- */
+        "quote", "qq", "unquote", "&rest", "let", "let*", "assign", "assign-inline",
+        "assign-lambda", "lambda", "mod", "if", "list", "com", "opt", "@", "@*env*", "print",
+        /* --- def / export / include heads (never a call) --- */
+        "defun", "defun-inline", "defmacro", "defmac", "defconstant", "defconst", "namespace",
+        "export", "embed-file", "compile-file", "include", NULL};
+    for (int i = 0; filtered[i]; i++) {
+        if (strcmp(t, filtered[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* True when `node` (a `list`) sits in a BINDER position rather than an
+ * application position: a `(defun NAME (params) ...)` parameter list, a
+ * `(mod (ARGS) ...)` curried-argument list, a `(lambda (x) ...)` parameter
+ * list, or a `let` binding container / one of its binding pairs.
+ *
+ * A binder NAMES things; it is not an invocation. Without this every function's
+ * parameter list would mint a CALLS edge to its own first parameter — on
+ * `(defun check_conditions (HEIGHTLOCK conditions) ...)` that is a phantom call
+ * to HEIGHTLOCK, and real Chialisp is mostly such definitions.
+ *
+ * Cost note: this compares `node` against the parent's first three forms rather
+ * than computing `node`'s own index. Searching for the index would scan all of
+ * the parent's children, and since this runs once per child, a single list of N
+ * forms would cost O(N^2) — `condition_codes.clib` is one list of forty, and a
+ * generated table is one list of thousands. Reading forms 1 and 2 is O(1). */
+static bool chialisp_node_is_binder_list(CBMArena *a, TSNode node, const char *source) {
+    /* At most two levels: the binder itself, and one binding pair inside a
+     * `let` binding container. Bounded on purpose — never an ancestor walk. */
+    for (int level = 0; level < 2; level++) {
+        TSNode parent = ts_node_parent(node);
+        if (ts_node_is_null(parent) || strcmp(ts_node_type(parent), "list") != 0) {
+            return false;
+        }
+        TSNode head = cbm_lisp_named_child_skip_comments(parent, 0);
+        if (!ts_node_is_null(head) && strcmp(ts_node_type(head), "symbol") == 0) {
+            char *ht = cbm_node_text(a, head, source);
+            if (!ht) {
+                return false;
+            }
+            /* `(defun NAME (params) ...)` — the params are the third form. */
+            if (strcmp(ht, "defun") == 0 || strcmp(ht, "defun-inline") == 0 ||
+                strcmp(ht, "defmacro") == 0 || strcmp(ht, "defmac") == 0) {
+                TSNode params = cbm_lisp_named_child_skip_comments(parent, 2);
+                return !ts_node_is_null(params) && ts_node_eq(params, node);
+            }
+            /* `(mod (ARGS) ...)`, `(lambda (x) ...)`, `(let ((a 1)) ...)`. */
+            if (strcmp(ht, "mod") == 0 || strcmp(ht, "lambda") == 0 || strcmp(ht, "let") == 0 ||
+                strcmp(ht, "let*") == 0) {
+                TSNode binder = cbm_lisp_named_child_skip_comments(parent, 1);
+                return !ts_node_is_null(binder) && ts_node_eq(binder, node);
+            }
+            return false;
+        }
+        /* The head is not a symbol, so `parent` may itself be a let-binding
+         * container and `node` one of its pairs — retry one level up. */
+        node = parent;
+    }
+    return false;
+}
+
+static char *extract_lisp_callee(CBMArena *a, TSNode node, const char *source, const char *nk,
+                                 CBMLanguage lang) {
     if (strcmp(nk, "list") != 0 && strcmp(nk, "list_lit") != 0) {
         return NULL;
     }
@@ -744,7 +831,16 @@ static char *extract_lisp_callee(CBMArena *a, TSNode node, const char *source, c
         const char *hk = ts_node_type(head);
         if (strcmp(hk, "symbol") == 0 || strcmp(hk, "sym_lit") == 0 ||
             strcmp(hk, "identifier") == 0) {
-            return cbm_node_text(a, head, source);
+            char *ht = cbm_node_text(a, head, source);
+            /* Drop CLVM ops / syntax / def heads, binder positions, and
+             * anything inside quoted data — a quoted form is a value, not an
+             * invocation. */
+            if (lang == CBM_LANG_CHIALISP &&
+                (chialisp_head_is_not_call(ht) || chialisp_node_is_binder_list(a, node, source) ||
+                 cbm_lisp_node_in_quote(a, node, source))) {
+                return NULL;
+            }
+            return ht;
         }
     }
     return NULL;
@@ -1383,8 +1479,9 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
     }
 
     if (lang == CBM_LANG_CLOJURE || lang == CBM_LANG_COMMONLISP || lang == CBM_LANG_SCHEME ||
-        lang == CBM_LANG_FENNEL || lang == CBM_LANG_RACKET || lang == CBM_LANG_EMACSLISP) {
-        return extract_lisp_callee(a, node, source, nk);
+        lang == CBM_LANG_FENNEL || lang == CBM_LANG_RACKET || lang == CBM_LANG_EMACSLISP ||
+        lang == CBM_LANG_CHIALISP) {
+        return extract_lisp_callee(a, node, source, nk, lang);
     }
     if (lang == CBM_LANG_FSHARP) {
         return extract_fsharp_callee(a, node, source, nk);

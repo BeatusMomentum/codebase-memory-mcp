@@ -1225,19 +1225,18 @@ TEST(form_procedure) {
 
 /* --- Oracle PL/SQL --- */
 TEST(plsql_package_and_call) {
-    const char *src =
-        "CREATE OR REPLACE PACKAGE BODY emp_pkg AS\n"
-        "  FUNCTION hire(p_name VARCHAR2) RETURN NUMBER IS\n"
-        "    v_sal NUMBER;\n"
-        "  BEGIN\n"
-        "    v_sal := util_pkg.calc_salary(p_name);\n"
-        "    IF v_sal > 0 THEN\n"
-        "      RETURN v_sal;\n"
-        "    END IF;\n"
-        "    RAISE no_data_found;\n"
-        "  END;\n"
-        "END emp_pkg;\n"
-        "/\n";
+    const char *src = "CREATE OR REPLACE PACKAGE BODY emp_pkg AS\n"
+                      "  FUNCTION hire(p_name VARCHAR2) RETURN NUMBER IS\n"
+                      "    v_sal NUMBER;\n"
+                      "  BEGIN\n"
+                      "    v_sal := util_pkg.calc_salary(p_name);\n"
+                      "    IF v_sal > 0 THEN\n"
+                      "      RETURN v_sal;\n"
+                      "    END IF;\n"
+                      "    RAISE no_data_found;\n"
+                      "  END;\n"
+                      "END emp_pkg;\n"
+                      "/\n";
     CBMFileResult *r = extract(src, CBM_LANG_PLSQL, "t", "emp_pkg.pkb");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
@@ -1282,6 +1281,156 @@ TEST(plsql_create_type_as_object_limitation) {
     ASSERT(r->parse_incomplete);
     /* Must not crash; Class extraction is best-effort and currently absent. */
     ASSERT(!has_def(r, "Class", "address_t"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* --- Chialisp ---
+ *
+ * Three defects in the only public Chialisp grammar
+ * (Quexington/tree-sitter-chialisp) motivated writing our own, and each is
+ * pinned below as a parse-level assertion rather than a note: comments that
+ * required CRLF to terminate, `(include foo.clib)` rejected because of the dot
+ * in the filename, and `(defconstant NAME <expr>)` accepting only a primitive.
+ * All three desynchronised the rest of the file, so a regression here shows up
+ * as `has_error` plus missing defs, not as one lost node. */
+TEST(chialisp_puzzle_defs_and_labels) {
+    const char *src = "; a Chialisp puzzle\n"
+                      "(mod (ARG)\n"
+                      "  (include condition_codes.clib)\n"
+                      "  (defconstant TWO 2)\n"
+                      "  (defconstant HASH (sha256 1))\n"
+                      "  (defun-inline square (x) (* x x))\n"
+                      "  (defun apply_twice (v) (square (square v)))\n"
+                      "  (defmacro assert items (f items))\n"
+                      "  (apply_twice ARG)\n"
+                      ")\n";
+    CBMFileResult *r = extract(src, CBM_LANG_CHIALISP, "t", "puzzles/my_puzzle.clsp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    /* `mod` has no name of its own — the puzzle is named by its file. */
+    ASSERT(has_def(r, "Module", "my_puzzle"));
+    /* Defs are NESTED inside `(mod ...)`; a walk that stops at the module
+     * loses every one of them. */
+    ASSERT(has_def(r, "Function", "square"));
+    ASSERT(has_def(r, "Function", "apply_twice"));
+    ASSERT(has_def(r, "Macro", "assert"));
+    /* `defconstant` binds an arbitrary EXPRESSION, not just a primitive. */
+    ASSERT(has_def(r, "Constant", "TWO"));
+    ASSERT(has_def(r, "Constant", "HASH"));
+    /* A dotted include filename resolves as one symbol. */
+    ASSERT(has_import(r, "condition_codes.clib"));
+    /* Real calls survive; CLVM primitives and def heads do not become calls. */
+    ASSERT(has_call(r, "square"));
+    ASSERT(has_call(r, "apply_twice"));
+    ASSERT(!has_call(r, "sha256"));
+    ASSERT(!has_call(r, "defun"));
+    ASSERT(!has_call(r, "mod"));
+    ASSERT(!has_call(r, "include"));
+    /* A parameter list is a `list` too — but it binds, it does not invoke. */
+    ASSERT(!has_call(r, "x"));
+    ASSERT(!has_call(r, "v"));
+    ASSERT(!has_call(r, "items"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(chialisp_comment_line_endings) {
+    /* LF, CRLF, and a comment closed by EOF with no trailing newline. The
+     * public grammar's comment rule was `/;.*\r\n/`, so an LF file lost every
+     * form after the first comment. */
+    const char *lf = "(mod (A)\n; note\n(defun f (x) x)\n)\n";
+    const char *crlf = "(mod (A)\r\n; note\r\n(defun f (x) x)\r\n)\r\n";
+    const char *eof = "(mod (A)\n(defun f (x) x)\n)\n; trailing comment, no newline";
+    const char *srcs[] = {lf, crlf, eof};
+    for (int i = 0; i < 3; i++) {
+        CBMFileResult *r = extract(srcs[i], CBM_LANG_CHIALISP, "t", "c.clsp");
+        ASSERT_NOT_NULL(r);
+        ASSERT_FALSE(r->has_error);
+        ASSERT_FALSE(r->parse_incomplete);
+        ASSERT(has_def(r, "Function", "f"));
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+TEST(chialisp_library_defs_and_quoted_data) {
+    /* A .clib wraps its definitions in one enclosing list, and its macros embed
+     * puzzle-shaped literals under `(q ...)`. Those literals are DATA: a def
+     * head or call symbol inside one must mint nothing. */
+    const char *src = "(\n"
+                      "  (defconstant TWO 2)\n"
+                      "  (defmacro emit () (q . (defun ghost (x) (real_helper x))))\n"
+                      "  (defun real_helper (x) (+ x TWO))\n"
+                      ")\n";
+    CBMFileResult *r = extract(src, CBM_LANG_CHIALISP, "t", "curry.clib");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Constant", "TWO"));
+    ASSERT(has_def(r, "Macro", "emit"));
+    ASSERT(has_def(r, "Function", "real_helper"));
+    ASSERT(!has_def_any(r, "ghost"));
+    ASSERT(!has_call(r, "real_helper"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(chialisp_export_names_do_not_duplicate_defs) {
+    /* `(export foo)` names a function already defined in the same file. As a
+     * def head it would mint a SECOND node for `foo`; as a call head it would
+     * mint a phantom call. It is neither. */
+    const char *src = "(\n"
+                      "  (defun foo (x) x)\n"
+                      "  (export foo)\n"
+                      ")\n";
+    CBMFileResult *r = extract(src, CBM_LANG_CHIALISP, "t", "e.clsp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int foo_defs = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, "foo") == 0) {
+            foo_defs++;
+        }
+    }
+    ASSERT_EQ(foo_defs, 1);
+    ASSERT(!has_call(r, "export"));
+    ASSERT(!has_call(r, "foo"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(chialisp_comment_before_def_head_keeps_the_name) {
+    /* Comments are NAMED nodes and so occupy named-child indices. A comment
+     * between the head and the name shifts them by one; defs and call-scope
+     * must skip comments the same way or they stop describing the same tree. */
+    const char *src = "(mod ()\n"
+                      "  (defun ; why this exists\n"
+                      "     documented (x) (* x 2))\n"
+                      "  (defun caller () (documented 21))\n"
+                      ")\n";
+    CBMFileResult *r = extract(src, CBM_LANG_CHIALISP, "t", "d.clsp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "documented"));
+    ASSERT(has_def(r, "Function", "caller"));
+    ASSERT(has_call(r, "documented"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(chialisp_dialect_sigil_is_not_a_file_import) {
+    /* `(include *standard-cl-26*)` selects a dialect; recording it as an import
+     * invents a dependency on a file that does not exist. The compiler filters
+     * `*...*` names and so must we. */
+    const char *src = "(mod ()\n"
+                      "  (include *standard-cl-26*)\n"
+                      "  (include curry.clib)\n"
+                      ")\n";
+    CBMFileResult *r = extract(src, CBM_LANG_CHIALISP, "t", "s.clsp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_import(r, "curry.clib"));
+    ASSERT(!has_import(r, "standard-cl-26"));
     cbm_free_result(r);
     PASS();
 }
@@ -2052,9 +2201,10 @@ TEST(dbt_source_and_two_arg_ref) {
     /* Both dbt builtins name the relation in their LAST string argument:
      * source('group','table') -> table, and the two-argument
      * ref('package','model') form -> model. */
-    CBMFileResult *r = extract("SELECT * FROM {{ source('raw', 'customers') }}\n"
-                               "UNION ALL SELECT * FROM {{ ref('analytics', 'legacy_customers') }}\n",
-                               CBM_LANG_SQL, "t", "models/stg_customers.sql");
+    CBMFileResult *r =
+        extract("SELECT * FROM {{ source('raw', 'customers') }}\n"
+                "UNION ALL SELECT * FROM {{ ref('analytics', 'legacy_customers') }}\n",
+                CBM_LANG_SQL, "t", "models/stg_customers.sql");
     ASSERT_NOT_NULL(r);
     ASSERT(has_def(r, "Model", "stg_customers"));
     ASSERT(has_usage(r, "customers"));
@@ -3073,8 +3223,8 @@ TEST(vue_embedded_structure_negative_controls_issue1410) {
 }
 
 TEST(vue_embedded_structure_host_controls_issue1410) {
-    CBMFileResult *plain = extract("function plainTs(): void { target(); }\n", CBM_LANG_TYPESCRIPT,
-                                   "t", "plain.ts");
+    CBMFileResult *plain =
+        extract("function plainTs(): void { target(); }\n", CBM_LANG_TYPESCRIPT, "t", "plain.ts");
     ASSERT_NOT_NULL(plain);
     ASSERT_FALSE(plain->has_error);
     ASSERT_EQ(count_defs_named(plain, "Function", "plainTs"), 1);
@@ -3532,11 +3682,11 @@ TEST(extract_java_method_annotations_issue382) {
 /* ── ArkTS (HarmonyOS .ets) ─────────────────────────────────────── */
 
 TEST(arkts_component_struct) {
-    CBMFileResult *r = extract(
-        "@Entry\n@Component\nstruct Index {\n  @State message: string = 'Hello'\n\n"
-        "  build() {\n    Column() {\n      Text(this.message).fontSize(20)\n    }\n"
-        "    .width('100%')\n  }\n}\n",
-        CBM_LANG_ARKTS, "t", "Index.ets");
+    CBMFileResult *r =
+        extract("@Entry\n@Component\nstruct Index {\n  @State message: string = 'Hello'\n\n"
+                "  build() {\n    Column() {\n      Text(this.message).fontSize(20)\n    }\n"
+                "    .width('100%')\n  }\n}\n",
+                CBM_LANG_ARKTS, "t", "Index.ets");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Struct", "Index"));
@@ -3567,12 +3717,12 @@ TEST(arkts_exported_struct_decorators) {
 }
 
 TEST(arkts_member_decorators) {
-    CBMFileResult *r = extract(
-        "@Component\nstruct S {\n  @State a: number = 0\n  @Prop b: string\n"
-        "  @Link c: boolean\n  @Provide('k') d: string = ''\n  @Consume('k') e: string\n"
-        "  @StorageLink('s') f: number = 1\n  @State @Watch('onW') g: boolean = false\n\n"
-        "  build() {\n  }\n}\n",
-        CBM_LANG_ARKTS, "t", "S.ets");
+    CBMFileResult *r =
+        extract("@Component\nstruct S {\n  @State a: number = 0\n  @Prop b: string\n"
+                "  @Link c: boolean\n  @Provide('k') d: string = ''\n  @Consume('k') e: string\n"
+                "  @StorageLink('s') f: number = 1\n  @State @Watch('onW') g: boolean = false\n\n"
+                "  build() {\n  }\n}\n",
+                CBM_LANG_ARKTS, "t", "S.ets");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(decorators_contain(find_def_by_name(r, "a"), "State"));
@@ -3612,11 +3762,11 @@ TEST(arkts_no_phantom_builtin_defs) {
 }
 
 TEST(arkts_builder_extend_styles) {
-    CBMFileResult *r = extract(
-        "@Builder\nfunction card(t: string) {\n  Column() {\n    Text(t)\n  }\n}\n\n"
-        "@Extend(Text)\nfunction fancy(size: number) {\n  .fontSize(size)\n}\n\n"
-        "@Styles\nfunction pressed() {\n  .backgroundColor('#eee')\n}\n",
-        CBM_LANG_ARKTS, "t", "b.ets");
+    CBMFileResult *r =
+        extract("@Builder\nfunction card(t: string) {\n  Column() {\n    Text(t)\n  }\n}\n\n"
+                "@Extend(Text)\nfunction fancy(size: number) {\n  .fontSize(size)\n}\n\n"
+                "@Styles\nfunction pressed() {\n  .backgroundColor('#eee')\n}\n",
+                CBM_LANG_ARKTS, "t", "b.ets");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Function", "card"));
@@ -4960,8 +5110,8 @@ TEST(extract_c_test_dir_marks_is_test_issue1294) {
  * not be (#1294). */
 TEST(extract_python_method_test_dir_marks_is_test_issue1294) {
     const char *src = "class Foo:\n"
-                       "    def helper(self):\n"
-                       "        pass\n";
+                      "    def helper(self):\n"
+                      "        pass\n";
 
     /* Python's LSP layer injects synthetic builtin stub Methods (str.upper,
      * dict.get, ...) into defs.items alongside real ones (py_builtins.c), so
@@ -6150,6 +6300,12 @@ SUITE(extraction) {
     RUN_TEST(plsql_package_and_call);
     RUN_TEST(plsql_standalone_function);
     RUN_TEST(plsql_create_type_as_object_limitation);
+    RUN_TEST(chialisp_puzzle_defs_and_labels);
+    RUN_TEST(chialisp_comment_line_endings);
+    RUN_TEST(chialisp_library_defs_and_quoted_data);
+    RUN_TEST(chialisp_export_names_do_not_duplicate_defs);
+    RUN_TEST(chialisp_comment_before_def_head_keeps_the_name);
+    RUN_TEST(chialisp_dialect_sigil_is_not_a_file_import);
     RUN_TEST(wolfram_function);
     RUN_TEST(magma_function);
 
