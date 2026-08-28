@@ -826,6 +826,32 @@ static char *extract_ada_callee(CBMArena *a, TSNode node, const char *source, co
     return NULL;
 }
 
+/* PL/SQL: ref_call → referenced_element. Package-qualified calls use
+ * ref_name_parent.ref_name (e.g. UTIL_PKG.CALC_SALARY); bare calls use
+ * ref_name alone. */
+static char *extract_plsql_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "ref_call") != 0) {
+        return NULL;
+    }
+    TSNode ref = cbm_find_child_by_kind(node, "referenced_element");
+    if (ts_node_is_null(ref)) {
+        return NULL;
+    }
+    TSNode parent = ts_node_child_by_field_name(ref, TS_FIELD("ref_name_parent"));
+    TSNode name = ts_node_child_by_field_name(ref, TS_FIELD("ref_name"));
+    if (!ts_node_is_null(parent) && !ts_node_is_null(name)) {
+        char *p = cbm_node_text(a, parent, source);
+        char *n = cbm_node_text(a, name, source);
+        if (p && n && p[0] && n[0]) {
+            return cbm_arena_sprintf(a, "%s.%s", p, n);
+        }
+    }
+    if (!ts_node_is_null(name)) {
+        return cbm_node_text(a, name, source);
+    }
+    return cbm_node_text(a, ref, source);
+}
+
 // Solidity: a call_expression's callee is on the `function` field, wrapped in an
 // `expression` node (call_expression -> function:expression -> identifier). Descend
 // left-most through expression wrappers until we reach the identifier/member.
@@ -1368,6 +1394,9 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
     }
     if (lang == CBM_LANG_ADA) {
         return extract_ada_callee(a, node, source, nk);
+    }
+    if (lang == CBM_LANG_PLSQL) {
+        return extract_plsql_callee(a, node, source, nk);
     }
     if (lang == CBM_LANG_SOLIDITY) {
         return extract_solidity_callee(a, node, source, nk);
@@ -3338,7 +3367,7 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
             // right. Bare calls (helper()) and new_expression have no member
             // receiver, so they keep is_method=false (struct is zero-init).
             if ((ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
-                 ctx->language == CBM_LANG_TSX) &&
+                 ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) &&
                 strcmp(ts_node_type(node), "call_expression") == 0) {
                 TSNode fn = ts_node_child_by_field_name(node, TS_FIELD("function"));
                 if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "member_expression") == 0) {
