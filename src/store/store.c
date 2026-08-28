@@ -1227,12 +1227,50 @@ typedef struct {
     bool has_row;
 } graph_edge_cursor_t;
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+static atomic_int graph_compare_test_bind_countdown = ATOMIC_VAR_INIT(CBM_NOT_FOUND);
+static atomic_int graph_compare_test_cancel_countdown = ATOMIC_VAR_INIT(CBM_NOT_FOUND);
+
+void cbm_store_compare_test_fail_bind_after(int successful_binds) {
+    atomic_store(&graph_compare_test_bind_countdown, successful_binds);
+}
+
+void cbm_store_compare_test_cancel_after(int successful_checks) {
+    atomic_store(&graph_compare_test_cancel_countdown, successful_checks);
+}
+
+static bool graph_compare_test_countdown_fires(atomic_int *countdown) {
+    int remaining = atomic_load(countdown);
+    while (remaining >= 0) {
+        int next = remaining == 0 ? CBM_NOT_FOUND : remaining - 1;
+        if (atomic_compare_exchange_weak(countdown, &remaining, next)) {
+            return remaining == 0;
+        }
+    }
+    return false;
+}
+#endif
+
 static bool graph_compare_is_cancelled(const graph_compare_progress_t *progress) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (graph_compare_test_countdown_fires(&graph_compare_test_cancel_countdown)) {
+        return true;
+    }
+#endif
     return progress && progress->cancel && progress->cancel(progress->context);
 }
 
 static int graph_compare_progress(void *context) {
     return graph_compare_is_cancelled((const graph_compare_progress_t *)context) ? 1 : 0;
+}
+
+static int graph_compare_bind_text(sqlite3_stmt *stmt, int column, const char *value) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (graph_compare_test_countdown_fires(&graph_compare_test_bind_countdown)) {
+        return SQLITE_NOMEM;
+    }
+#endif
+    return bind_text(stmt, column, value);
 }
 
 /* SQLite's BINARY collation compares the unsigned bytes of the UTF-8 text.
@@ -1282,7 +1320,11 @@ static int graph_count_rows(cbm_store_t *store, const char *sql, const char *pro
         store_set_error_sqlite(store, "compare count prepare");
         return CBM_STORE_ERR;
     }
-    bind_text(stmt, SKIP_ONE, project);
+    if (graph_compare_bind_text(stmt, SKIP_ONE, project) != SQLITE_OK) {
+        store_set_error(store, "compare count bind failed");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
     int step_rc = sqlite3_step(stmt);
     if (step_rc != SQLITE_ROW) {
         store_set_error_sqlite(store, "compare count");
@@ -1388,35 +1430,46 @@ static int graph_edge_cursor_step(cbm_store_t *store, graph_edge_cursor_t *curso
 static int graph_prepare_node_cursor(cbm_store_t *store, const char *project,
                                      graph_node_cursor_t *cursor) {
     static const char sql[] =
-        "SELECT qualified_name,label,coalesce(file_path,'') FROM nodes WHERE project=?1 "
+        "SELECT qualified_name,label,replace(coalesce(file_path,''),'\\','/') "
+        "FROM nodes WHERE project=?1 "
         "ORDER BY qualified_name COLLATE BINARY,label COLLATE BINARY,"
-        "coalesce(file_path,'') COLLATE BINARY;";
+        "replace(coalesce(file_path,''),'\\','/') COLLATE BINARY;";
     if (sqlite3_prepare_v2(store->db, sql, CBM_NOT_FOUND, &cursor->stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(store, "compare node prepare");
         return CBM_STORE_ERR;
     }
-    bind_text(cursor->stmt, SKIP_ONE, project);
+    if (graph_compare_bind_text(cursor->stmt, SKIP_ONE, project) != SQLITE_OK) {
+        store_set_error(store, "compare node bind failed");
+        sqlite3_finalize(cursor->stmt);
+        cursor->stmt = NULL;
+        return CBM_STORE_ERR;
+    }
     return graph_node_cursor_step(store, cursor);
 }
 
 static int graph_prepare_edge_cursor(cbm_store_t *store, const char *project,
                                      graph_edge_cursor_t *cursor) {
     static const char sql[] =
-        "SELECT sn.qualified_name,sn.label,coalesce(sn.file_path,''),"
-        "tn.qualified_name,tn.label,coalesce(tn.file_path,''),e.type,"
+        "SELECT sn.qualified_name,sn.label,replace(coalesce(sn.file_path,''),'\\','/'),"
+        "tn.qualified_name,tn.label,replace(coalesce(tn.file_path,''),'\\','/'),e.type,"
         "coalesce(e.local_name_gen,'') FROM edges e "
         "JOIN nodes sn ON sn.id=e.source_id JOIN nodes tn ON tn.id=e.target_id "
         "WHERE e.project=?1 ORDER BY "
         "sn.qualified_name COLLATE BINARY,sn.label COLLATE BINARY,"
-        "coalesce(sn.file_path,'') COLLATE BINARY,"
+        "replace(coalesce(sn.file_path,''),'\\','/') COLLATE BINARY,"
         "tn.qualified_name COLLATE BINARY,tn.label COLLATE BINARY,"
-        "coalesce(tn.file_path,'') COLLATE BINARY,"
+        "replace(coalesce(tn.file_path,''),'\\','/') COLLATE BINARY,"
         "e.type COLLATE BINARY,coalesce(e.local_name_gen,'') COLLATE BINARY;";
     if (sqlite3_prepare_v2(store->db, sql, CBM_NOT_FOUND, &cursor->stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(store, "compare edge prepare");
         return CBM_STORE_ERR;
     }
-    bind_text(cursor->stmt, SKIP_ONE, project);
+    if (graph_compare_bind_text(cursor->stmt, SKIP_ONE, project) != SQLITE_OK) {
+        store_set_error(store, "compare edge bind failed");
+        sqlite3_finalize(cursor->stmt);
+        cursor->stmt = NULL;
+        return CBM_STORE_ERR;
+    }
     return graph_edge_cursor_step(store, cursor);
 }
 

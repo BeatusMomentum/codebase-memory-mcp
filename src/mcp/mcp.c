@@ -2918,13 +2918,26 @@ static bool compare_parse_arguments(const char *args, char **base_project, char 
     return true;
 }
 
+static char *sanitize_utf8_lossy(const char *s);
+
+static bool compare_add_identity_string(yyjson_mut_doc *doc, yyjson_mut_val *object,
+                                        const char *key, const char *value) {
+    char *sanitized = sanitize_utf8_lossy(value);
+    if (!sanitized) {
+        return false;
+    }
+    bool ok = yyjson_mut_obj_add_strcpy(doc, object, key, sanitized);
+    free(sanitized);
+    return ok;
+}
+
 static yyjson_mut_val *compare_node_json(yyjson_mut_doc *doc,
                                          const cbm_graph_node_identity_t *node) {
     yyjson_mut_val *object = yyjson_mut_obj(doc);
     if (!object ||
-        !yyjson_mut_obj_add_strcpy(doc, object, "qualified_name", node->qualified_name) ||
-        !yyjson_mut_obj_add_strcpy(doc, object, "label", node->label) ||
-        !yyjson_mut_obj_add_strcpy(doc, object, "file_path", node->file_path)) {
+        !compare_add_identity_string(doc, object, "qualified_name", node->qualified_name) ||
+        !compare_add_identity_string(doc, object, "label", node->label) ||
+        !compare_add_identity_string(doc, object, "file_path", node->file_path)) {
         return NULL;
     }
     return object;
@@ -2992,8 +3005,8 @@ static bool compare_edge_callback(void *context, bool added,
     yyjson_mut_val *target = doc ? compare_node_json(doc, &edge->target) : NULL;
     bool ok = item && source && target && yyjson_mut_obj_add_val(doc, item, "source", source) &&
               yyjson_mut_obj_add_val(doc, item, "target", target) &&
-              yyjson_mut_obj_add_strcpy(doc, item, "type", edge->type) &&
-              yyjson_mut_obj_add_strcpy(doc, item, "local_name_gen", edge->local_name_gen);
+              compare_add_identity_string(doc, item, "type", edge->type) &&
+              compare_add_identity_string(doc, item, "local_name_gen", edge->local_name_gen);
     if (ok) {
         yyjson_mut_doc_set_root(doc, item);
     }

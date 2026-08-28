@@ -282,9 +282,12 @@ typedef bool (*cbm_graph_compare_node_fn)(void *context, bool added,
 typedef bool (*cbm_graph_compare_edge_fn)(void *context, bool added,
                                           const cbm_graph_edge_identity_t *edge);
 
+#define CBM_GRAPH_COMPARE_GENERATION_SIZE 128
+#define CBM_GRAPH_COMPARE_INDEX_MODE_SIZE 32
+
 typedef struct {
-    char generation[128];
-    char index_mode[32];
+    char generation[CBM_GRAPH_COMPARE_GENERATION_SIZE];
+    char index_mode[CBM_GRAPH_COMPARE_INDEX_MODE_SIZE];
     int64_t node_count;
     int64_t edge_count;
 } cbm_graph_compare_project_t;
@@ -307,6 +310,14 @@ int cbm_store_compare_graphs(cbm_store_t *base_store, const char *base_project,
                              uint64_t scan_limit, cbm_graph_compare_cancel_fn cancel,
                              cbm_graph_compare_node_fn on_node, cbm_graph_compare_edge_fn on_edge,
                              void *context, cbm_graph_compare_result_t *out);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Deterministic one-shot comparison fault seams. Values count successful
+ * comparison binds/cancellation checks before the injected event; -1 disables
+ * the seam. */
+void cbm_store_compare_test_fail_bind_after(int successful_binds);
+void cbm_store_compare_test_cancel_after(int successful_checks);
+#endif
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
