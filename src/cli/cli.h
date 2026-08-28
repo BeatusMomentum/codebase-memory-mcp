@@ -193,6 +193,7 @@ typedef struct {
     bool crush;         /* Crush config or CLI exists */
     bool goose;         /* Goose config or CLI exists */
     bool mistral_vibe;  /* $VIBE_HOME, ~/.vibe/, or vibe CLI exists */
+    bool grok;          /* $GROK_HOME, ~/.grok/, or grok CLI exists */
 } cbm_detected_agents_t;
 
 /* Detect which coding agents are installed.
@@ -422,10 +423,20 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key);
 #define CBM_CONFIG_AUTO_INDEX_LIMIT "auto_index_limit"
 #define CBM_CONFIG_AUTO_WATCH "auto_watch"
 #define CBM_CONFIG_UI_LANG "ui-lang"
+#define CBM_CONFIG_WATCHER_ENABLED "watcher_enabled"
 /* #1558: the graph UI's loopback listener. Stored in the UI config file rather
  * than the key-value store, but surfaced through `config` so it is findable. */
 #define CBM_CONFIG_UI_ENABLED "ui_enabled"
 #define CBM_CONFIG_UI_PORT "ui_port"
+
+/* Whether the background watcher subsystem should run at all (default true).
+ * When false, the daemon host skips building and starting the watcher entirely:
+ * the poll thread never starts and no projects are registered (#335). Read once
+ * at daemon startup. Distinct from auto_watch, which only gates per-session
+ * registration while the watcher IS running. NULL-safe — a NULL cfg returns the
+ * default (true), so a failure to open the config store never silently disables
+ * the watcher. */
+bool cbm_config_watcher_enabled(cbm_config_t *cfg);
 
 /* ── Binary activation safety ─────────────────────────────────── */
 
