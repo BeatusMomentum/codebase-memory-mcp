@@ -1308,7 +1308,7 @@ TEST(parallel_lsp_index_exact_ambiguity_does_not_fall_through_to_legacy) {
     const cbm_gbuf_edge_t *legacy_edge =
         find_calls_edge_by_tails(gbuf, "Caller.run", "Legacy.render");
     if (!probe.ambiguity.injected || !probe.legacy_injected || !probe.carrier_allows_fallback ||
-        !probe.shared_matcher_failed_closed || alpha_edges != 1 || beta_edges != 0 ||
+        !probe.shared_matcher_failed_closed || alpha_edges != 0 || beta_edges != 0 ||
         legacy_edges != 0) {
         printf("  exact ambiguity + legacy diagnostic: exact_ambiguity=%d legacy=%d "
                "fallback_allowed=%d shared_failed_closed=%d alpha=%d beta=%d legacy_edge=%d "
@@ -1325,9 +1325,26 @@ TEST(parallel_lsp_index_exact_ambiguity_does_not_fall_through_to_legacy) {
     ASSERT_TRUE(probe.legacy_injected);
     ASSERT_TRUE(probe.carrier_allows_fallback);
     ASSERT_TRUE(probe.shared_matcher_failed_closed);
-    /* The ordinary registry/type fallback may still recover the source-proven
-     * Alpha receiver. Only the lower-ranked legacy semantic row is forbidden. */
-    ASSERT_EQ(alpha_edges, 1);
+    /* alpha_edges is a SIDE EFFECT of this test, not its subject. The subject is
+     * beta_edges == 0 and legacy_edges == 0 below: an ambiguous exact LSP match
+     * must not fall through to the lower-ranked legacy semantic row. Both are
+     * unchanged, as are all four probe assertions above.
+     *
+     * It used to be 1 because this harness DELIBERATELY injects an ambiguous
+     * exact match and forces the shared matcher to fail closed, so
+     * `value.render()` drops past the LSP into the registry with THREE
+     * same-named candidates (Alpha/Beta/Legacy.render) and bound by
+     * suffix_match — MEASURED: strategy=suffix_match, cands=3, conf=0.5500.
+     * That is a 1-in-3 guess that happened to land on Alpha: exactly the weak
+     * member-call class the Python guard now suppresses (#1276), and the same
+     * accepted trade recorded on python/S6 in test_lsp_resolution_probe.c.
+     *
+     * NOT over-suppression: sibling tests in this suite index the same
+     * `value.render()` source and resolve it via lsp_method (cands=1,
+     * conf=0.9000), a strategy the guard keeps — they still assert 1. Only the
+     * sabotaged-LSP path degrades to a weak textual guess.
+     * Flips back to 1 once py_lsp_cross resolves the receiver on this path. */
+    ASSERT_EQ(alpha_edges, 0);
     ASSERT_EQ(beta_edges, 0);
     ASSERT_EQ(legacy_edges, 0);
     PASS();
