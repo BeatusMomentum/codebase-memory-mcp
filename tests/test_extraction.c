@@ -4700,6 +4700,67 @@ TEST(extract_python_bare_call_flags_locally_bound_callee) {
     PASS();
 }
 
+/* The scope walk behind the bare-call flag is BOUNDED (64 ancestors). An
+ * unbounded walk is QUADRATIC in a file's nesting depth -- every level of
+ * f(f(f(...))) is itself a bare call re-walking its own chain -- which hung
+ * stack_overflow_b's 30,000-deep fixture rather than merely slowing it.
+ *
+ * This pins the cap's CONTRACT deterministically rather than by wall clock (a
+ * timing assertion would be a lottery, not a gate): within the cap the shadowed
+ * callee is flagged; past it the guard FAILS OPEN and leaves the call alone, so
+ * the cap can only ever cost a suppression, never a true edge. Removing the cap
+ * flips the deep case to flagged and fails this test. */
+TEST(extract_python_bare_call_scope_walk_is_bounded) {
+    /* Shallow: return_statement / block / function_definition — 3 ancestors. */
+    CBMFileResult *shallow = extract("def shallow(handler):\n"
+                                     "    return handler()\n",
+                                     CBM_LANG_PYTHON, "t", "s.py");
+    ASSERT_NOT_NULL(shallow);
+    ASSERT_FALSE(shallow->has_error);
+    int shallow_seen = 0;
+    for (int i = 0; i < shallow->calls.count; i++) {
+        const char *cn = shallow->calls.items[i].callee_name;
+        if (cn && strcmp(cn, "handler") == 0) {
+            shallow_seen++;
+            ASSERT_TRUE(shallow->calls.items[i].callee_is_locally_bound);
+        }
+    }
+    ASSERT_EQ(shallow_seen, 1);
+    cbm_free_result(shallow);
+
+    /* Deep: 200 parenthesized_expression ancestors put the SAME call well past
+     * the cap, so the enclosing parameter is never reached and the call stays
+     * unflagged. */
+    const int PARENS = 200;
+    size_t sz = (size_t)PARENS * 2 + 128;
+    char *src = malloc(sz);
+    ASSERT_NOT_NULL(src);
+    char *w = src;
+    w += snprintf(w, sz, "def deep(handler):\n    return ");
+    memset(w, '(', (size_t)PARENS);
+    w += PARENS;
+    w += snprintf(w, sz - (size_t)(w - src), "handler()");
+    memset(w, ')', (size_t)PARENS);
+    w += PARENS;
+    snprintf(w, sz - (size_t)(w - src), "\n");
+
+    CBMFileResult *deep = extract(src, CBM_LANG_PYTHON, "t", "d.py");
+    ASSERT_NOT_NULL(deep);
+    ASSERT_FALSE(deep->has_error);
+    int deep_seen = 0;
+    for (int i = 0; i < deep->calls.count; i++) {
+        const char *cn = deep->calls.items[i].callee_name;
+        if (cn && strcmp(cn, "handler") == 0) {
+            deep_seen++;
+            ASSERT_FALSE(deep->calls.items[i].callee_is_locally_bound);
+        }
+    }
+    ASSERT_EQ(deep_seen, 1);
+    cbm_free_result(deep);
+    free(src);
+    PASS();
+}
+
 /* TS/JS/TSX receiver-aware flag (#592/#606; same intent as the Perl flag above).
  * A member call x.foo() with a non-this/super receiver is flagged is_method so
  * the resolver can suppress a weak short-name match (`re.test()` must not bind a
@@ -6380,6 +6441,7 @@ SUITE(extraction) {
     RUN_TEST(extract_flag_exempt_method_call_not_flagged_is_method);
     RUN_TEST(extract_python_member_call_flags_is_method);
     RUN_TEST(extract_python_bare_call_flags_locally_bound_callee);
+    RUN_TEST(extract_python_bare_call_scope_walk_is_bounded);
     RUN_TEST(extract_ts_member_call_flags_is_method);
     RUN_TEST(extract_ts_this_super_receiver_not_flagged);
     RUN_TEST(extract_js_member_call_flags_is_method);

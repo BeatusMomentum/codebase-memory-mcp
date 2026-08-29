@@ -2853,14 +2853,54 @@ static const char *python_parameter_name(CBMExtractCtx *ctx, TSNode param) {
  * function whose parameter is `run` is still flagged. Detecting it needs exactly
  * the body scan this helper avoids, and it costs one edge in a shape that
  * essentially does not occur. */
-static bool python_callee_is_bound_parameter(CBMExtractCtx *ctx, TSNode call_node,
+static bool python_callee_is_bound_parameter(CBMExtractCtx *ctx, WalkState *state, TSNode call_node,
                                              TSNode callee_ident) {
+    /* Ancestors are walked with the UNIFIED WALK'S OWN CURSOR, not ts_node_parent().
+     *
+     * ts_node_parent() is not O(1): it restarts at the tree root and descends to
+     * find the parent (vendored ts_runtime/src/node.c), so it costs O(depth) per
+     * hop. A parent-chain walk is therefore O(depth^2) per call, and since every
+     * level of f(f(f(...))) is ITSELF a bare call, O(depth^3) across the file --
+     * tests/test_stack_overflow.c nests 30,000 deep, which is a hang, not a
+     * slowdown. Capping the hop COUNT does not fix that, because the cost is per
+     * hop; the walk itself has to be cheap.
+     *
+     * ts_tree_cursor_goto_parent() IS O(1) -- the cursor carries its path stack --
+     * so copying the walk cursor and ascending costs nothing per hop. Same reason
+     * CBMWalkScope keeps a frame stack instead of recomputing enclosing state, and
+     * same current_cursor idiom (including the identity guard) as
+     * usage_current_field_name in extract_usages.c.
+     *
+     * The hop cap then bounds the remaining O(depth) per call. 64 rather than
+     * Lean's 20 above: that walk looks for an IMMEDIATE declaration boundary,
+     * while this one crosses whatever statement/expression nesting separates a
+     * call from its enclosing def, so it needs headroom before it can bite on
+     * ordinary code.
+     *
+     * Both the cap and a missing/mismatched cursor FAIL OPEN -- return false, do
+     * NOT suppress. A guard whose whole justification is precision must never
+     * destroy an edge it did not actually prove was fabricated, so either can
+     * only ever cost a suppression, never a true edge. Pinned in
+     * test_extraction.c. */
+    enum { PY_MAX_SCOPE_WALK_DEPTH = 64 };
+
     const char *callee_name = cbm_node_text(ctx->arena, callee_ident, ctx->source);
     if (!callee_name || !callee_name[0]) {
         return false;
     }
-    for (TSNode scope = ts_node_parent(call_node); !ts_node_is_null(scope);
-         scope = ts_node_parent(scope)) {
+    /* Only trust the shared cursor when it is actually parked on this call. */
+    if (!state || !state->current_cursor ||
+        !ts_node_eq(ts_tree_cursor_current_node(state->current_cursor), call_node)) {
+        return false;
+    }
+
+    TSTreeCursor up = ts_tree_cursor_copy(state->current_cursor);
+    bool bound = false;
+    for (int walked = 0; walked < PY_MAX_SCOPE_WALK_DEPTH && !bound; walked++) {
+        if (!ts_tree_cursor_goto_parent(&up)) {
+            break;
+        }
+        TSNode scope = ts_tree_cursor_current_node(&up);
         const char *kind = ts_node_type(scope);
         if (strcmp(kind, "function_definition") != 0 && strcmp(kind, "lambda") != 0) {
             continue;
@@ -2873,11 +2913,13 @@ static bool python_callee_is_bound_parameter(CBMExtractCtx *ctx, TSNode call_nod
         for (uint32_t i = 0; i < count; i++) {
             const char *pname = python_parameter_name(ctx, ts_node_named_child(params, i));
             if (pname && strcmp(pname, callee_name) == 0) {
-                return true;
+                bound = true;
+                break;
             }
         }
     }
-    return false;
+    ts_tree_cursor_delete(&up);
+    return bound;
 }
 
 static bool is_objectscript_language(CBMLanguage language) {
@@ -3515,7 +3557,8 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                     TSNode obj = ts_node_child_by_field_name(fn, TS_FIELD("object"));
                     call.is_method = !python_receiver_is_exempt(ctx, obj);
                 } else if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "identifier") == 0) {
-                    call.callee_is_locally_bound = python_callee_is_bound_parameter(ctx, node, fn);
+                    call.callee_is_locally_bound =
+                        python_callee_is_bound_parameter(ctx, state, node, fn);
                 }
             }
             // TS/JS/TSX receiver-aware guard (#592/#606 direction; same intent
