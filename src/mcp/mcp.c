@@ -7706,7 +7706,28 @@ static void try_artifact_bootstrap(const char *project_name, const char *repo_pa
     project_db_path(project_name, db_buf, sizeof(db_buf));
     if (cbm_file_size(db_buf) < 0 && cbm_artifact_exists(repo_path)) {
         cbm_log_info("index.artifact_bootstrap", "project", project_name);
-        cbm_artifact_import(repo_path, db_buf);
+        /* An imported artifact is trusted for graph CONTENT as-is — nothing
+         * verifies that its nodes/edges describe the code they claim to. What
+         * has been limiting the blast radius is mechanical, not a check: every
+         * imported row carries the EXPORTER's mtime, so the first incremental
+         * run re-parses ~everything and auto-scrubs a poisoned artifact at a
+         * clone time the producer cannot predict. That exposure is transient
+         * and self-healing.
+         *
+         * cbm_artifact_reconcile_hashes deliberately trades part of that away
+         * for the speed the artifact is supposed to deliver (#885): rows it
+         * restamps are no longer re-parsed, so poisoned nodes for those files
+         * persist until the file changes — a DURABLE exposure gated on a
+         * producer-written marker. It stays acceptable only because the marker
+         * alone never suffices: each restamped row must additionally be proven
+         * unchanged by the LOCAL git against a commit present in this clone.
+         * Read the trade-off note in artifact.h before widening it.
+         *
+         * Best-effort: a -1 return leaves every row foreign and falls back to
+         * today's behavior, so a failure here can never fail the import. */
+        if (cbm_artifact_import(repo_path, db_buf) == 0) {
+            (void)cbm_artifact_reconcile_hashes(repo_path, db_buf, project_name);
+        }
     }
 }
 
