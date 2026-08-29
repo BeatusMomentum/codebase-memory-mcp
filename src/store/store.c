@@ -8883,10 +8883,25 @@ int cbm_store_adr_delete(cbm_store_t *s, const char *project) {
 
 int cbm_store_adr_update_sections(cbm_store_t *s, const char *project, const char **keys,
                                   const char **values, int count, cbm_adr_t *out) {
+    if (!s || !s->db || !project || !keys || !values || !out) {
+        return CBM_STORE_ERR;
+    }
+
+    /* The read-modify-write below must be ONE transaction. Three writers
+     * replace this row wholesale — the indexing pipeline, the UI POST
+     * /api/adr handler, and manage_adr mode='update' — so an unguarded
+     * get/merge/store silently loses whichever of them commits between the
+     * read and the UPSERT. BEGIN IMMEDIATE takes the write lock up front, so a
+     * competing writer waits rather than being overwritten. */
+    if (cbm_store_begin(s) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+
     /* Get existing ADR */
     cbm_adr_t existing;
     int rc = cbm_store_adr_get(s, project, &existing);
     if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
         store_set_error(s, "no existing ADR to update");
         return rc;
     }
@@ -8917,13 +8932,20 @@ int cbm_store_adr_update_sections(cbm_store_t *s, const char *project, const cha
     char *merged = cbm_adr_render(&sections);
     cbm_adr_sections_free(&sections);
 
+    if (!merged) {
+        (void)cbm_store_rollback(s);
+        store_set_error(s, "failed to render merged ADR");
+        return CBM_STORE_ERR;
+    }
+
     /* Check length */
     if ((int)strlen(merged) > CBM_ADR_MAX_LENGTH) {
         char msg[CBM_SZ_128];
         snprintf(msg, sizeof(msg), "merged ADR exceeds %d chars (%d chars)", CBM_ADR_MAX_LENGTH,
                  (int)strlen(merged));
-        store_set_error(s, msg);
         free(merged);
+        (void)cbm_store_rollback(s);
+        store_set_error(s, msg);
         return CBM_STORE_ERR;
     }
 
@@ -8931,10 +8953,22 @@ int cbm_store_adr_update_sections(cbm_store_t *s, const char *project, const cha
     rc = cbm_store_adr_store(s, project, merged);
     free(merged);
     if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
         return rc;
     }
 
-    return cbm_store_adr_get(s, project, out);
+    /* Read back INSIDE the transaction so `out` is exactly what commits. */
+    rc = cbm_store_adr_get(s, project, out);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+    if (cbm_store_commit(s) != CBM_STORE_OK) {
+        cbm_store_adr_free(out);
+        (void)cbm_store_rollback(s);
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
 }
 
 void cbm_store_adr_free(cbm_adr_t *adr) {

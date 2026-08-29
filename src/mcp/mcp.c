@@ -706,10 +706,19 @@ static const tool_def_t TOOLS[] = {
 
     {"manage_adr", "Manage ADR", "Create or update Architecture Decision Records",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"mode\":{\"type\":"
-     "\"string\",\"enum\":[\"get\",\"update\",\"sections\"],\"description\":\"update replaces "
-     "the entire ADR document; sections only lists existing "
-     "headings\"},\"content\":{\"type\":\"string\",\"description\":\"Complete replacement document "
-     "required by update\"}},\"additionalProperties\":false,"
+     "\"string\",\"enum\":[\"get\",\"update\",\"set_sections\",\"sections\"],\"description\":"
+     "\"update REPLACES the entire ADR document; set_sections rewrites only the named sections "
+     "and leaves every other byte of the stored document untouched, so adding one entry does not "
+     "mean re-sending the whole ADR (setting the same section to the same body twice leaves the "
+     "document byte-identical, so retrying after a lost response is safe); sections only lists "
+     "existing headings\"},\"content\":{\"type\":\"string\",\"description\":\"Complete replacement "
+     "document required by update\"},\"section_updates\":{\"type\":\"object\",\"description\":"
+     "\"Required by set_sections: section name -> new body for that section. Only the six "
+     "canonical sections exist; any other name is rejected.\",\"properties\":{"
+     "\"PURPOSE\":{\"type\":\"string\"},\"STACK\":{\"type\":\"string\"},"
+     "\"ARCHITECTURE\":{\"type\":\"string\"},\"PATTERNS\":{\"type\":\"string\"},"
+     "\"TRADEOFFS\":{\"type\":\"string\"},\"PHILOSOPHY\":{\"type\":\"string\"}},"
+     "\"additionalProperties\":false}},\"additionalProperties\":false,"
      "\"required\":[\"project\"]}"},
 
     {"ingest_traces", "Ingest traces", "Ingest runtime traces to enhance the knowledge graph",
@@ -11848,6 +11857,123 @@ static cbm_store_t *open_adr_store_for_write(cbm_mcp_server_t *srv, cbm_store_t 
     return *owned_rw;
 }
 
+/* Parsed `section_updates` for mode='set_sections'.
+ *
+ * mode='update' replaces the whole document, so adding one entry costs a full
+ * re-send and the stored ADR is only ever as good as that round-trip. Writing
+ * named sections instead leaves the rest of the document as the authority for
+ * itself — and, unlike a whole-document append, applying the same request
+ * twice yields the same document, so a client that retries after a lost
+ * response cannot silently duplicate content. */
+typedef struct {
+    char *keys[PROPS_MAX];
+    char *values[PROPS_MAX];
+    int count;
+    /* Rejection reason, or NULL when the request parsed cleanly. Set means no
+     * store was opened and nothing was written. */
+    const char *status;
+    const char *error;
+} adr_section_updates_t;
+
+static void adr_section_updates_free(adr_section_updates_t *u) {
+    for (int i = 0; i < u->count; i++) {
+        free(u->keys[i]);
+        free(u->values[i]);
+    }
+    u->count = 0;
+}
+
+static bool adr_collect_section_update(adr_section_updates_t *u, yyjson_val *key, yyjson_val *val) {
+    const char *name = yyjson_get_str(key);
+    if (!name || !name[0]) {
+        u->status = "invalid_section_updates";
+        u->error = "'section_updates' keys must be non-empty section names. "
+                   "No ADR write was performed.";
+        return false;
+    }
+    if (!yyjson_is_str(val)) {
+        u->status = "invalid_section_updates";
+        u->error = "'section_updates' values must be strings (the new body for that section). "
+                   "No ADR write was performed.";
+        return false;
+    }
+    const char *body = yyjson_get_str(val);
+    /* An empty body would render a heading with nothing under it — a silent
+     * content deletion wearing the response shape of an update. Clearing a
+     * section is whole-document surgery; that is what mode='update' is for. */
+    if (!body || !body[0]) {
+        u->status = "empty_section_content";
+        u->error = "'section_updates' values must be non-empty; use mode='update' to remove a "
+                   "section. No ADR write was performed.";
+        return false;
+    }
+    if (u->count >= PROPS_MAX) {
+        u->status = "too_many_sections";
+        u->error = "'section_updates' carries more entries than an ADR can hold. "
+                   "No ADR write was performed.";
+        return false;
+    }
+    u->keys[u->count] = heap_strdup(name);
+    u->values[u->count] = heap_strdup(body);
+    if (!u->keys[u->count] || !u->values[u->count]) {
+        free(u->keys[u->count]);
+        free(u->values[u->count]);
+        u->status = "write_error";
+        u->error = "out of memory parsing 'section_updates'. No ADR write was performed.";
+        return false;
+    }
+    u->count++;
+    return true;
+}
+
+static adr_section_updates_t adr_parse_section_updates(const char *args) {
+    adr_section_updates_t u;
+    memset(&u, 0, sizeof(u));
+
+    yyjson_doc *doc = yyjson_read(args, strlen(args), 0);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *updates =
+        (root && yyjson_is_obj(root)) ? yyjson_obj_get(root, "section_updates") : NULL;
+
+    if (!updates) {
+        /* Never fall through to 'get': a caller that meant to write must not
+         * receive a success-shaped read. */
+        u.status = "missing_section_updates";
+        u.error = "mode='set_sections' requires 'section_updates', an object mapping section "
+                  "name to its new body. No ADR write was performed.";
+    } else if (!yyjson_is_obj(updates) || yyjson_obj_size(updates) == 0) {
+        u.status = "invalid_section_updates";
+        u.error = "'section_updates' must be a non-empty object mapping section name to its new "
+                  "body. No ADR write was performed.";
+    } else {
+        size_t idx = 0;
+        size_t max = 0;
+        yyjson_val *key = NULL;
+        yyjson_val *val = NULL;
+        yyjson_obj_foreach(updates, idx, max, key, val) {
+            if (!adr_collect_section_update(&u, key, val)) {
+                adr_section_updates_free(&u);
+                break;
+            }
+        }
+    }
+    yyjson_doc_free(doc);
+    return u;
+}
+
+/* Build the rejection payload for a set_sections request that never reached a
+ * store. Caller frees. */
+static char *adr_section_updates_error(const adr_section_updates_t *u) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root_obj);
+    yyjson_mut_obj_add_str(doc, root_obj, "status", u->status);
+    yyjson_mut_obj_add_strcpy(doc, root_obj, "error", u->error);
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    return json;
+}
+
 static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
@@ -11879,12 +12005,51 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
             true);
     }
 
+    bool set_sections_mode = (strcmp(mode_str, "set_sections") == 0);
+    adr_section_updates_t updates;
+    memset(&updates, 0, sizeof(updates));
+    char section_key_err[CBM_SZ_256] = "";
+    if (set_sections_mode) {
+        updates = adr_parse_section_updates(args);
+        /* Only the six canonical names are writable, and that is a correctness
+         * constraint rather than a house style: adr_try_section_header() parses
+         * ONLY canonical headers, so a '## FOO' written here would be read back
+         * as body text of the section above it and a second identical write
+         * would append a duplicate — destroying exactly the idempotence this
+         * mode exists to provide. */
+        if (!updates.status && cbm_adr_validate_section_keys(
+                                   (const char **)updates.keys, updates.count, section_key_err,
+                                   (int)sizeof(section_key_err)) != CBM_STORE_OK) {
+            adr_section_updates_free(&updates);
+            updates.status = "invalid_section_name";
+            updates.error = section_key_err;
+        }
+        if (updates.status) {
+            /* Reject before taking the project lease or opening a store: a
+             * malformed write must not block an index, and must not read. */
+            char *err = adr_section_updates_error(&updates);
+            adr_section_updates_free(&updates);
+            free(project);
+            free(mode_str);
+            free(content);
+            char *res = cbm_mcp_text_result(err, true);
+            free(err);
+            return res;
+        }
+    }
+
+    /* This classification is load-bearing. A mode missing from it takes no
+     * per-project mutation lease, resolves the store query-only, and never
+     * reaches open_adr_store_for_write — so its write would be attempted
+     * through a read-only handle, concurrently with an active index. */
     bool write_request =
-        content && (strcmp(mode_str, "update") == 0 || strcmp(mode_str, "store") == 0);
+        (content && (strcmp(mode_str, "update") == 0 || strcmp(mode_str, "store") == 0)) ||
+        set_sections_mode;
     bool mutation_held = false;
     if (write_request && project) {
         mutation_held = mcp_project_mutation_begin(srv, project);
         if (!mutation_held) {
+            adr_section_updates_free(&updates);
             free(project);
             free(mode_str);
             free(content);
@@ -11893,6 +12058,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
         }
         if (mcp_request_cancelled(srv)) {
             mcp_project_mutation_end(srv, project);
+            adr_section_updates_free(&updates);
             free(project);
             free(mode_str);
             free(content);
@@ -11921,6 +12087,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
         if (mutation_held) {
             mcp_project_mutation_end(srv, project);
         }
+        adr_section_updates_free(&updates);
         free(project);
         free(mode_str);
         free(content);
@@ -11935,6 +12102,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
             if (mutation_held) {
                 mcp_project_mutation_end(srv, project);
             }
+            adr_section_updates_free(&updates);
             free(project);
             free(mode_str);
             free(content);
@@ -11981,13 +12149,69 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
         }
     }
 
+    /* A set_sections write must see a legacy file-backed ADR too. The
+     * migration above deliberately runs on the read path only — it must never
+     * block on the lease — so the write path reads the file here, where the
+     * exclusive project lease and a writable store are already held. Merging
+     * onto an empty document instead would silently discard an ADR the user
+     * still has on disk. */
+    char *legacy_seed = NULL;
+    if (set_sections_mode && !have_adr) {
+        char *root_path = project_root_from_store(store, project);
+        legacy_seed = adr_read_legacy_file(root_path);
+        free(root_path);
+    }
+
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root_obj);
 
     bool is_error = false;
     const char *adr_content = have_adr ? adr.content : legacy;
-    if (write_request) {
+    if (set_sections_mode) {
+        /* cbm_store_adr_update_sections requires an existing row — its
+         * contract, pinned by TEST(adr_update_no_existing). Seed one when the
+         * project has none, so the mode degrades to a plain create: the legacy
+         * document when there is one, an empty document otherwise. */
+        bool base_present = have_adr;
+        bool seeded_empty = false;
+        if (!base_present) {
+            const char *seed = legacy_seed ? legacy_seed : "";
+            if (cbm_store_adr_store(store, project, seed) == CBM_STORE_OK) {
+                base_present = true;
+                seeded_empty = (legacy_seed == NULL);
+            }
+        }
+        cbm_adr_t updated;
+        memset(&updated, 0, sizeof(updated));
+        int section_rc = base_present ? cbm_store_adr_update_sections(
+                                            store, project, (const char **)updates.keys,
+                                            (const char **)updates.values, updates.count, &updated)
+                                      : CBM_STORE_ERR;
+        if (section_rc == CBM_STORE_OK) {
+            yyjson_mut_obj_add_str(doc, root_obj, "status", "sections_updated");
+            yyjson_mut_obj_add_str(doc, root_obj, "semantics",
+                                   "named_sections_replaced_rest_preserved");
+            yyjson_mut_obj_add_uint(doc, root_obj, "sections_written", (uint64_t)updates.count);
+            /* Callers confirm the write landed without re-fetching the ADR. */
+            yyjson_mut_obj_add_uint(doc, root_obj, "content_length",
+                                    (uint64_t)strlen(updated.content));
+            cbm_store_adr_free(&updated);
+        } else {
+            /* Undo an empty seed. A rejected write must not leave the project
+             * holding a blank ADR where `get` used to answer no_adr. A legacy
+             * seed is a real migration and is kept. */
+            if (seeded_empty) {
+                (void)cbm_store_adr_delete(store, project);
+            }
+            yyjson_mut_obj_add_str(doc, root_obj, "status", "write_error");
+            const char *store_err = cbm_store_error(store);
+            if (store_err && store_err[0]) {
+                yyjson_mut_obj_add_strcpy(doc, root_obj, "error", store_err);
+            }
+            is_error = true;
+        }
+    } else if (write_request) {
         if (cbm_store_adr_store(store, project, content) == CBM_STORE_OK) {
             yyjson_mut_obj_add_str(doc, root_obj, "status", "updated");
             yyjson_mut_obj_add_str(doc, root_obj, "semantics", "whole_document_replaced");
@@ -12018,6 +12242,8 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     if (mutation_held) {
         mcp_project_mutation_end(srv, project);
     }
+    adr_section_updates_free(&updates);
+    free(legacy_seed);
     free(legacy);
     free(project);
     free(mode_str);
