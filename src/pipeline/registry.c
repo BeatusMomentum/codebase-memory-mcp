@@ -429,19 +429,27 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
     return true; /* weak short-name match (suffix_match / unique_name / …) → drop */
 }
 
-/* TS/JS analogue of the Perl guard above (#592/#606 direction; precedent #477).
- * A member call `x.foo()` reaches the weak textual cascade ONLY when the TS-LSP
- * could not resolve the receiver type — type-resolved calls win via lsp_*
- * strategies before the registry runs. Binding such a call to a project symbol
- * by a weak short-name strategy fabricates a CALLS edge (`re.test()` ->
- * SalesforceRestClient.test, `date.toISOString()` -> any project toISOString).
- * Drop ONLY the weak strategies; keep import/same-module/qualified-tail matches
- * and every lsp_* strategy. Uses an EXPLICIT drop-list (not keep-list +
- * default-drop) because the parallel resolver runs lsp_* strategies through the
- * same guard variable — a default-drop would silently kill lsp_ts_method. Pure
- * + side-effect-free so the contract is unit-testable without a full pipeline. */
-bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const char *strategy) {
-    if (!is_tsjs || !is_method || !strategy || !strategy[0]) {
+/* Dynamic-language analogue of the Perl guard above (#592/#606/#1276
+ * direction; precedent #477). A member call `x.foo()` reaches the weak textual
+ * cascade ONLY when the language's LSP could not resolve the receiver type —
+ * type-resolved calls win via lsp_* strategies before the registry runs.
+ * Binding such a call to a project symbol by a weak short-name strategy
+ * fabricates a CALLS edge (`re.test()` -> SalesforceRestClient.test,
+ * `accelerator.print()` -> MockAccelerator.print). Drop ONLY the weak
+ * strategies; keep import/same-module/qualified-tail matches and every lsp_*
+ * strategy. Uses an EXPLICIT drop-list (not keep-list + default-drop) because
+ * the parallel resolver runs lsp_* strategies through the same guard variable —
+ * a default-drop would silently kill lsp_ts_method. Pure + side-effect-free so
+ * the contract is unit-testable without a full pipeline.
+ *
+ * `enabled` is the CALLER's per-language gate, deliberately kept OUT of this
+ * helper: the guard applies only to the language set each call site enumerates
+ * (today Python plus the JS/TS family including ArkTS). Widening it is a
+ * per-language decision made at the call sites in pass_calls.c and
+ * pass_parallel.c, which MUST stay in lockstep — a gate added to only one of
+ * them diverges the sequential and parallel resolvers. */
+bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *strategy) {
+    if (!enabled || !is_method || !strategy || !strategy[0]) {
         return false;
     }
     /* Weak short-name strategies that actually reach the call-resolution guards:
