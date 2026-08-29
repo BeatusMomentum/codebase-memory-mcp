@@ -129,6 +129,7 @@ enum {
 #define MCP_MAX_MESSAGE_SIZE ((size_t)10U * 1024U * 1024U)
 #define MCP_MAX_HEADER_SIZE ((size_t)8U * 1024U)
 #define MCP_SEARCH_OUTPUT_MAX ((size_t)64U * 1024U * 1024U)
+#define MCP_SEARCH_SCAN_TIMEOUT_MS ((uint64_t)30000U)
 
 /* ── Helpers ────────────────────────────────────────────────────── */
 
@@ -1624,6 +1625,9 @@ struct cbm_mcp_server {
     void *auto_index_count_test_context;
 #endif
     size_t search_output_limit_override;
+    const char *search_scan_command_override;
+    uint64_t search_scan_timeout_override_ms;
+    bool search_scan_timeout_override_set;
     cbm_thread_t autoindex_tid;
     bool autoindex_active; /* true if auto-index thread was started */
 
@@ -1936,6 +1940,20 @@ void cbm_mcp_server_set_command_test_hook(cbm_mcp_server_t *srv, cbm_mcp_command
 void cbm_mcp_server_set_search_output_limit_for_test(cbm_mcp_server_t *srv, size_t limit) {
     if (srv) {
         srv->search_output_limit_override = limit;
+    }
+}
+
+void cbm_mcp_server_set_search_scan_command_for_test(cbm_mcp_server_t *srv, const char *command) {
+    if (srv) {
+        srv->search_scan_command_override = command;
+    }
+}
+
+void cbm_mcp_server_set_search_scan_timeout_for_test(cbm_mcp_server_t *srv, uint64_t timeout_ms,
+                                                     bool override_set) {
+    if (srv) {
+        srv->search_scan_timeout_override_ms = timeout_ms;
+        srv->search_scan_timeout_override_set = override_set;
     }
 }
 
@@ -9513,11 +9531,16 @@ void cbm_search_code_build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bo
             /* -0: read NUL-separated paths from the filelist so paths containing
              * spaces stay one argument (issue #687). Pairs with the NUL separator
              * written by write_scoped_filelist. */
-            snprintf(cmd, cmd_sz, "xargs -0 grep -Hn %s --include='%s' -f '%s' < '%s' 2>/dev/null",
+            snprintf(cmd, cmd_sz,
+                     "xargs -0 sh -c 'grep -Hn -d skip %s --include=\"%s\" -f \"%s\" \"$@\"; "
+                     "status=$?; [ \"$status\" -eq 0 ] || [ \"$status\" -eq 1 ]' sh < '%s' "
+                     "2>/dev/null",
                      flag, file_pattern, tmpfile, filelist);
         } else {
-            snprintf(cmd, cmd_sz, "xargs -0 grep -Hn %s -f '%s' < '%s' 2>/dev/null", flag, tmpfile,
-                     filelist);
+            snprintf(cmd, cmd_sz,
+                     "xargs -0 sh -c 'grep -Hn -d skip %s -f \"%s\" \"$@\"; status=$?; "
+                     "[ \"$status\" -eq 0 ] || [ \"$status\" -eq 1 ]' sh < '%s' 2>/dev/null",
+                     flag, tmpfile, filelist);
         }
     } else {
         if (file_pattern) {
@@ -10118,13 +10141,18 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
     }
     char **indexed_files = NULL;
     int indexed_count = 0;
-    if (cbm_store_list_files(pre_store, project, &indexed_files, &indexed_count) != CBM_STORE_OK ||
-        indexed_count == 0) {
+    int list_rc = cbm_store_list_files(pre_store, project, &indexed_files, &indexed_count);
+    if (list_rc != CBM_STORE_OK || indexed_count == 0) {
+        for (int fi = 0; fi < indexed_count; fi++) {
+            free(indexed_files[fi]);
+        }
+        free(indexed_files);
         return false;
     }
     bool ok = false;
     int written = 0;
     if (fl) {
+        ok = true;
         for (int fi = 0; fi < indexed_count; fi++) {
             /* A source path never legitimately contains a newline or carriage
              * return. Those bytes are exactly the record separator on the
@@ -10142,6 +10170,31 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
                     continue;
                 }
             }
+            size_t root_len = strlen(root_path);
+            size_t file_len = strlen(indexed_files[fi]);
+            if (root_len > SIZE_MAX - file_len - 2) {
+                continue;
+            }
+            size_t scan_path_len = root_len + 1 + file_len;
+            char *scan_path = malloc(scan_path_len + 1);
+            if (!scan_path) {
+                ok = false;
+                break;
+            }
+            memcpy(scan_path, root_path, root_len);
+            scan_path[root_len] = '/';
+            memcpy(scan_path + root_len + 1, indexed_files[fi], file_len + 1);
+
+            /* Incremental stores can retain structural directory nodes and
+             * briefly stale deleted-file paths. Neither is a content-scan
+             * operand. Filter them before spawning so an expected stale entry
+             * cannot turn otherwise valid matches into grep status 2. This
+             * deliberately does not follow symlinks/reparse points. */
+            cbm_path_info_t path_info;
+            if (cbm_path_info_utf8(scan_path, &path_info) != 0 || !path_info.is_regular) {
+                free(scan_path);
+                continue;
+            }
             /* Write "<root>/<file>" piece-by-piece (no fixed-size buffer, so an
              * arbitrarily long absolute path cannot overflow). Forward slash join
              * so xargs doesn't treat Windows backslashes as escapes; binary mode
@@ -10150,9 +10203,8 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
              *     newline separator would split plain xargs on the space).
              *   - Windows: newline, consumed by PowerShell `Get-Content |
              *     Select-String -LiteralPath` (NUL bytes break Get-Content). */
-            (void)fwrite(root_path, 1, strlen(root_path), fl);
-            (void)fputc('/', fl);
-            (void)fwrite(indexed_files[fi], 1, strlen(indexed_files[fi]), fl);
+            (void)fwrite(scan_path, 1, scan_path_len, fl);
+            free(scan_path);
 #ifdef _WIN32
             (void)fputc('\n', fl);
 #else
@@ -10162,7 +10214,6 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
         }
         /* The stream stays open — the caller owns it and closes it (flushing
          * these records to disk) before the grep subprocess reads the list. */
-        ok = true;
     }
     for (int fi = 0; fi < indexed_count; fi++) {
         free(indexed_files[fi]);
@@ -10266,6 +10317,16 @@ typedef struct {
     FILE *filelist; /* held open for write_scoped_filelist; closed by the caller */
 } search_scratch_t;
 
+typedef enum {
+    MCP_SCAN_SUCCESS = 0,
+    MCP_SCAN_COMMAND_FAILURE,
+    MCP_SCAN_CONTAINED_COMMAND_FAILURE,
+    MCP_SCAN_OUTPUT_LIMIT,
+    MCP_SCAN_DEADLINE,
+    MCP_SCAN_CANCELLED,
+    MCP_SCAN_SUPERVISION_FAILURE,
+} mcp_scan_cause_t;
+
 /* Create <scratch>/<basename>-XXXXXX exclusively and return a stream on the
  * descriptor. On failure `path_out` is emptied so cleanup skips it. */
 static FILE *search_scratch_file(const char *dir, const char *basename, char *path_out,
@@ -10362,17 +10423,44 @@ static bool compile_path_filter(const char *filter, cbm_regex_t *re) {
     return cbm_regcomp(re, filter, CBM_REG_EXTENDED | CBM_REG_NOSUB) == CBM_REG_OK;
 }
 
-static int mcp_run_shell_command_cancellable_bounded(cbm_mcp_server_t *srv, const char *command,
-                                                     char output_path[CBM_SZ_2K],
-                                                     size_t output_limit,
-                                                     bool *output_limit_exceeded,
-                                                     cbm_proc_result_t *result_out);
+static mcp_scan_cause_t mcp_run_shell_command_cancellable_bounded(
+    cbm_mcp_server_t *srv, const char *command, char output_path[CBM_SZ_2K], size_t output_limit,
+    uint64_t deadline_ms, bool deadline_enabled, bool deadline_latched, bool exit_one_is_no_match,
+    cbm_proc_result_t *result_out);
 
-#ifdef _WIN32
+static char *search_code_timeout_result(void) {
+    static const char message[] = "search_code scan exceeded its execution deadline";
+    static const char fallback[] =
+        "{\"content\":[{\"type\":\"text\",\"text\":\"search_code scan exceeded its execution "
+        "deadline\"}],\"structuredContent\":{\"code\":\"request_timeout\",\"message\":\"search_"
+        "code "
+        "scan exceeded its execution deadline\"},\"isError\":true}";
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return heap_strdup(fallback);
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_val *content = yyjson_mut_arr(doc);
+    yyjson_mut_val *item = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, item, "type", "text");
+    yyjson_mut_obj_add_str(doc, item, "text", message);
+    yyjson_mut_arr_add_val(content, item);
+    yyjson_mut_obj_add_val(doc, root, "content", content);
+    yyjson_mut_val *structured = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, structured, "code", "request_timeout");
+    yyjson_mut_obj_add_str(doc, structured, "message", message);
+    yyjson_mut_obj_add_val(doc, root, "structuredContent", structured);
+    yyjson_mut_obj_add_bool(doc, root, "isError", true);
+    char *result = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    return result ? result : heap_strdup(fallback);
+}
+
 static char *search_code_scan_error(search_scratch_t *scratch, const char *output_path,
                                     bool has_path_filter, cbm_regex_t *path_regex, char *root_path,
                                     char *pattern, char *project, char *file_pattern,
-                                    const char *message) {
+                                    mcp_scan_cause_t cause, const char *message) {
     if (output_path && output_path[0]) {
         (void)cbm_unlink(output_path);
     }
@@ -10384,9 +10472,11 @@ static char *search_code_scan_error(search_scratch_t *scratch, const char *outpu
     free(pattern);
     free(project);
     free(file_pattern);
+    if (cause == MCP_SCAN_DEADLINE) {
+        return search_code_timeout_result();
+    }
     return cbm_mcp_text_result(message, true);
 }
-#endif
 
 static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     char *pattern = cbm_mcp_get_string_arg(args, "pattern");
@@ -10516,8 +10606,18 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     }
 
     /* ── Phase 1: Grep scan ──────────────────────────────────── */
+    uint64_t scan_budget_ms = srv->search_scan_timeout_override_set
+                                  ? srv->search_scan_timeout_override_ms
+                                  : MCP_SEARCH_SCAN_TIMEOUT_MS;
+    uint64_t scan_started_ms = cbm_now_ms();
+    uint64_t scan_deadline_ms = UINT64_MAX - scan_started_ms < scan_budget_ms
+                                    ? UINT64_MAX
+                                    : scan_started_ms + scan_budget_ms;
+    bool scan_deadline_latched = false;
     search_scratch_t scratch;
     if (!search_scratch_open(&scratch, pattern)) {
+        bool scan_cancelled = mcp_request_cancelled(srv);
+        bool scan_timed_out = cbm_now_ms() >= scan_deadline_ms;
         char errmsg[CBM_SZ_256];
         snprintf(errmsg, sizeof(errmsg), "search failed: cannot create temp file (%s)",
                  strerror(errno));
@@ -10525,8 +10625,16 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         free(pattern);
         free(project);
         free(file_pattern);
+        if (scan_cancelled) {
+            return cbm_mcp_text_result("search_code cancelled for this request", true);
+        }
+        if (scan_timed_out) {
+            return search_code_timeout_result();
+        }
         return cbm_mcp_text_result(errmsg, true);
     }
+    scan_deadline_latched = cbm_now_ms() >= scan_deadline_ms;
+    bool scan_cancellation_latched = mcp_request_cancelled(srv);
     const char *tmpfile = scratch.pattern_path;
     const char *filelist = scratch.filelist_path;
 
@@ -10544,13 +10652,17 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     int scoped_written = 0;
 
     uint64_t scope_t0 = metrics.include_phase_timings ? cbm_now_ms() : 0;
-    scoped = write_scoped_filelist(srv, project, root_path, scratch.filelist, has_path_filter,
-                                   has_path_filter ? &path_regex : NULL, &scoped_written);
+    if (!scan_cancellation_latched && !scan_deadline_latched) {
+        scoped = write_scoped_filelist(srv, project, root_path, scratch.filelist, has_path_filter,
+                                       has_path_filter ? &path_regex : NULL, &scoped_written);
+    }
     /* Close before grep runs: this is what flushes the records the helper wrote
      * through the descriptor. Clearing the field hands ownership to
      * search_scratch_close, which still unlinks the file itself. */
     (void)fclose(scratch.filelist);
     scratch.filelist = NULL;
+    scan_cancellation_latched = scan_cancellation_latched || mcp_request_cancelled(srv);
+    scan_deadline_latched = scan_deadline_latched || cbm_now_ms() >= scan_deadline_ms;
     if (metrics.include_phase_timings) {
         metrics.scope_ms = cbm_now_ms() - scope_t0;
     }
@@ -10559,7 +10671,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     int gm_count = 0;
     grep_match_t *gm = NULL;
     uint64_t scan_t0 = metrics.include_phase_timings ? cbm_now_ms() : 0;
-    if (scoped && scoped_written == 0) {
+    if (scoped && scoped_written == 0 && !scan_cancellation_latched && !scan_deadline_latched) {
         /* The path_filter excluded every indexed file — nothing to scan.
          * Skip the grep subprocess: xargs on an empty filelist is
          * platform-dependent (GNU execs grep once with no operands, BSD
@@ -10571,61 +10683,57 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         cbm_search_code_build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile,
                                        filelist, root_path);
 
-#ifdef _WIN32
         char output_path[CBM_SZ_2K] = {0};
         cbm_proc_result_t scan_result = {0};
-        bool scan_output_exceeded = false;
         size_t scan_output_limit = srv->search_output_limit_override
                                        ? srv->search_output_limit_override
                                        : MCP_SEARCH_OUTPUT_MAX;
-        int scan_run = mcp_run_shell_command_cancellable_bounded(
-            srv, cmd, output_path, scan_output_limit, &scan_output_exceeded, &scan_result);
-        if (scan_output_exceeded) {
+        const char *scan_command =
+            srv->search_scan_command_override ? srv->search_scan_command_override : cmd;
+        mcp_scan_cause_t scan_cause = mcp_run_shell_command_cancellable_bounded(
+            srv, scan_command, output_path, scan_output_limit, scan_deadline_ms, true,
+            scan_deadline_latched, !scoped, &scan_result);
+        if (scan_cause == MCP_SCAN_SUPERVISION_FAILURE) {
+            return search_code_scan_error(&scratch, output_path, has_path_filter, &path_regex,
+                                          root_path, pattern, project, file_pattern, scan_cause,
+                                          "search failed: process supervision could not quiesce");
+        }
+        if (scan_cause == MCP_SCAN_CANCELLED) {
+            return search_code_scan_error(&scratch, output_path, has_path_filter, &path_regex,
+                                          root_path, pattern, project, file_pattern, scan_cause,
+                                          "search_code cancelled for this request");
+        }
+        if (scan_cause == MCP_SCAN_DEADLINE) {
+            return search_code_scan_error(&scratch, output_path, has_path_filter, &path_regex,
+                                          root_path, pattern, project, file_pattern, scan_cause,
+                                          NULL);
+        }
+        if (scan_cause == MCP_SCAN_OUTPUT_LIMIT) {
             char message[CBM_SZ_128];
             snprintf(message, sizeof(message),
                      "search failed: output exceeded the %zu-byte safety limit", scan_output_limit);
             return search_code_scan_error(&scratch, output_path, has_path_filter, &path_regex,
-                                          root_path, pattern, project, file_pattern, message);
+                                          root_path, pattern, project, file_pattern, scan_cause,
+                                          message);
         }
-        bool scan_cancelled = scan_result.cancellation_requested || mcp_request_cancelled(srv);
-        if (scan_cancelled) {
-            return search_code_scan_error(&scratch, output_path, has_path_filter, &path_regex,
-                                          root_path, pattern, project, file_pattern,
-                                          "search_code cancelled for this request");
-        }
-        if (scan_run != 0) {
+        if (scan_cause == MCP_SCAN_COMMAND_FAILURE ||
+            scan_cause == MCP_SCAN_CONTAINED_COMMAND_FAILURE) {
             return search_code_scan_error(
                 &scratch, output_path, has_path_filter, &path_regex, root_path, pattern, project,
-                file_pattern, "search failed: the contained command could not complete");
+                file_pattern, scan_cause,
+                "search failed: the contained command could not complete");
         }
         FILE *fp = cbm_fopen(output_path, "rb");
         if (!fp) {
             return search_code_scan_error(&scratch, output_path, has_path_filter, &path_regex,
                                           root_path, pattern, project, file_pattern,
+                                          MCP_SCAN_COMMAND_FAILURE,
                                           "search failed: contained output could not be read");
         }
         gm = collect_grep_matches(fp, root_path, strlen(root_path), has_path_filter, &path_regex,
                                   grep_limit, &gm_count);
         (void)fclose(fp);
         (void)cbm_unlink(output_path);
-#else
-        FILE *fp = cbm_popen(cmd, "r");
-        if (!fp) {
-            search_scratch_close(&scratch);
-            if (has_path_filter) {
-                cbm_regfree(&path_regex);
-            }
-            free(root_path);
-            free(pattern);
-            free(project);
-            free(file_pattern);
-            return cbm_mcp_text_result("search failed", true);
-        }
-
-        gm = collect_grep_matches(fp, root_path, strlen(root_path), has_path_filter, &path_regex,
-                                  grep_limit, &gm_count);
-        cbm_pclose(fp);
-#endif
         /* Both scratch files and the private directory go here — unlike the old
          * code, the file list is removed even when the scan was not scoped. */
         search_scratch_close(&scratch);
@@ -10786,29 +10894,74 @@ static bool mcp_resolve_windows_cmd(char out[CBM_SZ_4K]) {
 }
 #endif
 
-static int mcp_run_shell_command_cancellable_bounded(cbm_mcp_server_t *srv, const char *command,
-                                                     char output_path[CBM_SZ_2K],
-                                                     size_t output_limit,
-                                                     bool *output_limit_exceeded,
-                                                     cbm_proc_result_t *result_out) {
-    if (output_limit_exceeded) {
-        *output_limit_exceeded = false;
+static mcp_scan_cause_t mcp_scan_pre_spawn_cause(cbm_mcp_server_t *srv, const char *output_path,
+                                                 size_t output_limit, uint64_t deadline_ms,
+                                                 bool deadline_enabled, bool *cancellation_latched,
+                                                 bool *deadline_latched,
+                                                 bool *output_limit_latched) {
+    *cancellation_latched = *cancellation_latched || mcp_request_cancelled(srv);
+    *deadline_latched = *deadline_latched || (deadline_enabled && cbm_now_ms() >= deadline_ms);
+    if (!*output_limit_latched && output_limit > 0 && output_path && output_path[0]) {
+        int64_t output_size = cbm_file_size(output_path);
+        *output_limit_latched = output_size > 0 && (uint64_t)output_size > output_limit;
     }
-    if (!srv || !command || !output_path || !result_out ||
-        (output_limit > 0 && !output_limit_exceeded) || !mcp_command_output_path(output_path)) {
-        return -1;
+    if (*cancellation_latched) {
+        return MCP_SCAN_CANCELLED;
+    }
+    if (*deadline_latched) {
+        return MCP_SCAN_DEADLINE;
+    }
+    if (*output_limit_latched) {
+        return MCP_SCAN_OUTPUT_LIMIT;
+    }
+    return MCP_SCAN_SUCCESS;
+}
+
+static mcp_scan_cause_t mcp_run_shell_command_cancellable_bounded(
+    cbm_mcp_server_t *srv, const char *command, char output_path[CBM_SZ_2K], size_t output_limit,
+    uint64_t deadline_ms, bool deadline_enabled, bool deadline_latched, bool exit_one_is_no_match,
+    cbm_proc_result_t *result_out) {
+    if (!srv || !command || !output_path || !result_out) {
+        return MCP_SCAN_COMMAND_FAILURE;
+    }
+    memset(result_out, 0, sizeof(*result_out));
+    bool cancellation_latched = false;
+    bool output_limit_latched = false;
+    mcp_scan_cause_t pre_spawn_cause =
+        mcp_scan_pre_spawn_cause(srv, NULL, output_limit, deadline_ms, deadline_enabled,
+                                 &cancellation_latched, &deadline_latched, &output_limit_latched);
+    if (pre_spawn_cause != MCP_SCAN_SUCCESS) {
+        result_out->tree_quiesced = true; /* no child was spawned */
+        return pre_spawn_cause;
+    }
+    if (!mcp_command_output_path(output_path)) {
+        pre_spawn_cause = mcp_scan_pre_spawn_cause(srv, NULL, output_limit, deadline_ms,
+                                                   deadline_enabled, &cancellation_latched,
+                                                   &deadline_latched, &output_limit_latched);
+        result_out->tree_quiesced = true;
+        return pre_spawn_cause != MCP_SCAN_SUCCESS ? pre_spawn_cause : MCP_SCAN_COMMAND_FAILURE;
     }
     /* Internal test seam: rejecting after output allocation exercises the same
      * cleanup contract as a contained process-tree failure. */
-    if (srv->command_test_hook && !srv->command_test_hook(srv->command_test_context, command)) {
-        return -1;
+    bool command_rejected =
+        srv->command_test_hook && !srv->command_test_hook(srv->command_test_context, command);
+    pre_spawn_cause =
+        mcp_scan_pre_spawn_cause(srv, output_path, output_limit, deadline_ms, deadline_enabled,
+                                 &cancellation_latched, &deadline_latched, &output_limit_latched);
+    if (pre_spawn_cause != MCP_SCAN_SUCCESS || command_rejected) {
+        result_out->tree_quiesced = true; /* no child was spawned */
+        return pre_spawn_cause != MCP_SCAN_SUCCESS ? pre_spawn_cause : MCP_SCAN_COMMAND_FAILURE;
     }
 #ifdef _WIN32
     char shell[CBM_SZ_4K];
     if (!mcp_resolve_windows_cmd(shell)) {
+        pre_spawn_cause = mcp_scan_pre_spawn_cause(srv, output_path, output_limit, deadline_ms,
+                                                   deadline_enabled, &cancellation_latched,
+                                                   &deadline_latched, &output_limit_latched);
         (void)cbm_unlink(output_path);
         output_path[0] = '\0';
-        return -1;
+        result_out->tree_quiesced = true;
+        return pre_spawn_cause != MCP_SCAN_SUCCESS ? pre_spawn_cause : MCP_SCAN_COMMAND_FAILURE;
     }
 #else
     const char *shell = "/bin/sh";
@@ -10826,27 +10979,48 @@ static int mcp_run_shell_command_cancellable_bounded(cbm_mcp_server_t *srv, cons
         .cancel_grace_ms = CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS,
         .delete_log_on_exit = false,
     };
+    pre_spawn_cause =
+        mcp_scan_pre_spawn_cause(srv, output_path, output_limit, deadline_ms, deadline_enabled,
+                                 &cancellation_latched, &deadline_latched, &output_limit_latched);
+    if (pre_spawn_cause != MCP_SCAN_SUCCESS) {
+        result_out->tree_quiesced = true;
+        return pre_spawn_cause;
+    }
     cbm_subprocess_t *process = NULL;
     if (cbm_subprocess_spawn(&options, &process) != 0) {
+        pre_spawn_cause = mcp_scan_pre_spawn_cause(srv, output_path, output_limit, deadline_ms,
+                                                   deadline_enabled, &cancellation_latched,
+                                                   &deadline_latched, &output_limit_latched);
         (void)cbm_unlink(output_path);
         output_path[0] = '\0';
-        return -1;
+        result_out->tree_quiesced = true;
+        return pre_spawn_cause != MCP_SCAN_SUCCESS ? pre_spawn_cause : MCP_SCAN_COMMAND_FAILURE;
     }
 
     cbm_proc_poll_t state;
-    bool limit_exceeded = false;
     for (;;) {
         if (mcp_request_cancelled(srv)) {
+            cancellation_latched = true;
             (void)cbm_subprocess_request_cancel(process);
         }
-        if (!limit_exceeded && output_limit > 0) {
+        if (deadline_enabled && cbm_now_ms() >= deadline_ms) {
+            deadline_latched = true;
+            (void)cbm_subprocess_request_cancel(process);
+        }
+        if (!output_limit_latched && output_limit > 0) {
             int64_t output_size = cbm_file_size(output_path);
             if (output_size > 0 && (uint64_t)output_size > output_limit) {
-                limit_exceeded = true;
+                output_limit_latched = true;
                 (void)cbm_subprocess_request_cancel(process);
             }
         }
         state = cbm_subprocess_poll(process, result_out);
+        cancellation_latched = cancellation_latched || mcp_request_cancelled(srv);
+        deadline_latched = deadline_latched || (deadline_enabled && cbm_now_ms() >= deadline_ms);
+        if (!output_limit_latched && output_limit > 0) {
+            int64_t output_size = cbm_file_size(output_path);
+            output_limit_latched = output_size > 0 && (uint64_t)output_size > output_limit;
+        }
         if (state != CBM_PROC_POLL_RUNNING) {
             break;
         }
@@ -10855,21 +11029,41 @@ static int mcp_run_shell_command_cancellable_bounded(cbm_mcp_server_t *srv, cons
     bool contained = state == CBM_PROC_POLL_TERMINAL && result_out->tree_quiesced &&
                      !result_out->supervision_failed;
     cbm_subprocess_destroy(process);
-    if (!limit_exceeded && output_limit > 0) {
+    if (!output_limit_latched && output_limit > 0) {
         int64_t final_size = cbm_file_size(output_path);
-        limit_exceeded = final_size > 0 && (uint64_t)final_size > output_limit;
+        output_limit_latched = final_size > 0 && (uint64_t)final_size > output_limit;
     }
-    if (output_limit_exceeded) {
-        *output_limit_exceeded = limit_exceeded;
+    if (!contained) {
+        return MCP_SCAN_SUPERVISION_FAILURE;
     }
-    return contained ? 0 : -1;
+    if (cancellation_latched) {
+        return MCP_SCAN_CANCELLED;
+    }
+    if (deadline_latched) {
+        return MCP_SCAN_DEADLINE;
+    }
+    if (output_limit_latched) {
+        return MCP_SCAN_OUTPUT_LIMIT;
+    }
+#ifndef _WIN32
+    if (exit_one_is_no_match && result_out->outcome == CBM_PROC_EXIT_NONZERO &&
+        result_out->exit_code == 1) {
+        return MCP_SCAN_SUCCESS; /* ordinary direct grep no-match */
+    }
+#endif
+    return result_out->outcome == CBM_PROC_CLEAN ? MCP_SCAN_SUCCESS
+                                                 : MCP_SCAN_CONTAINED_COMMAND_FAILURE;
 }
 
 static int mcp_run_shell_command_cancellable(cbm_mcp_server_t *srv, const char *command,
                                              char output_path[CBM_SZ_2K],
                                              cbm_proc_result_t *result_out) {
-    return mcp_run_shell_command_cancellable_bounded(srv, command, output_path, 0, NULL,
-                                                     result_out);
+    mcp_scan_cause_t cause = mcp_run_shell_command_cancellable_bounded(
+        srv, command, output_path, 0, 0, false, false, false, result_out);
+    /* Legacy callers inspect result_out for cancellation/exit status. Preserve
+     * their original contract: any contained terminal tree is transport
+     * success; only spawn/rejection or failed supervision is a wrapper error. */
+    return cause == MCP_SCAN_COMMAND_FAILURE || cause == MCP_SCAN_SUPERVISION_FAILURE ? -1 : 0;
 }
 
 /* Does `node`'s line range overlap any recorded hunk for `file`? Used to scope

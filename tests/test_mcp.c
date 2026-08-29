@@ -163,11 +163,14 @@ typedef struct {
     int merge_base_calls;
 } mcp_command_hook_probe_t;
 
-#ifdef _WIN32
 typedef struct {
     cbm_mcp_server_t *server;
     bool cancel_on_call;
     bool cancel_accepted;
+    bool reject;
+    const char *fill_output_directory;
+    uint64_t delay_ms;
+    bool output_filled;
     int calls;
     char command[CBM_SZ_4K];
 } mcp_search_command_probe_t;
@@ -176,7 +179,6 @@ typedef struct {
     char path[512];
     char *saved_cache;
 } mcp_search_cache_t;
-#endif
 
 static bool mcp_quarantine_hook_probe(void *context, const char *step) {
     mcp_quarantine_hook_probe_t *probe = context;
@@ -203,7 +205,6 @@ static bool mcp_command_hook_probe(void *context, const char *command) {
     return true;
 }
 
-#ifdef _WIN32
 static bool mcp_search_command_hook_probe(void *context, const char *command) {
     mcp_search_command_probe_t *probe = context;
     if (!probe || !command) {
@@ -211,10 +212,35 @@ static bool mcp_search_command_hook_probe(void *context, const char *command) {
     }
     probe->calls++;
     snprintf(probe->command, sizeof(probe->command), "%s", command);
+    if (probe->delay_ms > 0) {
+        cbm_usleep(probe->delay_ms * 1000U);
+    }
     if (probe->cancel_on_call && probe->server) {
         probe->cancel_accepted = cbm_mcp_server_cancel_active(probe->server);
     }
-    return true;
+    if (probe->fill_output_directory) {
+        static const char prefix[] = ".mcp-command-";
+        cbm_dir_t *directory = cbm_opendir(probe->fill_output_directory);
+        cbm_dirent_t *entry;
+        while (directory && (entry = cbm_readdir(directory)) != NULL) {
+            if (strncmp(entry->name, prefix, sizeof(prefix) - SKIP_ONE) != 0) {
+                continue;
+            }
+            char path[CBM_SZ_2K];
+            snprintf(path, sizeof(path), "%s/%s", probe->fill_output_directory, entry->name);
+            FILE *output = cbm_fopen(path, "ab");
+            if (output) {
+                bool wrote = fputs("bounded-output-sentinel\n", output) >= 0;
+                bool closed = fclose(output) == 0;
+                probe->output_filled = wrote && closed;
+            }
+            break;
+        }
+        if (directory) {
+            cbm_closedir(directory);
+        }
+    }
+    return !probe->reject;
 }
 
 static bool mcp_search_cache_open(mcp_search_cache_t *cache, const char *prefix) {
@@ -240,7 +266,6 @@ static bool mcp_search_cache_close(mcp_search_cache_t *cache) {
     cache->saved_cache = NULL;
     return th_rmtree(cache->path) == 0;
 }
-#endif
 
 typedef struct {
     const char *name;
@@ -5070,8 +5095,7 @@ TEST(search_code_windows_prefilter_precedes_content_scan) {
 #endif
 }
 
-TEST(search_code_windows_cancel_cleans_supervised_scan) {
-#ifdef _WIN32
+TEST(search_code_cancel_cleans_supervised_scan) {
     mcp_search_cache_t cache;
     ASSERT_TRUE(mcp_search_cache_open(&cache, "cbm-search-cancel"));
 
@@ -5103,13 +5127,9 @@ TEST(search_code_windows_cancel_cleans_supervised_scan) {
     cleanup_prefilter_dir(tmp, src_path, vendor_path);
     ASSERT_TRUE(mcp_search_cache_close(&cache));
     PASS();
-#else
-    SKIP_PLATFORM("supervised Select-String cancellation runs on Windows");
-#endif
 }
 
-TEST(search_code_windows_output_limit_fails_closed_and_cleans_scan) {
-#ifdef _WIN32
+TEST(search_code_output_limit_fails_closed_and_cleans_scan) {
     mcp_search_cache_t cache;
     ASSERT_TRUE(mcp_search_cache_open(&cache, "cbm-search-limit"));
 
@@ -5143,9 +5163,375 @@ TEST(search_code_windows_output_limit_fails_closed_and_cleans_scan) {
     cleanup_prefilter_dir(tmp, src_path, vendor_path);
     ASSERT_TRUE(mcp_search_cache_close(&cache));
     PASS();
+}
+
+TEST(search_code_scan_deadline_fails_closed_and_resets) {
+    mcp_search_cache_t cache;
+    ASSERT_TRUE(mcp_search_cache_open(&cache, "cbm-search-deadline"));
+    int scratch_before = mcp_count_directory_entries_with_prefix(cbm_tmpdir(), "cbm-search-");
+    ASSERT_TRUE(scratch_before >= 0);
+
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_search_scan_timeout_for_test(srv, 0, true);
+
+    char *response =
+        cbm_mcp_handle_tool(srv, "search_code",
+                            "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\","
+                            "\"file_pattern\":\"*.go\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(response, "request_timeout"));
+    ASSERT_NOT_NULL(strstr(response, "execution deadline"));
+    ASSERT_NOT_NULL(
+        strstr(response, "\"text\":\"search_code scan exceeded its execution deadline\""));
+    ASSERT_NOT_NULL(strstr(
+        response, "\"structuredContent\":{\"code\":\"request_timeout\",\"message\":\"search_code "
+                  "scan exceeded its execution deadline\"}"));
+    ASSERT_NULL(strstr(response, "src/handler.go"));
+    ASSERT_NULL(strstr(response, "return nil"));
+
+    char logs[640];
+    snprintf(logs, sizeof(logs), "%s/logs", cache.path);
+    /* An immediate deadline can return before the log directory is created;
+     * both a missing directory (-1) and an empty one (0) prove no artifact. */
+    ASSERT_TRUE(mcp_count_directory_entries_with_prefix(logs, ".mcp-command-") <= 0);
+    ASSERT_EQ(mcp_count_directory_entries_with_prefix(cbm_tmpdir(), "cbm-search-"), scratch_before);
+    free(response);
+
+    cbm_mcp_server_set_search_scan_timeout_for_test(srv, 0, false);
+    response = cbm_mcp_handle_tool(srv, "search_code",
+                                   "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-"
+                                   "search\",\"file_pattern\":\"*.go\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NULL(strstr(response, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(response, "src/handler.go"));
+    free(response);
+
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    ASSERT_TRUE(mcp_search_cache_close(&cache));
+    PASS();
+}
+
+TEST(search_code_scan_deadline_override_is_per_server) {
+    char tmp_a[512], src_a[768], vendor_a[768];
+    char tmp_b[512], src_b[768], vendor_b[768];
+    cbm_mcp_server_t *server_a = setup_prefilter_server(tmp_a, sizeof(tmp_a), src_a, sizeof(src_a),
+                                                        vendor_a, sizeof(vendor_a));
+    cbm_mcp_server_t *server_b = setup_prefilter_server(tmp_b, sizeof(tmp_b), src_b, sizeof(src_b),
+                                                        vendor_b, sizeof(vendor_b));
+    ASSERT_NOT_NULL(server_a);
+    ASSERT_NOT_NULL(server_b);
+    cbm_mcp_server_set_search_scan_timeout_for_test(server_a, 0, true);
+
+    char *timed_out = cbm_mcp_handle_tool(server_a, "search_code",
+                                          "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-"
+                                          "search\",\"file_pattern\":\"*.go\"}");
+    char *normal = cbm_mcp_handle_tool(server_b, "search_code",
+                                       "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-"
+                                       "search\",\"file_pattern\":\"*.go\"}");
+    ASSERT_NOT_NULL(timed_out);
+    ASSERT_NOT_NULL(normal);
+    ASSERT_NOT_NULL(strstr(timed_out, "request_timeout"));
+    ASSERT_NULL(strstr(normal, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(normal, "src/handler.go"));
+
+    free(timed_out);
+    free(normal);
+    cbm_mcp_server_free(server_a);
+    cbm_mcp_server_free(server_b);
+    cleanup_prefilter_dir(tmp_a, src_a, vendor_a);
+    cleanup_prefilter_dir(tmp_b, src_b, vendor_b);
+    PASS();
+}
+
+TEST(search_code_scan_setup_failures_respect_cause_precedence) {
+    mcp_search_cache_t cache;
+    ASSERT_TRUE(mcp_search_cache_open(&cache, "cbm-search-setup-precedence"));
+
+    char cache_blocker[640];
+    snprintf(cache_blocker, sizeof(cache_blocker), "%s/not-a-directory", cache.path);
+    FILE *blocker = cbm_fopen(cache_blocker, "wb");
+    ASSERT_NOT_NULL(blocker);
+    ASSERT_EQ(fclose(blocker), 0);
+
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache_blocker, 1), 0);
+    cbm_mcp_server_set_search_scan_timeout_for_test(srv, 0, true);
+
+    /* Keep an outer request scope active so cancellation is latched before the
+     * nested tool call starts. It must beat both the zero deadline and the
+     * deliberately broken command-output directory. */
+    ASSERT_TRUE(cbm_mcp_server_request_scope_begin(srv));
+    ASSERT_TRUE(cbm_mcp_server_cancel_active(srv));
+    char *response = cbm_mcp_handle_tool(
+        srv, "search_code", "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\"}");
+    bool cancellation_won = response && strstr(response, "cancelled") != NULL &&
+                            strstr(response, "request_timeout") == NULL &&
+                            strstr(response, "contained command") == NULL;
+    free(response);
+    cbm_mcp_server_request_scope_end(srv);
+
+    /* With cancellation cleared, the same broken setup must not hide the
+     * already-latched deadline. */
+    response = cbm_mcp_handle_tool(
+        srv, "search_code", "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\"}");
+    bool deadline_won = response && strstr(response, "request_timeout") != NULL &&
+                        strstr(response, "contained command") == NULL;
+    free(response);
+
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache.path, 1), 0);
+    ASSERT_EQ(cbm_unlink(cache_blocker), 0);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    ASSERT_TRUE(mcp_search_cache_close(&cache));
+    ASSERT_TRUE(cancellation_won);
+    ASSERT_TRUE(deadline_won);
+    PASS();
+}
+
+TEST(search_code_scan_live_child_deadline_is_bounded_and_fails_closed) {
+    mcp_search_cache_t cache;
+    ASSERT_TRUE(mcp_search_cache_open(&cache, "cbm-search-live-deadline"));
+    int scratch_before = mcp_count_directory_entries_with_prefix(cbm_tmpdir(), "cbm-search-");
+    ASSERT_TRUE(scratch_before >= 0);
+
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+#ifdef _WIN32
+    const char *slow_command =
+        "echo deadline-partial-output & powershell.exe -NoProfile -Command \"Start-Sleep -Seconds "
+        "6\"";
 #else
-    SKIP_PLATFORM("supervised Select-String output limit runs on Windows");
+    const char *slow_command = "printf 'deadline-partial-output\\n'; trap '' TERM; sleep 6";
 #endif
+    cbm_mcp_server_set_search_scan_command_for_test(srv, slow_command);
+    cbm_mcp_server_set_search_scan_timeout_for_test(srv, 100, true);
+
+    uint64_t started = cbm_now_ms();
+    char *response = cbm_mcp_handle_tool(
+        srv, "search_code", "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\"}");
+    uint64_t elapsed = cbm_now_ms() - started;
+    bool bounded = elapsed < 3000U;
+    bool timed_out = response && strstr(response, "request_timeout") != NULL &&
+                     strstr(response, "\"isError\":true") != NULL;
+    bool partial_hidden = !response || strstr(response, "deadline-partial-output") == NULL;
+
+    char logs[640];
+    snprintf(logs, sizeof(logs), "%s/logs", cache.path);
+    int command_artifacts = mcp_count_directory_entries_with_prefix(logs, ".mcp-command-");
+    int scratch_after = mcp_count_directory_entries_with_prefix(cbm_tmpdir(), "cbm-search-");
+
+    free(response);
+    cbm_mcp_server_set_search_scan_command_for_test(srv, NULL);
+    cbm_mcp_server_set_search_scan_timeout_for_test(srv, 0, false);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    ASSERT_TRUE(mcp_search_cache_close(&cache));
+    ASSERT_TRUE(bounded);
+    ASSERT_TRUE(timed_out);
+    ASSERT_TRUE(partial_hidden);
+    ASSERT_EQ(command_artifacts, 0);
+    ASSERT_EQ(scratch_after, scratch_before);
+    PASS();
+}
+
+TEST(search_code_scan_cancellation_precedes_zero_deadline) {
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_search_scan_timeout_for_test(srv, 0, true);
+    ASSERT_TRUE(cbm_mcp_server_request_scope_begin(srv));
+    ASSERT_TRUE(cbm_mcp_server_cancel_active(srv));
+
+    char *response = cbm_mcp_handle_tool(srv, "search_code",
+                                         "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-"
+                                         "search\",\"file_pattern\":\"*.go\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "cancelled"));
+    ASSERT_NULL(strstr(response, "request_timeout"));
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+
+    free(response);
+    cbm_mcp_server_request_scope_end(srv);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    PASS();
+}
+
+TEST(search_code_scan_deadline_precedes_output_limit) {
+    mcp_search_cache_t cache;
+    ASSERT_TRUE(mcp_search_cache_open(&cache, "cbm-search-precedence"));
+    char logs[640];
+    snprintf(logs, sizeof(logs), "%s/logs", cache.path);
+
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+    mcp_search_command_probe_t probe = {.fill_output_directory = logs, .delay_ms = 1100};
+    cbm_mcp_server_set_command_test_hook(srv, mcp_search_command_hook_probe, &probe);
+    cbm_mcp_server_set_search_scan_timeout_for_test(srv, 1000, true);
+    cbm_mcp_server_set_search_output_limit_for_test(srv, 1);
+
+    char *response = cbm_mcp_handle_tool(srv, "search_code",
+                                         "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-"
+                                         "search\",\"file_pattern\":\"*.go\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_TRUE(probe.output_filled);
+    ASSERT_NOT_NULL(strstr(response, "request_timeout"));
+    ASSERT_NULL(strstr(response, "output exceeded"));
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    ASSERT_EQ(mcp_count_directory_entries_with_prefix(logs, ".mcp-command-"), 0);
+
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    ASSERT_TRUE(mcp_search_cache_close(&cache));
+    PASS();
+}
+
+TEST(search_code_scan_hook_rejection_is_contained_and_cleans_up) {
+    mcp_search_cache_t cache;
+    ASSERT_TRUE(mcp_search_cache_open(&cache, "cbm-search-reject"));
+    int scratch_before = mcp_count_directory_entries_with_prefix(cbm_tmpdir(), "cbm-search-");
+    ASSERT_TRUE(scratch_before >= 0);
+
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+    mcp_search_command_probe_t probe = {.reject = true};
+    cbm_mcp_server_set_command_test_hook(srv, mcp_search_command_hook_probe, &probe);
+
+    char *response = cbm_mcp_handle_tool(srv, "search_code",
+                                         "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-"
+                                         "search\",\"file_pattern\":\"*.go\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_EQ(probe.calls, 1);
+    ASSERT_NOT_NULL(strstr(response, "contained command could not complete"));
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    ASSERT_NULL(strstr(response, "src/handler.go"));
+
+    char logs[640];
+    snprintf(logs, sizeof(logs), "%s/logs", cache.path);
+    ASSERT_EQ(mcp_count_directory_entries_with_prefix(logs, ".mcp-command-"), 0);
+    ASSERT_EQ(mcp_count_directory_entries_with_prefix(cbm_tmpdir(), "cbm-search-"), scratch_before);
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    ASSERT_TRUE(mcp_search_cache_close(&cache));
+    PASS();
+}
+
+TEST(search_code_scoped_exit_one_is_not_no_match) {
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+#ifdef _WIN32
+    cbm_mcp_server_set_search_scan_command_for_test(srv, "exit /b 1");
+#else
+    cbm_mcp_server_set_search_scan_command_for_test(srv, "exit 1");
+#endif
+
+    char *response = cbm_mcp_handle_tool(
+        srv, "search_code", "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\"}");
+    bool failed_closed = response && strstr(response, "contained command could not complete") &&
+                         strstr(response, "\"isError\":true") &&
+                         !strstr(response, "total_grep_matches: 0");
+
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    ASSERT_TRUE(failed_closed);
+    PASS();
+}
+
+TEST(search_code_no_match_is_empty_for_direct_and_scoped_routes) {
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *scoped = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                      vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(scoped);
+    char *scoped_response = cbm_mcp_handle_tool(
+        scoped, "search_code",
+        "{\"pattern\":\"DefinitelyAbsentSymbol\",\"project\":\"prefilter-search\"}");
+    ASSERT_NOT_NULL(scoped_response);
+    ASSERT_NULL(strstr(scoped_response, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(scoped_response, "total_grep_matches: 0"));
+
+    cbm_mcp_server_t *direct = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(direct);
+    cbm_store_t *store = cbm_mcp_server_store(direct);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_project(direct, "direct-search");
+    ASSERT_EQ(cbm_store_upsert_project(store, "direct-search", tmp), CBM_STORE_OK);
+    char *direct_response = cbm_mcp_handle_tool(
+        direct, "search_code",
+        "{\"pattern\":\"DefinitelyAbsentSymbol\",\"project\":\"direct-search\"}");
+    ASSERT_NOT_NULL(direct_response);
+    ASSERT_NULL(strstr(direct_response, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(direct_response, "total_grep_matches: 0"));
+
+    free(scoped_response);
+    free(direct_response);
+    cbm_mcp_server_free(scoped);
+    cbm_mcp_server_free(direct);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    PASS();
+}
+
+/* A store may contain an indexed path that is non-regular or no longer exists.
+ * Neither is a content-scan operand. Scoped search must skip both while
+ * preserving matches from regular files; actual command failures remain
+ * contained. */
+TEST(search_code_scoped_scan_skips_non_regular_indexed_paths) {
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+
+    char indexed_dir[768];
+    snprintf(indexed_dir, sizeof(indexed_dir), "%s/indexed-dir", tmp);
+    ASSERT_EQ(cbm_mkdir(indexed_dir), 0);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    cbm_node_t directory_node = {.project = "prefilter-search",
+                                 .label = "File",
+                                 .name = "indexed-dir",
+                                 .qualified_name = "prefilter-search.indexed-dir",
+                                 .file_path = "indexed-dir",
+                                 .start_line = 1,
+                                 .end_line = 1};
+    ASSERT_GT(cbm_store_upsert_node(store, &directory_node), 0);
+    cbm_node_t missing_node = {.project = "prefilter-search",
+                               .label = "File",
+                               .name = "missing.go",
+                               .qualified_name = "prefilter-search.missing.go",
+                               .file_path = "missing.go",
+                               .start_line = 1,
+                               .end_line = 1};
+    ASSERT_GT(cbm_store_upsert_node(store, &missing_node), 0);
+
+    char *response = cbm_mcp_handle_tool(
+        srv, "search_code", "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NULL(strstr(response, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(response, "src/handler.go"));
+
+    free(response);
+    cbm_mcp_server_free(srv);
+    ASSERT_EQ(cbm_rmdir(indexed_dir), 0);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    PASS();
 }
 
 /* Windows raw scans must pin the PowerShell pipe to UTF-8: PS 5.1 otherwise
@@ -12755,8 +13141,18 @@ SUITE(mcp) {
     RUN_TEST(search_code_path_filter_matches_nothing);
     RUN_TEST(search_code_file_pattern_prefilter_boundaries);
     RUN_TEST(search_code_windows_prefilter_precedes_content_scan);
-    RUN_TEST(search_code_windows_cancel_cleans_supervised_scan);
-    RUN_TEST(search_code_windows_output_limit_fails_closed_and_cleans_scan);
+    RUN_TEST(search_code_cancel_cleans_supervised_scan);
+    RUN_TEST(search_code_output_limit_fails_closed_and_cleans_scan);
+    RUN_TEST(search_code_scan_deadline_fails_closed_and_resets);
+    RUN_TEST(search_code_scan_deadline_override_is_per_server);
+    RUN_TEST(search_code_scan_setup_failures_respect_cause_precedence);
+    RUN_TEST(search_code_scan_live_child_deadline_is_bounded_and_fails_closed);
+    RUN_TEST(search_code_scan_cancellation_precedes_zero_deadline);
+    RUN_TEST(search_code_scan_deadline_precedes_output_limit);
+    RUN_TEST(search_code_scan_hook_rejection_is_contained_and_cleans_up);
+    RUN_TEST(search_code_scoped_exit_one_is_not_no_match);
+    RUN_TEST(search_code_no_match_is_empty_for_direct_and_scoped_routes);
+    RUN_TEST(search_code_scoped_scan_skips_non_regular_indexed_paths);
     RUN_TEST(search_code_windows_scan_pins_utf8_output);
     RUN_TEST(search_code_invalid_regex_errors_issue283);
     RUN_TEST(search_code_literal_pipe_warns_issue282);
