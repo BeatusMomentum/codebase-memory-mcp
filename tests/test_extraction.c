@@ -4621,6 +4621,85 @@ TEST(extract_python_member_call_flags_is_method) {
     PASS();
 }
 
+/* Python bare-call local-binding flag (the bare-call counterpart of the
+ * receiver flag above). Pins BOTH directions: a callee shadowed by a parameter
+ * of an enclosing scope IS flagged so the resolver can suppress a weak
+ * short-name match, while an unshadowed callee — a genuine module-level
+ * function, an imported name, or a nested `def` — is NOT, so its true edge
+ * survives. Every parameter binding form the grammar produces is covered, since
+ * a form the extractor silently missed would leave that shape unguarded. */
+TEST(extract_python_bare_call_flags_locally_bound_callee) {
+    CBMFileResult *r = extract("from pkg import helper\n"
+                               "\n"
+                               "def outer(run, *rest, timeout=5, label: str = 'x', **opts):\n"
+                               "    def inner():\n"
+                               "        return run()\n"
+                               "    rest()\n"
+                               "    timeout()\n"
+                               "    label()\n"
+                               "    opts()\n"
+                               "    module_level()\n"
+                               "    helper()\n"
+                               "    return inner()\n"
+                               "\n"
+                               "def typed(cb: Callable):\n"
+                               "    return cb()\n"
+                               "\n"
+                               "apply_it = lambda fn: fn()\n",
+                               CBM_LANG_PYTHON, "t", "x.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    /* callee name -> (expected flag, seen count) */
+    struct {
+        const char *callee;
+        bool expect_bound;
+        int seen;
+    } cases[] = {
+        {"run", true, 0},      /* closure over an ENCLOSING function's parameter */
+        {"rest", true, 0},     /* *args   -> list_splat_pattern                  */
+        {"timeout", true, 0},  /* default_parameter                              */
+        {"label", true, 0},    /* typed_default_parameter (keyword-only)         */
+        {"opts", true, 0},     /* **kwargs -> dictionary_splat_pattern           */
+        {"cb", true, 0},       /* typed_parameter, no default                    */
+        {"fn", true, 0},       /* lambda parameter                               */
+        {"module_level", false, 0}, /* unbound: the true cross-file edge         */
+        {"helper", false, 0},       /* imported name, not a parameter            */
+        {"inner", false, 0},        /* nested def: a real target, keep the edge  */
+    };
+    const int case_count = (int)(sizeof(cases) / sizeof(cases[0]));
+
+    for (int i = 0; i < r->calls.count; i++) {
+        const char *cn = r->calls.items[i].callee_name;
+        if (!cn) {
+            continue;
+        }
+        for (int c = 0; c < case_count; c++) {
+            if (strcmp(cn, cases[c].callee) != 0) {
+                continue;
+            }
+            cases[c].seen++;
+            if (r->calls.items[i].callee_is_locally_bound != cases[c].expect_bound) {
+                printf("  bare-call flag mismatch for %s(): got %d, expected %d\n", cases[c].callee,
+                       r->calls.items[i].callee_is_locally_bound ? 1 : 0,
+                       cases[c].expect_bound ? 1 : 0);
+            }
+            ASSERT_EQ(r->calls.items[i].callee_is_locally_bound, cases[c].expect_bound);
+        }
+    }
+    /* Each shape must appear exactly once, so a missed extraction cannot let the
+     * loop above pass vacuously. */
+    for (int c = 0; c < case_count; c++) {
+        if (cases[c].seen != 1) {
+            printf("  bare call %s() extracted %d times, expected 1\n", cases[c].callee,
+                   cases[c].seen);
+        }
+        ASSERT_EQ(cases[c].seen, 1);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
 /* TS/JS/TSX receiver-aware flag (#592/#606; same intent as the Perl flag above).
  * A member call x.foo() with a non-this/super receiver is flagged is_method so
  * the resolver can suppress a weak short-name match (`re.test()` must not bind a
@@ -6300,6 +6379,7 @@ SUITE(extraction) {
     RUN_TEST(extract_perl_method_call_flags_is_method);
     RUN_TEST(extract_flag_exempt_method_call_not_flagged_is_method);
     RUN_TEST(extract_python_member_call_flags_is_method);
+    RUN_TEST(extract_python_bare_call_flags_locally_bound_callee);
     RUN_TEST(extract_ts_member_call_flags_is_method);
     RUN_TEST(extract_ts_this_super_receiver_not_flagged);
     RUN_TEST(extract_js_member_call_flags_is_method);

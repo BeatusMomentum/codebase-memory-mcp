@@ -2800,6 +2800,86 @@ static bool python_receiver_is_exempt(CBMExtractCtx *ctx, TSNode receiver) {
     return false;
 }
 
+/* Name bound by one Python parameter node, or NULL when the shape binds none.
+ * Covers every binding form a `parameters` / `lambda_parameters` list produces:
+ * a bare `identifier`, the `name` field of default/typed parameters, and the
+ * identifier under a `*args` / `**kwargs` splat. A shape with no identifier (the
+ * bare `*` keyword separator) yields NULL and simply matches nothing. */
+static const char *python_parameter_name(CBMExtractCtx *ctx, TSNode param) {
+    if (ts_node_is_null(param)) {
+        return NULL;
+    }
+    if (strcmp(ts_node_type(param), "identifier") == 0) {
+        return cbm_node_text(ctx->arena, param, ctx->source);
+    }
+    TSNode name = ts_node_child_by_field_name(param, TS_FIELD("name"));
+    if (!ts_node_is_null(name) && strcmp(ts_node_type(name), "identifier") == 0) {
+        return cbm_node_text(ctx->arena, name, ctx->source);
+    }
+    /* `*args` / `**kwargs`, and any typed shape without a `name` field: the
+     * bound identifier is the first named child. */
+    TSNode first = ts_node_named_child(param, 0);
+    if (!ts_node_is_null(first) && strcmp(ts_node_type(first), "identifier") == 0) {
+        return cbm_node_text(ctx->arena, first, ctx->source);
+    }
+    return NULL;
+}
+
+/* True when the callee of a BARE Python call `foo()` is bound as a parameter of
+ * an enclosing function or lambda — the bare-call counterpart of
+ * python_receiver_is_exempt above.
+ *
+ * A parameter binding shadows any module-level `foo` for the whole body, so
+ * resolving such a call to a project Function/Method by short name alone
+ * fabricates the edge BY CONSTRUCTION: `def _run_with_heavy_slot(run): run()`
+ * must not bind an unrelated `SatoriLive.run`. Unlike a receiver type this is
+ * decidable from the AST outright, with no flow analysis and no list of
+ * "generic-looking" callee names — Python forbids `global` on a parameter, and a
+ * parameter is in scope for the entire body regardless of position, so there is
+ * no ordering subtlety to get wrong.
+ *
+ * Enclosing scopes are walked to the file root so a closure over an outer
+ * parameter counts (`def outer(run): def inner(): return run()`).
+ *
+ * LOCAL ASSIGNMENTS are deliberately NOT covered. They are flow- and
+ * binding-form-sensitive (`for`, `with ... as`, `except ... as`, `:=`,
+ * unpacking, plus `global`/`nonlocal` overrides), so a partial body scan would
+ * suppress the wrong edges invisibly — the same failure mode that rules out a
+ * hardcoded name list. Parameters alone already cover the Callable-parameter
+ * shape that motivated this guard. Cost is O(enclosing depth x params) per bare
+ * call, never the corpus.
+ *
+ * Known and accepted: `def inner(): global run; return run()` nested in a
+ * function whose parameter is `run` is still flagged. Detecting it needs exactly
+ * the body scan this helper avoids, and it costs one edge in a shape that
+ * essentially does not occur. */
+static bool python_callee_is_bound_parameter(CBMExtractCtx *ctx, TSNode call_node,
+                                             TSNode callee_ident) {
+    const char *callee_name = cbm_node_text(ctx->arena, callee_ident, ctx->source);
+    if (!callee_name || !callee_name[0]) {
+        return false;
+    }
+    for (TSNode scope = ts_node_parent(call_node); !ts_node_is_null(scope);
+         scope = ts_node_parent(scope)) {
+        const char *kind = ts_node_type(scope);
+        if (strcmp(kind, "function_definition") != 0 && strcmp(kind, "lambda") != 0) {
+            continue;
+        }
+        TSNode params = ts_node_child_by_field_name(scope, TS_FIELD("parameters"));
+        if (ts_node_is_null(params)) {
+            continue;
+        }
+        uint32_t count = ts_node_named_child_count(params);
+        for (uint32_t i = 0; i < count; i++) {
+            const char *pname = python_parameter_name(ctx, ts_node_named_child(params, i));
+            if (pname && strcmp(pname, callee_name) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static bool is_objectscript_language(CBMLanguage language) {
     return language == CBM_LANG_OBJECTSCRIPT_UDL || language == CBM_LANG_OBJECTSCRIPT_ROUTINE;
 }
@@ -3424,11 +3504,18 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
             // (`accelerator.print()` must not bind MockAccelerator.print).
             // Imported receivers stay unflagged: module.function() is Python's
             // canonical cross-file call and the import map resolves it.
+            // A BARE Python call foo() whose callee is bound as a parameter of an
+            // enclosing scope cannot be the module-level foo, so short-name
+            // resolution would fabricate the edge (`def f(run): run()` must not
+            // bind SatoriLive.run). Distinct from is_method: there is no receiver
+            // here, so the weak-member guard cannot see this class at all.
             if (ctx->language == CBM_LANG_PYTHON && strcmp(ts_node_type(node), "call") == 0) {
                 TSNode fn = ts_node_child_by_field_name(node, TS_FIELD("function"));
                 if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "attribute") == 0) {
                     TSNode obj = ts_node_child_by_field_name(fn, TS_FIELD("object"));
                     call.is_method = !python_receiver_is_exempt(ctx, obj);
+                } else if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "identifier") == 0) {
+                    call.callee_is_locally_bound = python_callee_is_bound_parameter(ctx, node, fn);
                 }
             }
             // TS/JS/TSX receiver-aware guard (#592/#606 direction; same intent
