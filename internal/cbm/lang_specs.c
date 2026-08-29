@@ -80,6 +80,7 @@ extern const TSLanguage *tree_sitter_powershell(void);
 extern const TSLanguage *tree_sitter_pascal(void);
 extern const TSLanguage *tree_sitter_d(void);
 extern const TSLanguage *tree_sitter_scheme(void);
+extern const TSLanguage *tree_sitter_chialisp(void);
 extern const TSLanguage *tree_sitter_fennel(void);
 extern const TSLanguage *tree_sitter_fish(void);
 extern const TSLanguage *tree_sitter_awk(void);
@@ -1107,6 +1108,13 @@ static const char *scheme_func_types[] = {"list", NULL};
 static const char *scheme_call_types[] = {"list", NULL};
 static const char *scheme_var_types[] = {"symbol", NULL};
 static const char *scheme_module_types[] = {"program", NULL};
+// Chialisp: a deliberately generic s-expression grammar (tools/tree-sitter-chialisp).
+// Every parenthesized form is a `list` and every atom a `symbol`; which lists are
+// definitions is decided in extract_defs.c, not by the parser. Root is `source_file`.
+static const char *chialisp_func_types[] = {"list", NULL};
+static const char *chialisp_call_types[] = {"list", NULL};
+static const char *chialisp_var_types[] = {"symbol", NULL};
+static const char *chialisp_module_types[] = {"source_file", NULL};
 static const char *fennel_func_types[] = {"fn", "lambda", "hashfn", NULL};
 static const char *fennel_call_types[] = {"list", NULL};
 static const char *fennel_branch_types[] = {"each", "for", "match", NULL};
@@ -2160,6 +2168,12 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                          scheme_module_types, scheme_call_types, empty_types, empty_types,
                          empty_types, scheme_var_types, empty_types, empty_types, NULL, empty_types,
                          NULL, NULL, tree_sitter_scheme, NULL},
+
+    // CBM_LANG_CHIALISP — lisp-family shape (generic list/symbol nodes)
+    [CBM_LANG_CHIALISP] = {CBM_LANG_CHIALISP, chialisp_func_types, empty_types, empty_types,
+                           chialisp_module_types, chialisp_call_types, empty_types, empty_types,
+                           empty_types, chialisp_var_types, empty_types, empty_types, NULL,
+                           empty_types, NULL, NULL, tree_sitter_chialisp, NULL},
 
     // CBM_LANG_FENNEL
     [CBM_LANG_FENNEL] = {CBM_LANG_FENNEL, fennel_func_types, empty_types, empty_types,
