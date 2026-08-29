@@ -1285,7 +1285,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
             int fresh_count = 0;
             CBMLSPDef *fresh_defs =
                 def_modules && def_starts
-                    ? cbm_pxc_collect_all_defs(cache, changed_files, ci, ctx->project_name,
+                    ? cbm_pxc_collect_all_defs(ctx, cache, changed_files, ci, ctx->project_name,
                                                def_modules, &fresh_count, def_starts)
                     : NULL;
             if ((fresh_defs || fresh_count == 0) && def_starts &&
@@ -1588,8 +1588,8 @@ static int closure_probe_surfaces(cbm_pipeline_t *p, const char *project,
         int def_count = 0;
         CBMLSPDef *defs = NULL;
         if (def_modules && def_starts) {
-            defs = cbm_pxc_collect_all_defs(cache, probe_files, probe_count, project, def_modules,
-                                            &def_count, def_starts);
+            defs = cbm_pxc_collect_all_defs(NULL, cache, probe_files, probe_count, project,
+                                            def_modules, &def_count, def_starts);
             rc = cbm_lsp_surface_build_rows(project, cache, probe_files, probe_count, defs,
                                             def_starts, out_rows, out_count);
         } else {
