@@ -946,6 +946,9 @@ static void predump_complexity(cbm_pipeline_ctx_t *ctx) {
 static void predump_ensemble(cbm_pipeline_ctx_t *ctx) {
     cbm_pipeline_pass_ensemble_routing(ctx);
 }
+static void predump_importance(cbm_pipeline_ctx_t *ctx) {
+    cbm_pipeline_pass_importance(ctx);
+}
 
 static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     static const struct {
@@ -953,12 +956,23 @@ static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
         const char *name;
         bool moderate_only; /* true = skip in fast mode */
     } passes[] = {
-        {predump_deco, "decorator_tags", false},   {predump_cfg, "configlink", false},
-        {predump_route, "route_match", false},     {predump_ensemble, "ensemble_routing", false},
-        {predump_sim, "similarity", true},         {predump_sem, "semantic_edges", true},
+        {predump_deco, "decorator_tags", false},
+        {predump_cfg, "configlink", false},
+        {predump_route, "route_match", false},
+        {predump_ensemble, "ensemble_routing", false},
+        {predump_sim, "similarity", true},
+        {predump_sem, "semantic_edges", true},
         {predump_complexity, "complexity", false},
+        /* Importance runs LAST: it reads CALLS/USAGE (extraction) and TESTS
+         * (pass_tests, which run_post_extraction runs before this loop), so
+         * every edge type its score depends on already exists here. */
+        {predump_importance, "importance", false},
     };
-    enum { PREDUMP_PASS_COUNT = 7 };
+    /* Derived from the table, never hand-written. A hand-written count that
+     * lags a newly appended entry silently skips the LAST pass while every
+     * test stays green — exactly the failure this expression makes
+     * impossible. */
+    enum { PREDUMP_PASS_COUNT = (int)(sizeof(passes) / sizeof(passes[0])) };
     struct timespec t;
     for (int i = 0; i < PREDUMP_PASS_COUNT && !check_cancel(p); i++) {
         /* "moderate_only" passes (similarity/semantic edges) run in FULL,
