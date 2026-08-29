@@ -896,11 +896,22 @@ TEST(weak_call_guards_share_one_drop_list) {
      * someone re-inlines one of the lists and edits only that copy, the two
      * guards start disagreeing and this test catches it at the contract level
      * rather than in a corpus months later. */
-    static const char *const strategies[] = {
-        "suffix_match",  "unique_name",   "field_type_hint", "fuzzy",       "same_module",
-        "import_map",    "import_map_suffix", "qualified_suffix", "callee_suffix",
-        "service_pattern",   "lsp_cross", "lsp_ts_method", "lsp_py_method", "lsp_direct",
-        "",              NULL};
+    static const char *const strategies[] = {"suffix_match",
+                                             "unique_name",
+                                             "field_type_hint",
+                                             "fuzzy",
+                                             "same_module",
+                                             "import_map",
+                                             "import_map_suffix",
+                                             "qualified_suffix",
+                                             "callee_suffix",
+                                             "service_pattern",
+                                             "lsp_cross",
+                                             "lsp_ts_method",
+                                             "lsp_py_method",
+                                             "lsp_direct",
+                                             "",
+                                             NULL};
     for (int i = 0; strategies[i] != NULL; i++) {
         bool member = cbm_suppress_weak_member_match(true, true, strategies[i]);
         bool binding = cbm_suppress_weak_local_binding_call(true, true, strategies[i]);

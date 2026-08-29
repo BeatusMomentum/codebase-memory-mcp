@@ -4656,13 +4656,13 @@ TEST(extract_python_bare_call_flags_locally_bound_callee) {
         bool expect_bound;
         int seen;
     } cases[] = {
-        {"run", true, 0},      /* closure over an ENCLOSING function's parameter */
-        {"rest", true, 0},     /* *args   -> list_splat_pattern                  */
-        {"timeout", true, 0},  /* default_parameter                              */
-        {"label", true, 0},    /* typed_default_parameter (keyword-only)         */
-        {"opts", true, 0},     /* **kwargs -> dictionary_splat_pattern           */
-        {"cb", true, 0},       /* typed_parameter, no default                    */
-        {"fn", true, 0},       /* lambda parameter                               */
+        {"run", true, 0},           /* closure over an ENCLOSING function's parameter */
+        {"rest", true, 0},          /* *args   -> list_splat_pattern                  */
+        {"timeout", true, 0},       /* default_parameter                              */
+        {"label", true, 0},         /* typed_default_parameter (keyword-only)         */
+        {"opts", true, 0},          /* **kwargs -> dictionary_splat_pattern           */
+        {"cb", true, 0},            /* typed_parameter, no default                    */
+        {"fn", true, 0},            /* lambda parameter                               */
         {"module_level", false, 0}, /* unbound: the true cross-file edge         */
         {"helper", false, 0},       /* imported name, not a parameter            */
         {"inner", false, 0},        /* nested def: a real target, keep the edge  */
