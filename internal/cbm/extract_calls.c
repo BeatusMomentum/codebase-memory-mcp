@@ -2740,6 +2740,66 @@ static char *resolve_objectscript_instance_call(CBMArena *a, TSNode node, const 
     return NULL;
 }
 
+/* True when a Python attribute-call receiver is EXEMPT from the weak-member
+ * guard (#1276). Three exemptions, each because the receiver is in fact known:
+ *   - `self.x()` / `cls.x()`  — a direct self/cls receiver keeps class-local
+ *     semantics; the enclosing class is the right namespace for a weak match.
+ *   - `super().x()`           — same, via the base class.
+ *   - `helper.compute()`      — an identifier bound by one of THIS file's
+ *     imports, including the root of an attribute chain (`pkg.sub.fn()`).
+ *     module.function() is Python's canonical cross-file call shape and the
+ *     import map resolves it; flagging it would kill the true edge.
+ * Everything else — a parameter, a local, an attribute of self — has no
+ * statically-known type here, so the call must not bind by short name alone.
+ * Note `self.client.send()` is NOT exempt: the receiver is `self.client`, an
+ * attribute of unknown type, not `self` itself. */
+static bool python_receiver_is_exempt(CBMExtractCtx *ctx, TSNode receiver) {
+    if (ts_node_is_null(receiver)) {
+        return false;
+    }
+
+    /* super().m() — the receiver is a call node whose function is `super`. */
+    if (strcmp(ts_node_type(receiver), "call") == 0) {
+        TSNode fn = ts_node_child_by_field_name(receiver, TS_FIELD("function"));
+        if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "identifier") == 0) {
+            char *name = cbm_node_text(ctx->arena, fn, ctx->source);
+            return name && strcmp(name, "super") == 0;
+        }
+        return false;
+    }
+
+    /* Walk an attribute chain down to its root identifier: for `pkg.sub.fn()`
+     * the receiver is `pkg.sub`, whose root is `pkg` — the name an import binds. */
+    bool direct_identifier = strcmp(ts_node_type(receiver), "identifier") == 0;
+    TSNode root = receiver;
+    while (!ts_node_is_null(root) && strcmp(ts_node_type(root), "attribute") == 0) {
+        root = ts_node_child_by_field_name(root, TS_FIELD("object"));
+    }
+    if (ts_node_is_null(root) || strcmp(ts_node_type(root), "identifier") != 0) {
+        return false;
+    }
+
+    char *name = cbm_node_text(ctx->arena, root, ctx->source);
+    if (!name) {
+        return false;
+    }
+    /* self/cls only as a DIRECT receiver: `self.m()` is class-local, but
+     * `self.client.m()` has receiver `self.client` of unknown type. */
+    if (direct_identifier && (strcmp(name, "self") == 0 || strcmp(name, "cls") == 0)) {
+        return true;
+    }
+    /* Import-bound root, incl. aliases (`import tools as toolkit` binds
+     * local_name "toolkit"). Per-file scan: imports.count is a file-local
+     * number (tens), never the corpus, so this stays O(file), not O(corpus). */
+    for (int i = 0; i < ctx->result->imports.count; i++) {
+        const char *local_name = ctx->result->imports.items[i].local_name;
+        if (local_name && strcmp(local_name, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool is_objectscript_language(CBMLanguage language) {
     return language == CBM_LANG_OBJECTSCRIPT_UDL || language == CBM_LANG_OBJECTSCRIPT_ROUTINE;
 }
@@ -3356,6 +3416,20 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
             if (ctx->language == CBM_LANG_PERL &&
                 strcmp(ts_node_type(node), "method_call_expression") == 0) {
                 call.is_method = true;
+            }
+            // Python receiver-aware guard (#1276; same intent as the Perl and
+            // TS/JS flags). Flag an attribute call x.foo() whose receiver is not
+            // self/cls/super() and is not rooted in an imported name, so the
+            // call-resolution pass can suppress weak short-name matches for it
+            // (`accelerator.print()` must not bind MockAccelerator.print).
+            // Imported receivers stay unflagged: module.function() is Python's
+            // canonical cross-file call and the import map resolves it.
+            if (ctx->language == CBM_LANG_PYTHON && strcmp(ts_node_type(node), "call") == 0) {
+                TSNode fn = ts_node_child_by_field_name(node, TS_FIELD("function"));
+                if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "attribute") == 0) {
+                    TSNode obj = ts_node_child_by_field_name(fn, TS_FIELD("object"));
+                    call.is_method = !python_receiver_is_exempt(ctx, obj);
+                }
             }
             // TS/JS/TSX receiver-aware guard (#592/#606 direction; same intent
             // as the Perl flag above). Flag a member call x.foo() whose receiver

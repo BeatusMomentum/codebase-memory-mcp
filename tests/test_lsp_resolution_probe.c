@@ -952,11 +952,27 @@ TEST(lrp_python_s6_inherited_method) {
         {"child.py", "from .base import Base\n\n\nclass Child(Base):\n"
                      "    def extra(self):\n        return 'extra'\n\n\n"
                      "def run(c):\n    return c.describe()\n"}};
-    /* Uncertain: c.describe() on a Child — py_lsp_cross must see Child inherits Base
-     * (requires INHERITS edge resolution).  Given the Python extraction bug for
-     * base_classes, this may be RED end-to-end even if py_lsp_cross is correct.
-     * Assert the correct outcome; RED if extraction bug blocks resolution. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "python/S6/inherited_method", 0));
+    /* RED: c.describe() needs py_lsp_cross to walk `class Child(Base)`. Exactly
+     * the TS/S6 situation above, and resolved the same way (#1276).
+     * Until the receiver-aware guard landed, this scenario passed via a
+     * unique_name registry fallback — MEASURED on main before the guard:
+     * strategy=unique_name, cands=1, conf=0.7500. "describe" is the only symbol
+     * of that name in this 2-file fixture, so a weak short-name guess happened
+     * to be right. In a real repo the same guess binds an arbitrary same-named
+     * method (the false edges #1276 targets: accelerator.print() ->
+     * MockAccelerator.print), so the guard now suppresses weak member-call
+     * matches whose receiver is unresolved — here `c`, a bare parameter.
+     * c.describe() is the ONLY call in the fixture, so a correctly-suppressed
+     * run yields exactly zero CALLS.
+     * Tripwire: assert the store opened AND calls == 0 exactly, so an infra/DB
+     * failure cannot pass vacuously; flip to ASSERT calls >= 1 once py_lsp_cross
+     * resolves inheritance (lsp_py_*, a strategy the guard keeps). */
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, 2);
+    ASSERT_NOT_NULL(store);
+    int calls = cbm_store_count_edges_by_type(store, lp.project, "CALLS");
+    lrp_cleanup(&lp, store);
+    ASSERT_EQ(calls, 0);
     PASS();
 }
 
@@ -1776,7 +1792,8 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_rust_s8_field_call);
     RUN_TEST(lrp_rust_crossfile_macro_hidden_call_carrier);
 
-    /* ── Python (lsp_cross WIRED) — S1–S5,S7,S8 GREEN; S6 uncertain (extraction bug) ── */
+    /* ── Python (lsp_cross WIRED) — S1–S5,S7,S8 GREEN; S6 suppressed by the
+     * weak-member guard (#1276), asserted == 0 until py_lsp_cross inherits ── */
     RUN_TEST(lrp_python_s1_crossfile_call);
     RUN_TEST(lrp_python_s2_method_dispatch);
     RUN_TEST(lrp_python_s3_constructor);

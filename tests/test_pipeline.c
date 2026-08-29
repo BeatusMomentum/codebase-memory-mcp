@@ -4627,6 +4627,67 @@ TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge) {
     PASS();
 }
 
+/* Python counterpart to the TS/JS receiver guard (#1276), sequential path.
+ * Pins BOTH directions. NEGATIVE: an attribute call on an unknown receiver
+ * (a parameter) must not bind the lone same-named project method through
+ * unique_name. POSITIVE: an import-bound receiver (helper.compute) and a bare
+ * local call must still produce their CALLS edges.
+ * Fewer than 50 files exercises pass_calls.c. */
+TEST(pipeline_python_receiver_suppresses_weak_method_edge) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_python_recv_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "worker.py",
+                    "class Worker:\n"
+                    "    def backward(self):\n"
+                    "        return 1\n");
+    write_temp_file(tmp, "pkg/__init__.py", "from .helper import compute\n");
+    write_temp_file(tmp, "pkg/helper.py",
+                    "def compute(value):\n"
+                    "    return value * 2\n");
+    write_temp_file(tmp, "caller.py",
+                    "from pkg import helper\n"
+                    "\n"
+                    "def external_call(accelerator):\n"
+                    "    return accelerator.backward()\n"
+                    "\n"
+                    "def imported_call():\n"
+                    "    return helper.compute(42)\n"
+                    "\n"
+                    "def local_helper():\n"
+                    "    return 1\n"
+                    "\n"
+                    "def bare_call():\n"
+                    "    return local_helper()\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/python_recv.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* NEGATIVE: `accelerator` is a parameter — Worker.backward must not bind. */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "external_call", "backward"));
+    /* POSITIVE: import-bound receiver and bare local call both survive. */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "imported_call", "compute"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "bare_call", "local_helper"));
+    /* Tripwire: a run that emitted no edges at all would satisfy the negative
+     * assertion vacuously. */
+    ASSERT_GTE(cbm_store_count_edges_by_type(s, project, "CALLS"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Count nodes with the given exact name in the project (e.g. a Route path). */
 static int count_nodes_named(cbm_store_t *s, const char *project, const char *name) {
     cbm_node_t *ns = NULL;
@@ -4762,6 +4823,103 @@ TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
      * receiver and the dev.load weak match to ApiThing.load. */
     ASSERT_FALSE(cross_file_call_exists(s, project, "checkFormat", "test"));
     ASSERT_FALSE(cross_file_call_exists(s, project, "callLoad", "load"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Parallel Python regression for #1276. The field-type heuristic capitalizes
+ * the receiver token and previously promoted accelerator.print() to
+ * MockAccelerator.print at 0.85; ordinary suffix matching also selected one
+ * arbitrary backward()/step() implementation. All are unresolved-receiver
+ * calls and must remain absent, while the import-bound call and the bare local
+ * call remain — the same both-directions pin as the sequential test above.
+ * >= 50 files forces pass_parallel.c and try_field_type_hint(), so this is also
+ * the guard against a sequential/parallel divergence. */
+TEST(pipeline_python_receiver_parallel_suppresses_weak_method_edges) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_python_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "targets.py",
+                    "class MockAccelerator:\n"
+                    "    def print(self, value):\n"
+                    "        return value\n"
+                    "\n"
+                    "class OtherPrinter:\n"
+                    "    def print(self, value):\n"
+                    "        return value\n"
+                    "\n"
+                    "class FlashAttentionFunction:\n"
+                    "    def backward(self, loss):\n"
+                    "        return loss\n"
+                    "\n"
+                    "class OtherBackward:\n"
+                    "    def backward(self, loss):\n"
+                    "        return loss\n"
+                    "\n"
+                    "class EulerScheduler:\n"
+                    "    def step(self):\n"
+                    "        return 1\n"
+                    "\n"
+                    "class OtherScheduler:\n"
+                    "    def step(self):\n"
+                    "        return 1\n");
+    write_temp_file(tmp, "pkg/__init__.py", "from .helper import compute\n");
+    write_temp_file(tmp, "pkg/helper.py",
+                    "def compute(value):\n"
+                    "    return value * 2\n");
+    write_temp_file(tmp, "caller.py",
+                    "from pkg import helper\n"
+                    "\n"
+                    "def local_helper():\n"
+                    "    return 1\n"
+                    "\n"
+                    "def train(accelerator, trainer):\n"
+                    "    accelerator.print('hello')\n"
+                    "    accelerator.backward(1)\n"
+                    "    trainer.lr_scheduler.step()\n"
+                    "    helper.compute(42)\n"
+                    "    return local_helper()\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/python_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* NEGATIVE: every receiver here is a parameter or an attribute of one. */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "train", "print"));
+    ASSERT_FALSE(cross_file_call_exists(s, project, "train", "backward"));
+    ASSERT_FALSE(cross_file_call_exists(s, project, "train", "step"));
+    /* POSITIVE: import-bound and bare local calls survive the parallel path too. */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "train", "compute"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "train", "local_helper"));
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -12646,7 +12804,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_incremental_parallel_result_cache_alloc_failure_preserves_db_and_retries);
 #endif
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges);
+    RUN_TEST(pipeline_python_receiver_parallel_suppresses_weak_method_edges);
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
     RUN_TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);
