@@ -24,6 +24,9 @@ typedef struct cbm_store cbm_store_t;
 #define CBM_STORE_ERR (-1)
 #define CBM_STORE_NOT_FOUND (-2)
 #define CBM_INDEX_FORMAT_VERSION 1
+#define CBM_STORE_CANCELLED (-3)
+#define CBM_STORE_SCAN_LIMIT (-4)
+#define CBM_STORE_CALLBACK_ERR (-5)
 
 /* ── Data structures ────────────────────────────────────────────── */
 
@@ -254,6 +257,68 @@ typedef struct {
     const char **sample_qns;
     int sample_qn_count;
 } cbm_schema_info_t;
+
+/* ── Graph comparison ──────────────────────────────────────────── */
+
+/* Stable graph identities deliberately exclude the project name. Strings are
+ * borrowed from the active SQLite row and remain valid only for the duration
+ * of the callback. */
+typedef struct {
+    const char *qualified_name;
+    const char *label;
+    const char *file_path;
+} cbm_graph_node_identity_t;
+
+typedef struct {
+    cbm_graph_node_identity_t source;
+    cbm_graph_node_identity_t target;
+    const char *type;
+    const char *local_name_gen;
+} cbm_graph_edge_identity_t;
+
+typedef bool (*cbm_graph_compare_cancel_fn)(void *context);
+typedef bool (*cbm_graph_compare_node_fn)(void *context, bool added,
+                                          const cbm_graph_node_identity_t *node);
+typedef bool (*cbm_graph_compare_edge_fn)(void *context, bool added,
+                                          const cbm_graph_edge_identity_t *edge);
+
+#define CBM_GRAPH_COMPARE_GENERATION_SIZE 128
+#define CBM_GRAPH_COMPARE_INDEX_MODE_SIZE 32
+
+typedef struct {
+    char generation[CBM_GRAPH_COMPARE_GENERATION_SIZE];
+    char index_mode[CBM_GRAPH_COMPARE_INDEX_MODE_SIZE];
+    int64_t node_count;
+    int64_t edge_count;
+} cbm_graph_compare_project_t;
+
+typedef struct {
+    cbm_graph_compare_project_t base;
+    cbm_graph_compare_project_t target;
+    uint64_t nodes_added_total;
+    uint64_t nodes_removed_total;
+    uint64_t edges_added_total;
+    uint64_t edges_removed_total;
+} cbm_graph_compare_result_t;
+
+/* Compare two independently-owned read-only stores using ordered streaming
+ * cursors. Both read transactions and both SQLite progress handlers are owned
+ * by this call and released on every exit. scan_limit applies independently to
+ * the combined node rows and combined edge rows across the two projects. */
+int cbm_store_compare_graphs(cbm_store_t *base_store, const char *base_project,
+                             cbm_store_t *target_store, const char *target_project,
+                             uint64_t scan_limit, cbm_graph_compare_cancel_fn cancel,
+                             cbm_graph_compare_node_fn on_node, cbm_graph_compare_edge_fn on_edge,
+                             void *context, cbm_graph_compare_result_t *out);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Deterministic one-shot comparison fault seams. Values count successful
+ * comparison binds/cancellation checks before the injected event; -1 disables
+ * the seam. */
+void cbm_store_compare_test_fail_bind_after(int successful_binds);
+void cbm_store_compare_test_cancel_after(int successful_checks);
+void cbm_store_compare_test_cancel_from_progress(bool enabled);
+#endif
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 

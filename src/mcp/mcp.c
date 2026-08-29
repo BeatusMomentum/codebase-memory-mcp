@@ -1,5 +1,5 @@
 /*
- * mcp.c — MCP server: JSON-RPC 2.0 over stdio with 14 graph tools.
+ * mcp.c — MCP server: JSON-RPC 2.0 over stdio with graph tools.
  *
  * Uses yyjson for fast JSON parsing/building.
  * Single-threaded event loop: read line → parse → dispatch → respond.
@@ -36,6 +36,11 @@ enum {
     MCP_TOOLS_PAGE_SIZE = 8,
     MCP_HELP_TOOLS_WRAP_COL = 74, /* --help tool list stays readable on 80-col terminals */
     MCP_MAX_CROSS_REPO_TARGETS = 4096,
+    MCP_COMPARE_DEFAULT_LIMIT = 200,
+    MCP_COMPARE_MAX_LIMIT = 1000,
+    MCP_COMPARE_DEFAULT_SCAN_LIMIT = 2000000,
+    MCP_COMPARE_MAX_SCAN_LIMIT = 10000000,
+    MCP_COMPARE_SET_BYTE_BUDGET = 512 * 1024,
 };
 #define MCP_MS_TO_US 1000LL
 #define MCP_S_TO_US 1000000LL
@@ -556,6 +561,19 @@ static const tool_def_t TOOLS[] = {
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
      "\"project\"]}"},
 
+    {"compare_graphs", "Compare graphs",
+     "Compare two indexed project snapshots. Returns deterministic target-only additions and "
+     "base-only removals for stable node and edge identities using a bounded streaming merge. "
+     "Each result set is independently capped by limit and a fixed 512 KiB encoded-byte budget; "
+     "exact totals and truncation reasons are always reported.",
+     "{\"type\":\"object\",\"properties\":{"
+     "\"base_project\":{\"type\":\"string\",\"minLength\":1},"
+     "\"target_project\":{\"type\":\"string\",\"minLength\":1},"
+     "\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":1000,\"default\":200},"
+     "\"scan_limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":10000000,"
+     "\"default\":2000000}},\"required\":[\"base_project\",\"target_project\"],"
+     "\"additionalProperties\":false}"},
+
     {"get_architecture", "Get architecture",
      "Get high-level architecture overview. DEFAULT (no aspects) is a compact summary — "
      "overview counts, languages, packages, entry_points; request more via aspects:[...] "
@@ -719,6 +737,7 @@ static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"trace_path", false, true, true, false},
     {"get_code_snippet", false, true, true, false},
     {"get_graph_schema", false, true, true, false},
+    {"compare_graphs", true, false, true, false},
     {"get_architecture", false, true, true, false},
     {"search_code", false, true, true, false},
     {"list_projects", true, false, true, false},
@@ -780,9 +799,9 @@ static void mcp_add_tool_def(yyjson_mut_doc *doc, yyjson_mut_val *tools, int i) 
 
 static bool mcp_tool_allowed(cbm_mcp_tool_profile_t profile, const char *name) {
     static const char *const analysis_tools[] = {
-        "search_graph",     "query_graph",          "trace_path",     "get_code_snippet",
-        "get_graph_schema", "get_architecture",     "search_code",    "list_projects",
-        "index_status",     "check_index_coverage", "detect_changes",
+        "search_graph",     "query_graph",    "trace_path",           "get_code_snippet",
+        "get_graph_schema", "compare_graphs", "get_architecture",     "search_code",
+        "list_projects",    "index_status",   "check_index_coverage", "detect_changes",
     };
     static const char *const scout_tools[] = {
         "search_graph",  "trace_path",   "get_code_snippet",     "get_architecture",
@@ -2764,6 +2783,420 @@ static char *verify_project_indexed(cbm_store_t *store, const char *project) {
     }
     cbm_project_free_fields(&proj_check);
     return NULL;
+}
+
+/* compare_graphs deliberately bypasses resolve_store(): it needs two
+ * independently-owned request-scoped read handles, while resolve_store caches
+ * one handle on the server. Direct-name lookup stays the fast path; the
+ * existing internal-name fallback preserves legacy renamed databases. */
+static cbm_store_t *compare_open_project_store(const char *project) {
+    char path[CBM_SZ_1K];
+    project_db_path(project, path, sizeof(path));
+    cbm_store_t *store = path[0] ? cbm_store_open_path_query(path) : NULL;
+    if (store) {
+        cbm_project_t row = {0};
+        if (cbm_store_get_project(store, project, &row) == CBM_STORE_OK) {
+            cbm_project_free_fields(&row);
+            return store;
+        }
+        cbm_store_close(store);
+    }
+    return resolve_store_fallback_scan(project);
+}
+
+typedef struct {
+    yyjson_mut_val *items;
+    size_t returned;
+    size_t encoded_bytes;
+    bool budget_exhausted;
+} compare_result_set_t;
+
+typedef struct {
+    cbm_mcp_server_t *server;
+    yyjson_mut_doc *doc;
+    size_t limit;
+    compare_result_set_t nodes_added;
+    compare_result_set_t nodes_removed;
+    compare_result_set_t edges_added;
+    compare_result_set_t edges_removed;
+} compare_response_t;
+
+static char *compare_graphs_error(const char *code, const char *message) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    if (!doc || !root) {
+        yyjson_mut_doc_free(doc);
+        return cbm_mcp_text_result("compare_graphs failed: out of memory", true);
+    }
+    yyjson_mut_doc_set_root(doc, root);
+    if (!yyjson_mut_obj_add_strcpy(doc, root, "error", message) ||
+        !yyjson_mut_obj_add_strcpy(doc, root, "code", code)) {
+        yyjson_mut_doc_free(doc);
+        return cbm_mcp_text_result("compare_graphs failed: out of memory", true);
+    }
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    if (!json) {
+        return cbm_mcp_text_result("compare_graphs failed: out of memory", true);
+    }
+    char *result = cbm_mcp_text_result(json, true);
+    free(json);
+    return result;
+}
+
+static bool compare_arg_name_allowed(const char *name) {
+    return strcmp(name, "base_project") == 0 || strcmp(name, "target_project") == 0 ||
+           strcmp(name, "limit") == 0 || strcmp(name, "scan_limit") == 0;
+}
+
+static bool compare_parse_bounded_integer(yyjson_val *root, const char *key, int64_t default_value,
+                                          int64_t maximum, uint64_t *out,
+                                          const char **error_message) {
+    yyjson_val *value = yyjson_obj_get(root, key);
+    int64_t parsed = default_value;
+    if (value) {
+        if (!yyjson_is_int(value)) {
+            *error_message = "limit values must be integers";
+            return false;
+        }
+        parsed = yyjson_get_int(value);
+    }
+    if (parsed < 1 || parsed > maximum) {
+        *error_message = strcmp(key, "limit") == 0 ? "limit must be between 1 and 1000"
+                                                   : "scan_limit must be between 1 and 10000000";
+        return false;
+    }
+    *out = (uint64_t)parsed;
+    return true;
+}
+
+static bool compare_parse_arguments(const char *args, char **base_project, char **target_project,
+                                    uint64_t *limit, uint64_t *scan_limit,
+                                    const char **error_message) {
+    *base_project = NULL;
+    *target_project = NULL;
+    yyjson_doc *doc = yyjson_read(args ? args : "{}", args ? strlen(args) : SLEN("{}"), 0);
+    if (!doc) {
+        *error_message = "arguments must be valid JSON";
+        return false;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    if (!yyjson_is_obj(root)) {
+        *error_message = "arguments must be an object";
+        yyjson_doc_free(doc);
+        return false;
+    }
+
+    yyjson_obj_iter iterator = yyjson_obj_iter_with(root);
+    yyjson_val *key = NULL;
+    while ((key = yyjson_obj_iter_next(&iterator)) != NULL) {
+        const char *name = yyjson_get_str(key);
+        if (!name || !compare_arg_name_allowed(name)) {
+            *error_message = "unknown argument";
+            yyjson_doc_free(doc);
+            return false;
+        }
+    }
+
+    yyjson_val *base = yyjson_obj_get(root, "base_project");
+    yyjson_val *target = yyjson_obj_get(root, "target_project");
+    if (!base || !yyjson_is_str(base) || yyjson_get_len(base) == 0 || !target ||
+        !yyjson_is_str(target) || yyjson_get_len(target) == 0) {
+        *error_message = "base_project and target_project are required non-empty strings";
+        yyjson_doc_free(doc);
+        return false;
+    }
+    if (strcmp(yyjson_get_str(base), yyjson_get_str(target)) == 0) {
+        *error_message = "base_project and target_project must be distinct";
+        yyjson_doc_free(doc);
+        return false;
+    }
+    if (!compare_parse_bounded_integer(root, "limit", MCP_COMPARE_DEFAULT_LIMIT,
+                                       MCP_COMPARE_MAX_LIMIT, limit, error_message) ||
+        !compare_parse_bounded_integer(root, "scan_limit", MCP_COMPARE_DEFAULT_SCAN_LIMIT,
+                                       MCP_COMPARE_MAX_SCAN_LIMIT, scan_limit, error_message)) {
+        yyjson_doc_free(doc);
+        return false;
+    }
+
+    *base_project = heap_strdup(yyjson_get_str(base));
+    *target_project = heap_strdup(yyjson_get_str(target));
+    yyjson_doc_free(doc);
+    if (!*base_project || !*target_project) {
+        free(*base_project);
+        free(*target_project);
+        *base_project = NULL;
+        *target_project = NULL;
+        *error_message = "out of memory while validating arguments";
+        return false;
+    }
+    return true;
+}
+
+static char *sanitize_utf8_lossy(const char *s);
+
+static bool compare_add_identity_string(yyjson_mut_doc *doc, yyjson_mut_val *object,
+                                        const char *key, const char *value) {
+    char *sanitized = sanitize_utf8_lossy(value);
+    if (!sanitized) {
+        return false;
+    }
+    bool ok = yyjson_mut_obj_add_strcpy(doc, object, key, sanitized);
+    free(sanitized);
+    return ok;
+}
+
+static yyjson_mut_val *compare_node_json(yyjson_mut_doc *doc,
+                                         const cbm_graph_node_identity_t *node) {
+    yyjson_mut_val *object = yyjson_mut_obj(doc);
+    if (!object ||
+        !compare_add_identity_string(doc, object, "qualified_name", node->qualified_name) ||
+        !compare_add_identity_string(doc, object, "label", node->label) ||
+        !compare_add_identity_string(doc, object, "file_path", node->file_path)) {
+        return NULL;
+    }
+    return object;
+}
+
+static bool compare_append_item(compare_response_t *response, compare_result_set_t *set,
+                                yyjson_mut_doc *item_doc, yyjson_mut_val *item) {
+    if (!item_doc || !item) {
+        yyjson_mut_doc_free(item_doc);
+        return false;
+    }
+    char *encoded = yy_doc_to_str(item_doc);
+    if (!encoded) {
+        yyjson_mut_doc_free(item_doc);
+        return false;
+    }
+    size_t encoded_len = strlen(encoded);
+    size_t separator = set->returned > 0 ? 1U : 0U;
+    free(encoded);
+
+    if (set->encoded_bytes > MCP_COMPARE_SET_BYTE_BUDGET ||
+        separator > MCP_COMPARE_SET_BYTE_BUDGET - set->encoded_bytes ||
+        encoded_len > MCP_COMPARE_SET_BYTE_BUDGET - set->encoded_bytes - separator) {
+        set->budget_exhausted = true;
+        yyjson_mut_doc_free(item_doc);
+        return true;
+    }
+
+    yyjson_mut_val *copy = yyjson_mut_val_mut_copy(response->doc, item);
+    bool ok = copy && yyjson_mut_arr_add_val(set->items, copy);
+    yyjson_mut_doc_free(item_doc);
+    if (!ok) {
+        return false;
+    }
+    set->encoded_bytes += separator + encoded_len;
+    set->returned++;
+    return true;
+}
+
+static bool compare_node_callback(void *context, bool added,
+                                  const cbm_graph_node_identity_t *node) {
+    compare_response_t *response = (compare_response_t *)context;
+    compare_result_set_t *set = added ? &response->nodes_added : &response->nodes_removed;
+    if (set->returned >= response->limit || set->budget_exhausted) {
+        return true;
+    }
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *item = doc ? compare_node_json(doc, node) : NULL;
+    if (doc && item) {
+        yyjson_mut_doc_set_root(doc, item);
+    }
+    return compare_append_item(response, set, doc, item);
+}
+
+static bool compare_edge_callback(void *context, bool added,
+                                  const cbm_graph_edge_identity_t *edge) {
+    compare_response_t *response = (compare_response_t *)context;
+    compare_result_set_t *set = added ? &response->edges_added : &response->edges_removed;
+    if (set->returned >= response->limit || set->budget_exhausted) {
+        return true;
+    }
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *item = doc ? yyjson_mut_obj(doc) : NULL;
+    yyjson_mut_val *source = doc ? compare_node_json(doc, &edge->source) : NULL;
+    yyjson_mut_val *target = doc ? compare_node_json(doc, &edge->target) : NULL;
+    bool ok = item && source && target && yyjson_mut_obj_add_val(doc, item, "source", source) &&
+              yyjson_mut_obj_add_val(doc, item, "target", target) &&
+              compare_add_identity_string(doc, item, "type", edge->type) &&
+              compare_add_identity_string(doc, item, "local_name_gen", edge->local_name_gen);
+    if (ok) {
+        yyjson_mut_doc_set_root(doc, item);
+    }
+    return compare_append_item(response, set, doc, ok ? item : NULL);
+}
+
+static bool compare_cancel_callback(void *context) {
+    compare_response_t *response = (compare_response_t *)context;
+    return mcp_request_cancelled(response->server);
+}
+
+static yyjson_mut_val *compare_project_json(yyjson_mut_doc *doc, const char *project,
+                                            const cbm_graph_compare_project_t *metadata) {
+    yyjson_mut_val *object = yyjson_mut_obj(doc);
+    if (!object || !yyjson_mut_obj_add_strcpy(doc, object, "project", project) ||
+        !compare_add_identity_string(doc, object, "generation", metadata->generation) ||
+        !compare_add_identity_string(doc, object, "index_mode", metadata->index_mode) ||
+        !yyjson_mut_obj_add_sint(doc, object, "node_count", metadata->node_count) ||
+        !yyjson_mut_obj_add_sint(doc, object, "edge_count", metadata->edge_count)) {
+        return NULL;
+    }
+    return object;
+}
+
+static yyjson_mut_val *compare_set_json(yyjson_mut_doc *doc, compare_result_set_t *set,
+                                        uint64_t total, size_t limit) {
+    yyjson_mut_val *object = yyjson_mut_obj(doc);
+    yyjson_mut_val *reasons = yyjson_mut_arr(doc);
+    bool truncated = total > (uint64_t)set->returned;
+    if (!object || !reasons || !yyjson_mut_obj_add_val(doc, object, "items", set->items) ||
+        !yyjson_mut_obj_add_uint(doc, object, "returned", set->returned) ||
+        !yyjson_mut_obj_add_uint(doc, object, "total", total) ||
+        !yyjson_mut_obj_add_bool(doc, object, "truncated", truncated)) {
+        return NULL;
+    }
+    if (truncated && set->returned >= limit && !yyjson_mut_arr_add_strcpy(doc, reasons, "limit")) {
+        return NULL;
+    }
+    if (truncated && set->budget_exhausted &&
+        !yyjson_mut_arr_add_strcpy(doc, reasons, "encoded_byte_budget")) {
+        return NULL;
+    }
+    if (!yyjson_mut_obj_add_val(doc, object, "truncation_reasons", reasons)) {
+        return NULL;
+    }
+    return object;
+}
+
+static char *handle_compare_graphs(cbm_mcp_server_t *server, const char *args) {
+    char *base_project = NULL;
+    char *target_project = NULL;
+    uint64_t limit = 0;
+    uint64_t scan_limit = 0;
+    const char *argument_error = NULL;
+    if (!compare_parse_arguments(args, &base_project, &target_project, &limit, &scan_limit,
+                                 &argument_error)) {
+        return compare_graphs_error("invalid_arguments", argument_error);
+    }
+    if (mcp_request_cancelled(server)) {
+        free(base_project);
+        free(target_project);
+        return compare_graphs_error("cancelled", "compare_graphs cancelled for this request");
+    }
+
+    cbm_store_t *base_store = compare_open_project_store(base_project);
+    if (!base_store) {
+        free(base_project);
+        free(target_project);
+        return compare_graphs_error("project_not_indexed", "base project is not indexed");
+    }
+    cbm_store_t *target_store = compare_open_project_store(target_project);
+    if (!target_store) {
+        cbm_store_close(base_store);
+        free(base_project);
+        free(target_project);
+        return compare_graphs_error("project_not_indexed", "target project is not indexed");
+    }
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    compare_response_t response = {
+        .server = server,
+        .doc = doc,
+        .limit = (size_t)limit,
+        .nodes_added = {.items = doc ? yyjson_mut_arr(doc) : NULL, .encoded_bytes = 2U},
+        .nodes_removed = {.items = doc ? yyjson_mut_arr(doc) : NULL, .encoded_bytes = 2U},
+        .edges_added = {.items = doc ? yyjson_mut_arr(doc) : NULL, .encoded_bytes = 2U},
+        .edges_removed = {.items = doc ? yyjson_mut_arr(doc) : NULL, .encoded_bytes = 2U},
+    };
+    if (!doc || !root || !response.nodes_added.items || !response.nodes_removed.items ||
+        !response.edges_added.items || !response.edges_removed.items) {
+        cbm_store_close(target_store);
+        cbm_store_close(base_store);
+        yyjson_mut_doc_free(doc);
+        free(base_project);
+        free(target_project);
+        return compare_graphs_error("allocation_failed", "could not allocate comparison result");
+    }
+    yyjson_mut_doc_set_root(doc, root);
+
+    cbm_graph_compare_result_t comparison = {0};
+    int compare_rc = cbm_store_compare_graphs(
+        base_store, base_project, target_store, target_project, scan_limit, compare_cancel_callback,
+        compare_node_callback, compare_edge_callback, &response, &comparison);
+    cbm_store_close(target_store);
+    cbm_store_close(base_store);
+
+    if (compare_rc != CBM_STORE_OK) {
+        yyjson_mut_doc_free(doc);
+        free(base_project);
+        free(target_project);
+        if (compare_rc == CBM_STORE_CANCELLED) {
+            return compare_graphs_error("cancelled", "compare_graphs cancelled for this request");
+        }
+        if (compare_rc == CBM_STORE_NOT_FOUND) {
+            return compare_graphs_error("project_not_indexed", "project is not indexed");
+        }
+        if (compare_rc == CBM_STORE_SCAN_LIMIT) {
+            return compare_graphs_error("scan_limit_exceeded",
+                                        "combined graph rows exceed scan_limit");
+        }
+        if (compare_rc == CBM_STORE_CALLBACK_ERR) {
+            return compare_graphs_error("allocation_failed",
+                                        "could not allocate comparison result");
+        }
+        return compare_graphs_error("query_failed", "graph comparison query failed");
+    }
+
+    yyjson_mut_val *base = compare_project_json(doc, base_project, &comparison.base);
+    yyjson_mut_val *target = compare_project_json(doc, target_project, &comparison.target);
+    yyjson_mut_val *nodes = yyjson_mut_obj(doc);
+    yyjson_mut_val *edges = yyjson_mut_obj(doc);
+    yyjson_mut_val *limits = yyjson_mut_obj(doc);
+    yyjson_mut_val *nodes_added =
+        compare_set_json(doc, &response.nodes_added, comparison.nodes_added_total, response.limit);
+    yyjson_mut_val *nodes_removed = compare_set_json(
+        doc, &response.nodes_removed, comparison.nodes_removed_total, response.limit);
+    yyjson_mut_val *edges_added =
+        compare_set_json(doc, &response.edges_added, comparison.edges_added_total, response.limit);
+    yyjson_mut_val *edges_removed = compare_set_json(
+        doc, &response.edges_removed, comparison.edges_removed_total, response.limit);
+    bool built =
+        base && target && nodes && edges && limits && nodes_added && nodes_removed && edges_added &&
+        edges_removed && yyjson_mut_obj_add_int(doc, root, "schema_version", 1) &&
+        yyjson_mut_obj_add_val(doc, root, "base", base) &&
+        yyjson_mut_obj_add_val(doc, root, "target", target) &&
+        yyjson_mut_obj_add_val(doc, nodes, "added", nodes_added) &&
+        yyjson_mut_obj_add_val(doc, nodes, "removed", nodes_removed) &&
+        yyjson_mut_obj_add_val(doc, root, "nodes", nodes) &&
+        yyjson_mut_obj_add_val(doc, edges, "added", edges_added) &&
+        yyjson_mut_obj_add_val(doc, edges, "removed", edges_removed) &&
+        yyjson_mut_obj_add_val(doc, root, "edges", edges) &&
+        yyjson_mut_obj_add_uint(doc, limits, "limit", limit) &&
+        yyjson_mut_obj_add_uint(doc, limits, "scan_limit", scan_limit) &&
+        yyjson_mut_obj_add_uint(doc, limits, "encoded_byte_budget", MCP_COMPARE_SET_BYTE_BUDGET) &&
+        yyjson_mut_obj_add_val(doc, root, "limits", limits);
+    free(base_project);
+    free(target_project);
+    if (!built) {
+        yyjson_mut_doc_free(doc);
+        return compare_graphs_error("allocation_failed", "could not allocate comparison result");
+    }
+    if (mcp_request_cancelled(server)) {
+        yyjson_mut_doc_free(doc);
+        return compare_graphs_error("cancelled", "compare_graphs cancelled for this request");
+    }
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    if (!json) {
+        return compare_graphs_error("allocation_failed", "could not serialize comparison result");
+    }
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
 }
 
 static bool sg_field_blocked(const char *f); /* internal-only fields, defined with search_graph */
@@ -11453,6 +11886,9 @@ static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const c
     }
     if (strcmp(tool_name, "get_graph_schema") == 0) {
         return handle_get_graph_schema(srv, args_json);
+    }
+    if (strcmp(tool_name, "compare_graphs") == 0) {
+        return handle_compare_graphs(srv, args_json);
     }
     if (strcmp(tool_name, "search_graph") == 0) {
         return handle_search_graph(srv, args_json);

@@ -1313,6 +1313,473 @@ int cbm_store_rollback(cbm_store_t *s) {
     return exec_sql(s, "ROLLBACK;");
 }
 
+/* ── Graph comparison ────────────────────────────────────────────── */
+
+typedef struct {
+    cbm_graph_compare_cancel_fn cancel;
+    void *context;
+    bool progress_cancelled;
+} graph_compare_progress_t;
+
+enum { GRAPH_COMPARE_PROGRESS_INTERVAL = 1000 };
+
+typedef struct {
+    sqlite3_stmt *stmt;
+    cbm_graph_node_identity_t identity;
+    bool has_row;
+} graph_node_cursor_t;
+
+typedef struct {
+    sqlite3_stmt *stmt;
+    cbm_graph_edge_identity_t identity;
+    bool has_row;
+} graph_edge_cursor_t;
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static atomic_int graph_compare_test_bind_countdown = ATOMIC_VAR_INIT(CBM_NOT_FOUND);
+static atomic_int graph_compare_test_cancel_countdown = ATOMIC_VAR_INIT(CBM_NOT_FOUND);
+static atomic_bool graph_compare_test_progress_cancel = ATOMIC_VAR_INIT(false);
+
+void cbm_store_compare_test_fail_bind_after(int successful_binds) {
+    atomic_store(&graph_compare_test_bind_countdown, successful_binds);
+}
+
+void cbm_store_compare_test_cancel_after(int successful_checks) {
+    atomic_store(&graph_compare_test_cancel_countdown, successful_checks);
+}
+
+void cbm_store_compare_test_cancel_from_progress(bool enabled) {
+    atomic_store(&graph_compare_test_progress_cancel, enabled);
+}
+
+static bool graph_compare_test_countdown_fires(atomic_int *countdown) {
+    int remaining = atomic_load(countdown);
+    while (remaining >= 0) {
+        int next = remaining == 0 ? CBM_NOT_FOUND : remaining - 1;
+        if (atomic_compare_exchange_weak(countdown, &remaining, next)) {
+            return remaining == 0;
+        }
+    }
+    return false;
+}
+#endif
+
+static bool graph_compare_is_cancelled(const graph_compare_progress_t *progress) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (graph_compare_test_countdown_fires(&graph_compare_test_cancel_countdown)) {
+        return true;
+    }
+#endif
+    return progress && progress->cancel && progress->cancel(progress->context);
+}
+
+static int graph_compare_progress(void *context) {
+    graph_compare_progress_t *progress = (graph_compare_progress_t *)context;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (atomic_load(&graph_compare_test_progress_cancel)) {
+        progress->progress_cancelled = true;
+        return true;
+    }
+#endif
+    bool cancelled = graph_compare_is_cancelled(progress);
+    progress->progress_cancelled = cancelled;
+    return cancelled;
+}
+
+static int graph_compare_progress_interval(void) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (atomic_load(&graph_compare_test_progress_cancel)) {
+        return 1;
+    }
+#endif
+    return GRAPH_COMPARE_PROGRESS_INTERVAL;
+}
+
+static int graph_compare_bind_text(sqlite3_stmt *stmt, int column, const char *value) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (graph_compare_test_countdown_fires(&graph_compare_test_bind_countdown)) {
+        return SQLITE_NOMEM;
+    }
+#endif
+    return bind_text(stmt, column, value);
+}
+
+/* SQLite's BINARY collation compares the unsigned bytes of the UTF-8 text.
+ * Keep the merge comparator byte-for-byte equivalent so neither cursor can
+ * be advanced past a row that SQLite considers distinct. */
+static int graph_binary_compare(const char *left, const char *right) {
+    const unsigned char *a = (const unsigned char *)safe_str(left);
+    const unsigned char *b = (const unsigned char *)safe_str(right);
+    while (*a && *a == *b) {
+        a++;
+        b++;
+    }
+    return (*a > *b) - (*a < *b);
+}
+
+static int graph_node_compare(const cbm_graph_node_identity_t *left,
+                              const cbm_graph_node_identity_t *right) {
+    int cmp = graph_binary_compare(left->qualified_name, right->qualified_name);
+    if (cmp == 0) {
+        cmp = graph_binary_compare(left->label, right->label);
+    }
+    if (cmp == 0) {
+        cmp = graph_binary_compare(left->file_path, right->file_path);
+    }
+    return cmp;
+}
+
+static int graph_edge_compare(const cbm_graph_edge_identity_t *left,
+                              const cbm_graph_edge_identity_t *right) {
+    int cmp = graph_node_compare(&left->source, &right->source);
+    if (cmp == 0) {
+        cmp = graph_node_compare(&left->target, &right->target);
+    }
+    if (cmp == 0) {
+        cmp = graph_binary_compare(left->type, right->type);
+    }
+    if (cmp == 0) {
+        cmp = graph_binary_compare(left->local_name_gen, right->local_name_gen);
+    }
+    return cmp;
+}
+
+static int graph_count_rows(cbm_store_t *store, const char *sql, const char *project,
+                            int64_t *out) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(store->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(store, "compare count prepare");
+        return CBM_STORE_ERR;
+    }
+    if (graph_compare_bind_text(stmt, SKIP_ONE, project) != SQLITE_OK) {
+        store_set_error(store, "compare count bind failed");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    int step_rc = sqlite3_step(stmt);
+    if (step_rc != SQLITE_ROW) {
+        store_set_error_sqlite(store, "compare count");
+        sqlite3_finalize(stmt);
+        return step_rc == SQLITE_INTERRUPT ? CBM_STORE_CANCELLED : CBM_STORE_ERR;
+    }
+    *out = sqlite3_column_int64(stmt, 0);
+    step_rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (step_rc != SQLITE_DONE) {
+        store_set_error_sqlite(store, "compare count finish");
+        return step_rc == SQLITE_INTERRUPT ? CBM_STORE_CANCELLED : CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+static int graph_capture_project(cbm_store_t *store, const char *project,
+                                 cbm_graph_compare_project_t *out) {
+    cbm_project_t row = {0};
+    int rc = cbm_store_get_project(store, project, &row);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    if (!row.name || !row.indexed_at || !row.root_path) {
+        cbm_project_free_fields(&row);
+        store_set_error(store, "compare project allocation failed");
+        return CBM_STORE_ERR;
+    }
+
+    snprintf(out->generation, sizeof(out->generation), "%s", safe_str(row.indexed_at));
+    snprintf(out->index_mode, sizeof(out->index_mode), "unknown");
+
+    cbm_coverage_meta_t meta = {0};
+    rc = cbm_store_coverage_meta_get(store, project, &meta);
+    if (rc == CBM_STORE_OK) {
+        snprintf(out->generation, sizeof(out->generation), "%s", safe_str(meta.generation));
+        snprintf(out->index_mode, sizeof(out->index_mode), "%s", safe_str(meta.index_mode));
+        cbm_store_coverage_meta_clear(&meta);
+    } else if (rc != CBM_STORE_NOT_FOUND) {
+        cbm_project_free_fields(&row);
+        return rc;
+    }
+    cbm_project_free_fields(&row);
+
+    rc = graph_count_rows(store, "SELECT count(*) FROM nodes WHERE project=?1;", project,
+                          &out->node_count);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    return graph_count_rows(store, "SELECT count(*) FROM edges WHERE project=?1;", project,
+                            &out->edge_count);
+}
+
+static int graph_node_cursor_step(cbm_store_t *store, graph_node_cursor_t *cursor) {
+    int rc = sqlite3_step(cursor->stmt);
+    if (rc == SQLITE_DONE) {
+        cursor->has_row = false;
+        return CBM_STORE_OK;
+    }
+    if (rc != SQLITE_ROW) {
+        store_set_error_sqlite(store, "compare node scan");
+        cursor->has_row = false;
+        return rc == SQLITE_INTERRUPT ? CBM_STORE_CANCELLED : CBM_STORE_ERR;
+    }
+    cursor->identity.qualified_name = safe_str((const char *)sqlite3_column_text(cursor->stmt, 0));
+    cursor->identity.label = safe_str((const char *)sqlite3_column_text(cursor->stmt, ST_COL_1));
+    cursor->identity.file_path =
+        safe_str((const char *)sqlite3_column_text(cursor->stmt, ST_COL_2));
+    cursor->has_row = true;
+    return CBM_STORE_OK;
+}
+
+static int graph_edge_cursor_step(cbm_store_t *store, graph_edge_cursor_t *cursor) {
+    int rc = sqlite3_step(cursor->stmt);
+    if (rc == SQLITE_DONE) {
+        cursor->has_row = false;
+        return CBM_STORE_OK;
+    }
+    if (rc != SQLITE_ROW) {
+        store_set_error_sqlite(store, "compare edge scan");
+        cursor->has_row = false;
+        return rc == SQLITE_INTERRUPT ? CBM_STORE_CANCELLED : CBM_STORE_ERR;
+    }
+    cursor->identity.source.qualified_name =
+        safe_str((const char *)sqlite3_column_text(cursor->stmt, 0));
+    cursor->identity.source.label =
+        safe_str((const char *)sqlite3_column_text(cursor->stmt, ST_COL_1));
+    cursor->identity.source.file_path =
+        safe_str((const char *)sqlite3_column_text(cursor->stmt, ST_COL_2));
+    cursor->identity.target.qualified_name =
+        safe_str((const char *)sqlite3_column_text(cursor->stmt, ST_COL_3));
+    cursor->identity.target.label =
+        safe_str((const char *)sqlite3_column_text(cursor->stmt, ST_COL_4));
+    cursor->identity.target.file_path =
+        safe_str((const char *)sqlite3_column_text(cursor->stmt, ST_COL_5));
+    cursor->identity.type = safe_str((const char *)sqlite3_column_text(cursor->stmt, ST_COL_6));
+    cursor->identity.local_name_gen =
+        safe_str((const char *)sqlite3_column_text(cursor->stmt, ST_COL_7));
+    cursor->has_row = true;
+    return CBM_STORE_OK;
+}
+
+static int graph_prepare_node_cursor(cbm_store_t *store, const char *project,
+                                     graph_node_cursor_t *cursor) {
+    static const char sql[] =
+        "SELECT qualified_name,label,replace(coalesce(file_path,''),'\\','/') "
+        "FROM nodes WHERE project=?1 "
+        "ORDER BY qualified_name COLLATE BINARY,label COLLATE BINARY,"
+        "replace(coalesce(file_path,''),'\\','/') COLLATE BINARY;";
+    if (sqlite3_prepare_v2(store->db, sql, CBM_NOT_FOUND, &cursor->stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(store, "compare node prepare");
+        return CBM_STORE_ERR;
+    }
+    if (graph_compare_bind_text(cursor->stmt, SKIP_ONE, project) != SQLITE_OK) {
+        store_set_error(store, "compare node bind failed");
+        sqlite3_finalize(cursor->stmt);
+        cursor->stmt = NULL;
+        return CBM_STORE_ERR;
+    }
+    return graph_node_cursor_step(store, cursor);
+}
+
+static int graph_prepare_edge_cursor(cbm_store_t *store, const char *project,
+                                     graph_edge_cursor_t *cursor) {
+    static const char sql[] =
+        "SELECT sn.qualified_name,sn.label,replace(coalesce(sn.file_path,''),'\\','/'),"
+        "tn.qualified_name,tn.label,replace(coalesce(tn.file_path,''),'\\','/'),e.type,"
+        "coalesce(e.local_name_gen,'') FROM edges e "
+        "JOIN nodes sn ON sn.id=e.source_id JOIN nodes tn ON tn.id=e.target_id "
+        "WHERE e.project=?1 ORDER BY "
+        "sn.qualified_name COLLATE BINARY,sn.label COLLATE BINARY,"
+        "replace(coalesce(sn.file_path,''),'\\','/') COLLATE BINARY,"
+        "tn.qualified_name COLLATE BINARY,tn.label COLLATE BINARY,"
+        "replace(coalesce(tn.file_path,''),'\\','/') COLLATE BINARY,"
+        "e.type COLLATE BINARY,coalesce(e.local_name_gen,'') COLLATE BINARY;";
+    if (sqlite3_prepare_v2(store->db, sql, CBM_NOT_FOUND, &cursor->stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(store, "compare edge prepare");
+        return CBM_STORE_ERR;
+    }
+    if (graph_compare_bind_text(cursor->stmt, SKIP_ONE, project) != SQLITE_OK) {
+        store_set_error(store, "compare edge bind failed");
+        sqlite3_finalize(cursor->stmt);
+        cursor->stmt = NULL;
+        return CBM_STORE_ERR;
+    }
+    return graph_edge_cursor_step(store, cursor);
+}
+
+static int graph_compare_nodes(cbm_store_t *base_store, const char *base_project,
+                               cbm_store_t *target_store, const char *target_project,
+                               graph_compare_progress_t *progress,
+                               cbm_graph_compare_node_fn callback,
+                               cbm_graph_compare_result_t *out) {
+    graph_node_cursor_t base = {0};
+    graph_node_cursor_t target = {0};
+    int rc = graph_prepare_node_cursor(base_store, base_project, &base);
+    if (rc == CBM_STORE_OK) {
+        rc = graph_prepare_node_cursor(target_store, target_project, &target);
+    }
+    uint64_t merged = 0;
+    while (rc == CBM_STORE_OK && (base.has_row || target.has_row)) {
+        if ((merged++ & UINT64_C(255)) == 0 && graph_compare_is_cancelled(progress)) {
+            rc = CBM_STORE_CANCELLED;
+            break;
+        }
+        int cmp =
+            !base.has_row
+                ? 1
+                : (!target.has_row ? -1 : graph_node_compare(&base.identity, &target.identity));
+        if (cmp < 0) {
+            out->nodes_removed_total++;
+            if (callback && !callback(progress->context, false, &base.identity)) {
+                rc = CBM_STORE_CALLBACK_ERR;
+                break;
+            }
+            rc = graph_node_cursor_step(base_store, &base);
+        } else if (cmp > 0) {
+            out->nodes_added_total++;
+            if (callback && !callback(progress->context, true, &target.identity)) {
+                rc = CBM_STORE_CALLBACK_ERR;
+                break;
+            }
+            rc = graph_node_cursor_step(target_store, &target);
+        } else {
+            rc = graph_node_cursor_step(base_store, &base);
+            if (rc == CBM_STORE_OK) {
+                rc = graph_node_cursor_step(target_store, &target);
+            }
+        }
+    }
+    sqlite3_finalize(base.stmt);
+    sqlite3_finalize(target.stmt);
+    return rc;
+}
+
+static int graph_compare_edges(cbm_store_t *base_store, const char *base_project,
+                               cbm_store_t *target_store, const char *target_project,
+                               graph_compare_progress_t *progress,
+                               cbm_graph_compare_edge_fn callback,
+                               cbm_graph_compare_result_t *out) {
+    graph_edge_cursor_t base = {0};
+    graph_edge_cursor_t target = {0};
+    int rc = graph_prepare_edge_cursor(base_store, base_project, &base);
+    if (rc == CBM_STORE_OK) {
+        rc = graph_prepare_edge_cursor(target_store, target_project, &target);
+    }
+    uint64_t merged = 0;
+    while (rc == CBM_STORE_OK && (base.has_row || target.has_row)) {
+        if ((merged++ & UINT64_C(255)) == 0 && graph_compare_is_cancelled(progress)) {
+            rc = CBM_STORE_CANCELLED;
+            break;
+        }
+        int cmp =
+            !base.has_row
+                ? 1
+                : (!target.has_row ? -1 : graph_edge_compare(&base.identity, &target.identity));
+        if (cmp < 0) {
+            out->edges_removed_total++;
+            if (callback && !callback(progress->context, false, &base.identity)) {
+                rc = CBM_STORE_CALLBACK_ERR;
+                break;
+            }
+            rc = graph_edge_cursor_step(base_store, &base);
+        } else if (cmp > 0) {
+            out->edges_added_total++;
+            if (callback && !callback(progress->context, true, &target.identity)) {
+                rc = CBM_STORE_CALLBACK_ERR;
+                break;
+            }
+            rc = graph_edge_cursor_step(target_store, &target);
+        } else {
+            rc = graph_edge_cursor_step(base_store, &base);
+            if (rc == CBM_STORE_OK) {
+                rc = graph_edge_cursor_step(target_store, &target);
+            }
+        }
+    }
+    sqlite3_finalize(base.stmt);
+    sqlite3_finalize(target.stmt);
+    return rc;
+}
+
+static bool graph_scan_limit_exceeded(int64_t base_count, int64_t target_count,
+                                      uint64_t scan_limit) {
+    if (base_count < 0 || target_count < 0 || (uint64_t)base_count > scan_limit ||
+        (uint64_t)target_count > scan_limit) {
+        return true;
+    }
+    return (uint64_t)base_count > scan_limit - (uint64_t)target_count;
+}
+
+int cbm_store_compare_graphs(cbm_store_t *base_store, const char *base_project,
+                             cbm_store_t *target_store, const char *target_project,
+                             uint64_t scan_limit, cbm_graph_compare_cancel_fn cancel,
+                             cbm_graph_compare_node_fn on_node, cbm_graph_compare_edge_fn on_edge,
+                             void *context, cbm_graph_compare_result_t *out) {
+    if (!base_store || !target_store || base_store == target_store || !base_project ||
+        !base_project[0] || !target_project || !target_project[0] || scan_limit == 0 || !out) {
+        return CBM_STORE_ERR;
+    }
+    memset(out, 0, sizeof(*out));
+    graph_compare_progress_t progress = {.cancel = cancel, .context = context};
+    if (graph_compare_is_cancelled(&progress)) {
+        return CBM_STORE_CANCELLED;
+    }
+
+    int rc = CBM_STORE_OK;
+    bool base_transaction = false;
+    bool target_transaction = false;
+    int progress_interval = graph_compare_progress_interval();
+    sqlite3_progress_handler(base_store->db, progress_interval, graph_compare_progress, &progress);
+    sqlite3_progress_handler(target_store->db, progress_interval, graph_compare_progress,
+                             &progress);
+
+    rc = exec_sql(base_store, "BEGIN;");
+    if (rc == CBM_STORE_OK) {
+        base_transaction = true;
+        rc = exec_sql(target_store, "BEGIN;");
+    }
+    if (rc == CBM_STORE_OK) {
+        target_transaction = true;
+        rc = graph_capture_project(base_store, base_project, &out->base);
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = graph_capture_project(target_store, target_project, &out->target);
+    }
+    if (rc == CBM_STORE_OK &&
+        (graph_scan_limit_exceeded(out->base.node_count, out->target.node_count, scan_limit) ||
+         graph_scan_limit_exceeded(out->base.edge_count, out->target.edge_count, scan_limit))) {
+        rc = CBM_STORE_SCAN_LIMIT;
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = graph_compare_nodes(base_store, base_project, target_store, target_project, &progress,
+                                 on_node, out);
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = graph_compare_edges(base_store, base_project, target_store, target_project, &progress,
+                                 on_edge, out);
+    }
+    if (rc == CBM_STORE_OK &&
+        (progress.progress_cancelled || graph_compare_is_cancelled(&progress))) {
+        rc = CBM_STORE_CANCELLED;
+    }
+    if (rc != CBM_STORE_OK &&
+        (progress.progress_cancelled || graph_compare_is_cancelled(&progress))) {
+        rc = CBM_STORE_CANCELLED;
+    }
+
+    sqlite3_progress_handler(base_store->db, 0, NULL, NULL);
+    sqlite3_progress_handler(target_store->db, 0, NULL, NULL);
+    if (target_transaction && exec_sql(target_store, "ROLLBACK;") != CBM_STORE_OK &&
+        rc == CBM_STORE_OK) {
+        rc = CBM_STORE_ERR;
+    }
+    if (base_transaction && exec_sql(base_store, "ROLLBACK;") != CBM_STORE_OK &&
+        rc == CBM_STORE_OK) {
+        rc = CBM_STORE_ERR;
+    }
+    if (rc != CBM_STORE_OK) {
+        memset(out, 0, sizeof(*out));
+    }
+    return rc;
+}
+
 /* ── Bulk write ─────────────────────────────────────────────────── */
 
 int cbm_store_begin_bulk(cbm_store_t *s) {
