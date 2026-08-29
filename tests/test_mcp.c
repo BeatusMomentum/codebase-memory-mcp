@@ -5847,6 +5847,489 @@ TEST(tool_manage_adr_rejects_removed_sections_argument) {
     PASS();
 }
 
+/* mode='set_sections' rewrites only the named sections. mode='update' replaces
+ * the whole document, so adding one entry costs a full re-send and every byte
+ * the caller did not mean to touch survives only as well as that round-trip. */
+TEST(tool_manage_adr_set_sections_replaces_only_named) {
+    const char *project = "adr-sec-named";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/adr-sec-named"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_adr_store(st, project, "## PURPOSE\nOriginal purpose.\n\n## STACK\nC."),
+              CBM_STORE_OK);
+
+    /* A section write is a mutation: it must take the per-project lease, or it
+     * runs concurrently with an index through a query-only store handle. */
+    mcp_mutation_guard_probe_t probe = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                                     "{\"project\":\"adr-sec-named\",\"mode\":\"set_sections\","
+                                     "\"section_updates\":{\"PATTERNS\":\"- Pipeline stages.\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "sections_updated"));
+    ASSERT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+    ASSERT_EQ(probe.begin_count, 1);
+    ASSERT_EQ(probe.end_count, 1);
+    ASSERT_STR_EQ(probe.begin_projects[0], project);
+
+    /* The sections nobody named survive verbatim, and the named one landed. */
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &adr), CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr.content);
+    ASSERT_NOT_NULL(strstr(adr.content, "## PURPOSE\nOriginal purpose."));
+    ASSERT_NOT_NULL(strstr(adr.content, "## STACK\nC."));
+    ASSERT_NOT_NULL(strstr(adr.content, "## PATTERNS\n- Pipeline stages."));
+    cbm_store_adr_free(&adr);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* THE reason this shape was chosen over a whole-document append: applying the
+ * same request twice must leave the document byte-identical. An MCP client that
+ * loses a response and retries would silently duplicate an appended chunk. */
+TEST(tool_manage_adr_set_sections_is_idempotent) {
+    const char *project = "adr-sec-idem";
+    const char *request = "{\"project\":\"adr-sec-idem\",\"mode\":\"set_sections\","
+                          "\"section_updates\":{\"PATTERNS\":\"- Pipeline stages.\"}}";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/adr-sec-idem"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_adr_store(st, project, "## PURPOSE\nOriginal purpose.\n\n## STACK\nC."),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr", request);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "sections_updated"));
+    free(resp);
+
+    cbm_adr_t first;
+    memset(&first, 0, sizeof(first));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &first), CBM_STORE_OK);
+    ASSERT_NOT_NULL(first.content);
+    char *after_first = strdup(first.content);
+    ASSERT_NOT_NULL(after_first);
+    cbm_store_adr_free(&first);
+
+    /* Replay the identical request — the lost-response retry. */
+    resp = cbm_mcp_handle_tool(srv, "manage_adr", request);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "sections_updated"));
+    ASSERT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+
+    cbm_adr_t second;
+    memset(&second, 0, sizeof(second));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &second), CBM_STORE_OK);
+    ASSERT_NOT_NULL(second.content);
+    ASSERT_STR_EQ(second.content, after_first);
+    /* And the body is present exactly once, not appended twice. */
+    const char *hit = strstr(second.content, "- Pipeline stages.");
+    ASSERT_NOT_NULL(hit);
+    ASSERT_NULL(strstr(hit + 1, "- Pipeline stages."));
+    cbm_store_adr_free(&second);
+    free(after_first);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* A project with no ADR yet degrades to a plain create rather than erroring:
+ * the store primitive requires an existing row, so the handler seeds one. */
+TEST(tool_manage_adr_set_sections_creates_when_absent) {
+    const char *project = "adr-sec-new";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/adr-sec-new"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                                     "{\"project\":\"adr-sec-new\",\"mode\":\"set_sections\","
+                                     "\"section_updates\":{\"PURPOSE\":\"Only entry.\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "sections_updated"));
+    ASSERT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &adr), CBM_STORE_OK);
+    /* Exact match: a create must not leave a leading separator behind. */
+    ASSERT_STR_EQ(adr.content, "## PURPOSE\nOnly entry.");
+    cbm_store_adr_free(&adr);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* set_sections without section_updates must fail loudly. Falling through to
+ * 'get' would hand a caller that meant to write a success-shaped read — and it
+ * must not take the mutation lease on the way to being rejected. */
+TEST(tool_manage_adr_set_sections_without_updates_errors) {
+    const char *project = "adr-sec-missing";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/adr-sec-missing"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_adr_store(st, project, "## PURPOSE\nUntouched.\n"), CBM_STORE_OK);
+
+    mcp_mutation_guard_probe_t probe = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                                     "{\"project\":\"adr-sec-missing\",\"mode\":\"set_sections\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "missing_section_updates"));
+    ASSERT_NOT_NULL(strstr(resp, "No ADR write was performed"));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NULL(strstr(resp, "adr_hint"));
+    free(resp);
+    ASSERT_EQ(probe.begin_count, 0);
+    ASSERT_EQ(probe.end_count, 0);
+
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &adr), CBM_STORE_OK);
+    ASSERT_STR_EQ(adr.content, "## PURPOSE\nUntouched.\n");
+    cbm_store_adr_free(&adr);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* An empty body would leave a heading with nothing under it — a content
+ * deletion wearing the response shape of an update. A name that cannot survive
+ * a "## NAME" round-trip would scan back as a different heading or as none, so
+ * writing it twice would duplicate it. Both are refused before a store opens. */
+TEST(tool_manage_adr_set_sections_rejects_unwritable_sections) {
+    const char *project = "adr-sec-guards";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/adr-sec-guards"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_adr_store(st, project, "## PURPOSE\nUntouched.\n"), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                                     "{\"project\":\"adr-sec-guards\",\"mode\":\"set_sections\","
+                                     "\"section_updates\":{\"PURPOSE\":\"\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "empty_section_content"));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+
+    /* A '#'-leading name would render "## # PURPOSE" and scan back different. */
+    resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                               "{\"project\":\"adr-sec-guards\",\"mode\":\"set_sections\","
+                               "\"section_updates\":{\"# PURPOSE\":\"x\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "invalid_section_name"));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+
+    /* A newline in the name would forge a second heading line. */
+    resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                               "{\"project\":\"adr-sec-guards\",\"mode\":\"set_sections\","
+                               "\"section_updates\":{\"A\\nB\":\"x\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "invalid_section_name"));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                               "{\"project\":\"adr-sec-guards\",\"mode\":\"set_sections\","
+                               "\"section_updates\":{}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "invalid_section_updates"));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+
+    /* Every rejection left the stored ADR byte-identical. */
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &adr), CBM_STORE_OK);
+    ASSERT_STR_EQ(adr.content, "## PURPOSE\nUntouched.\n");
+    cbm_store_adr_free(&adr);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* The use case the whole change exists for: add an entry under its own
+ * heading, and be able to retry it. Under the old canonical-only rules this
+ * was the exact request that would have corrupted an ADR. */
+TEST(tool_manage_adr_set_sections_adds_custom_heading) {
+    const char *project = "adr-sec-custom";
+    const char *request = "{\"project\":\"adr-sec-custom\",\"mode\":\"set_sections\","
+                          "\"section_updates\":{\"DECISIONS\":\"- Chose SQLite.\"}}";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/adr-sec-custom"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_adr_store(st, project, "## PURPOSE\nFoo"), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr", request);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "sections_updated"));
+    ASSERT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &adr), CBM_STORE_OK);
+    ASSERT_STR_EQ(adr.content, "## PURPOSE\nFoo\n\n## DECISIONS\n- Chose SQLite.");
+    cbm_store_adr_free(&adr);
+
+    /* Retry the identical request: byte-identical, not duplicated. */
+    resp = cbm_mcp_handle_tool(srv, "manage_adr", request);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "sections_updated"));
+    free(resp);
+
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &adr), CBM_STORE_OK);
+    ASSERT_STR_EQ(adr.content, "## PURPOSE\nFoo\n\n## DECISIONS\n- Chose SQLite.");
+    cbm_store_adr_free(&adr);
+
+    /* And it is now a real section the write path can target again. */
+    resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                               "{\"project\":\"adr-sec-custom\",\"mode\":\"set_sections\","
+                               "\"section_updates\":{\"DECISIONS\":\"- Chose DuckDB.\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "sections_updated"));
+    free(resp);
+
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &adr), CBM_STORE_OK);
+    ASSERT_STR_EQ(adr.content, "## PURPOSE\nFoo\n\n## DECISIONS\n- Chose DuckDB.");
+    cbm_store_adr_free(&adr);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Regression for real data loss: rebuilding the document from parsed sections
+ * dropped the preamble, dropped a mis-cased heading together with its whole
+ * block, and reordered what survived. Splicing leaves all of it alone. */
+TEST(tool_manage_adr_set_sections_preserves_preamble_and_order) {
+    const char *project = "adr-sec-preserve";
+    /* The fenced block sits inside the mis-cased section, NOT the one being
+     * written: a section's body runs to the next heading, so rewriting STACK
+     * would legitimately replace a fence that belonged to STACK. */
+    const char *stored = "Notes before any heading.\n\n"
+                         "## Purpose\nMis-cased but real.\n\n"
+                         "```md\n## Example\nfenced sample\n```\n\n"
+                         "## STACK\nC and SQLite.\n\n"
+                         "## PURPOSE\nCanonical one.";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/adr-sec-preserve"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_adr_store(st, project, stored), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                                     "{\"project\":\"adr-sec-preserve\",\"mode\":\"set_sections\","
+                                     "\"section_updates\":{\"STACK\":\"C only.\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "sections_updated"));
+    free(resp);
+
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &adr), CBM_STORE_OK);
+    ASSERT_STR_EQ(adr.content, "Notes before any heading.\n\n"
+                               "## Purpose\nMis-cased but real.\n\n"
+                               "```md\n## Example\nfenced sample\n```\n\n"
+                               "## STACK\nC only.\n\n"
+                               "## PURPOSE\nCanonical one.");
+    cbm_store_adr_free(&adr);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* An unterminated fence hides every heading after it, so a write would append
+ * a duplicate heading rather than replace the real one. Refuse, explicitly,
+ * and leave the document alone. */
+TEST(tool_manage_adr_set_sections_refuses_unterminated_fence) {
+    const char *project = "adr-sec-fence";
+    const char *stored = "## PURPOSE\nFoo\n\n```\nunclosed sample\n\n## STACK\nBar";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/adr-sec-fence"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_adr_store(st, project, stored), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                                     "{\"project\":\"adr-sec-fence\",\"mode\":\"set_sections\","
+                                     "\"section_updates\":{\"STACK\":\"New bar.\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "write_error"));
+    ASSERT_NOT_NULL(strstr(resp, "code fence"));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &adr), CBM_STORE_OK);
+    ASSERT_STR_EQ(adr.content, stored);
+    cbm_store_adr_free(&adr);
+
+    /* mode='sections' reports the same ambiguity rather than a partial list. */
+    resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                               "{\"project\":\"adr-sec-fence\",\"mode\":\"sections\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "unterminated_code_fence"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* mode='sections' and the section write path must agree on what a heading is.
+ * They used to disagree — 'sections' listed every '#'-prefixed line, including
+ * ones inside code fences that no write could ever target — and two components
+ * disagreeing about what a section is is how a section write came to be able
+ * to destroy one. */
+TEST(tool_manage_adr_sections_agrees_with_write_path) {
+    const char *project = "adr-sec-agree";
+    const char *stored = "Preamble.\n\n"
+                         "# Title\n\n"
+                         "## PURPOSE\nFoo\n\n"
+                         "### Sub\n\n"
+                         "```md\n## Fenced\n```\n\n"
+                         "## DECISIONS\nBar";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/adr-sec-agree"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_adr_store(st, project, stored), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                                     "{\"project\":\"adr-sec-agree\",\"mode\":\"sections\"}");
+    ASSERT_NOT_NULL(resp);
+    /* Listed: exactly the two headings the write path can target. */
+    ASSERT_NOT_NULL(strstr(resp, "## PURPOSE"));
+    ASSERT_NOT_NULL(strstr(resp, "## DECISIONS"));
+    /* Not listed: a fenced '##', a '#' title, a '###' subheading. */
+    ASSERT_NULL(strstr(resp, "## Fenced"));
+    ASSERT_NULL(strstr(resp, "# Title"));
+    ASSERT_NULL(strstr(resp, "### Sub"));
+    free(resp);
+
+    /* Every listed heading is writable, and the unlisted ones stay as text. */
+    resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                               "{\"project\":\"adr-sec-agree\",\"mode\":\"set_sections\","
+                               "\"section_updates\":{\"DECISIONS\":\"New bar\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "sections_updated"));
+    free(resp);
+
+    /* The '#', '###' and fenced lines are body text of PURPOSE, and writing a
+     * different section leaves every byte of them alone. */
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &adr), CBM_STORE_OK);
+    ASSERT_STR_EQ(adr.content, "Preamble.\n\n"
+                               "# Title\n\n"
+                               "## PURPOSE\nFoo\n\n"
+                               "### Sub\n\n"
+                               "```md\n## Fenced\n```\n\n"
+                               "## DECISIONS\nNew bar");
+    cbm_store_adr_free(&adr);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* CBM_ADR_MAX_LENGTH is enforced on this path — mode='update' bypasses it, so
+ * exposing an incremental writer without the cap would make unbounded growth
+ * cheap. The rejected merge must also roll back to the byte-identical prior
+ * document rather than leaving a half-applied write. */
+TEST(tool_manage_adr_set_sections_rejects_oversize) {
+    const char *project = "adr-sec-cap";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/adr-sec-cap"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_adr_store(st, project, "## PURPOSE\nSmall.\n"), CBM_STORE_OK);
+
+    size_t huge_len = (size_t)CBM_ADR_MAX_LENGTH + 100;
+    char *huge = malloc(huge_len + 1);
+    ASSERT_NOT_NULL(huge);
+    memset(huge, 'x', huge_len);
+    huge[huge_len] = '\0';
+
+    size_t args_len = huge_len + 256;
+    char *args = malloc(args_len);
+    ASSERT_NOT_NULL(args);
+    snprintf(args, args_len,
+             "{\"project\":\"adr-sec-cap\",\"mode\":\"set_sections\","
+             "\"section_updates\":{\"STACK\":\"%s\"}}",
+             huge);
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "write_error"));
+    ASSERT_NOT_NULL(strstr(resp, "exceeds"));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+    free(args);
+    free(huge);
+
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &adr), CBM_STORE_OK);
+    ASSERT_STR_EQ(adr.content, "## PURPOSE\nSmall.\n");
+    cbm_store_adr_free(&adr);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* The mode must be advertised, or callers never learn it exists and keep
+ * paying for whole-document rewrites. */
+TEST(tool_manage_adr_set_sections_is_advertised) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}");
+    ASSERT_NOT_NULL(resp);
+    const char *adr_tool = strstr(resp, "manage_adr");
+    ASSERT_NOT_NULL(adr_tool);
+    ASSERT_NOT_NULL(strstr(adr_tool, "set_sections"));
+    ASSERT_NOT_NULL(strstr(adr_tool, "section_updates"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_manage_adr_mutation_guard_balances_success) {
     const char *project = "guard-adr-success";
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
@@ -13163,6 +13646,17 @@ SUITE(mcp) {
     RUN_TEST(tool_manage_adr_get_with_existing_adr);
     RUN_TEST(tool_manage_adr_unified_backend_issue256);
     RUN_TEST(tool_manage_adr_rejects_removed_sections_argument);
+    RUN_TEST(tool_manage_adr_set_sections_replaces_only_named);
+    RUN_TEST(tool_manage_adr_set_sections_is_idempotent);
+    RUN_TEST(tool_manage_adr_set_sections_creates_when_absent);
+    RUN_TEST(tool_manage_adr_set_sections_without_updates_errors);
+    RUN_TEST(tool_manage_adr_set_sections_rejects_unwritable_sections);
+    RUN_TEST(tool_manage_adr_set_sections_adds_custom_heading);
+    RUN_TEST(tool_manage_adr_set_sections_preserves_preamble_and_order);
+    RUN_TEST(tool_manage_adr_set_sections_refuses_unterminated_fence);
+    RUN_TEST(tool_manage_adr_sections_agrees_with_write_path);
+    RUN_TEST(tool_manage_adr_set_sections_rejects_oversize);
+    RUN_TEST(tool_manage_adr_set_sections_is_advertised);
     RUN_TEST(tool_index_repository_reports_store_backed_adr);
     RUN_TEST(tool_index_repository_resolves_root_path_from_project_name_issue1211);
     RUN_TEST(tool_index_repository_unknown_project_name_still_requires_repo_path);

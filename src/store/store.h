@@ -877,6 +877,47 @@ int cbm_adr_validate_content(const char *content, char *errbuf, int errbuf_size)
 int cbm_adr_validate_section_keys(const char **keys, int count, char *errbuf, int errbuf_size);
 void cbm_adr_sections_free(cbm_adr_sections_t *s);
 
+/* ── ADR section headings (the splice model) ────────────────────
+ *
+ * A section write must not rebuild the document. cbm_adr_parse_sections() +
+ * cbm_adr_render() is a lossy model — it drops everything before the first
+ * heading, drops headings it does not recognise, and reorders what is left —
+ * so rebuilding from it silently rewrites text nobody asked to change. These
+ * functions locate a heading's byte span instead, so a write replaces that
+ * span and leaves every other byte of the document exactly as it was.
+ *
+ * A heading is a line of the form "## NAME" that is NOT inside a fenced code
+ * block. NAME is matched EXACTLY, including case: "## Purpose" and
+ * "## PURPOSE" are different sections, because folding them would silently
+ * merge two blocks the author chose to keep apart. The six canonical names
+ * are a convention (see ADR_EMPTY_HINT), not a privilege: any name that
+ * round-trips is a section, and none of them gets ordering priority. */
+typedef struct {
+    const char *name; /* into the source buffer; NOT NUL-terminated */
+    int name_len;
+    size_t heading_start; /* offset of the first '#' of the heading line */
+    size_t body_start;    /* offset just past the heading line's newline */
+    size_t body_end;      /* offset of the next heading, or end of document */
+} cbm_adr_heading_t;
+
+/* Reports every heading in document order. Returns CBM_STORE_ERR without
+ * calling `cb` when the document has an unterminated code fence: its structure
+ * is ambiguous, and guessing could splice into a code sample. */
+int cbm_adr_scan_headings(const char *content, void (*cb)(void *ctx, const cbm_adr_heading_t *h),
+                          void *ctx);
+
+/* CBM_STORE_ERR + message when the document cannot be spliced safely. */
+int cbm_adr_check_structure(const char *content, char *errbuf, int errbuf_size);
+
+/* Replaces the body of `name`, or appends the section when it is absent.
+ * Returns a new document (caller frees), or NULL on bad input, an unterminated
+ * fence, or OOM. Bytes outside the replaced span are preserved exactly, and
+ * splicing the same name and body twice is byte-identical to doing it once. */
+char *cbm_adr_splice_section(const char *content, const char *name, const char *body);
+
+/* Rejects names that could not round-trip through a "## NAME" heading. */
+int cbm_adr_validate_section_name(const char *name, char *errbuf, int errbuf_size);
+
 /* ── Search helpers (exposed for testing) ───────────────────────── */
 
 /* Convert a glob pattern to SQL LIKE pattern. Caller must free result. */
