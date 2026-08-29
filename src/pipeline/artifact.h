@@ -39,6 +39,18 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
  * Returns NULL if no export error is recorded. */
 const char *cbm_artifact_export_last_error(void);
 
+/* Why the most recent cbm_artifact_export on THIS thread did NOT write the
+ * optional "reconcile_basis" marker, or NULL when it did write one. The string
+ * names the failing precondition (head_unresolved / head_not_hex_oid /
+ * tree_not_clean / db_hashes_differ_from_disk) and, for the last of those, the
+ * offending row with both stamps.
+ *
+ * Must be read from the thread that called export and BEFORE anything else
+ * exports on it. It cannot be reconstructed by re-running export: export's own
+ * ensure_gitattributes leaves an untracked .gitattributes behind, so a second
+ * evaluation always answers tree_not_clean regardless of the real cause. */
+const char *cbm_artifact_reconcile_basis_last_blocker(void);
+
 /* Import artifact from .codebase-memory/graph.db.zst to cache_db_path.
  * Decompresses, runs integrity check, recreates indexes.
  * Returns 0 on success, -1 on error. */

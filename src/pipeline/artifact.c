@@ -69,6 +69,18 @@ static const char *itoa_buf(int v) {
     return bufs[i];
 }
 
+/* Same rotating-buffer trick for 64-bit values. mtime_ns does not fit an int,
+ * and a diagnostic that truncates the number it is there to explain is worse
+ * than no diagnostic. */
+static const char *i64_buf(int64_t v) {
+    static _Thread_local char bufs[ART_RING][CBM_SZ_32];
+    static _Thread_local int idx = 0;
+    int i = idx;
+    idx = (idx + ART_NUL) & ART_RING_MASK;
+    snprintf(bufs[i], sizeof(bufs[i]), "%lld", (long long)v);
+    return bufs[i];
+}
+
 const char *cbm_artifact_export_last_error(void) {
     return g_export_error[0] ? g_export_error : NULL;
 }
@@ -517,8 +529,27 @@ static bool reconcile_is_synthetic_row(const char *rel_path) {
  * mtime_ns + size matches the stored stamp. Any stat failure, path overflow,
  * or mismatch makes the artifact untrusted for reconciliation — this is the
  * belt-and-suspenders that catches a stale/swapped DB even when the tree looks
- * clean. */
-static bool db_hashes_match_disk(const char *repo_path, const char *db_path, const char *project) {
+ * clean.
+ *
+ * The disk side MUST be read with cbm_path_info_utf8, because that is the
+ * function that WROTE the rows being compared: the semantic manifest stamps
+ * every row via pipeline_incremental.c's semantic_manifest_hash_file, which
+ * calls cbm_path_info_utf8. On POSIX any lstat-based helper agrees with it,
+ * but on Windows cbm_path_info_utf8 derives mtime_ns from ftLastWriteTime
+ * (100-ns FILETIME ticks) while a _wstat64 st_mtime carries WHOLE SECONDS —
+ * so a seconds-truncated re-stat can only ever equal the stored value when a
+ * file's write time lands exactly on a second boundary. It essentially never
+ * does, which made this check fail for every row on Windows and only on
+ * Windows, suppressing the reconcile_basis marker there. Compare like with
+ * like: same function on both sides, no encoding to keep in sync.
+ *
+ * cbm_path_info_utf8 reports symlinks/reparse points rather than following
+ * them, so the is_symlink/is_regular guard below preserves exactly the
+ * refusal reconcile_stat_no_symlink provides (git tracks a symlink's link
+ * text, not its target's bytes). */
+static bool db_hashes_match_disk(const char *repo_path, const char *db_path, const char *project,
+                                 char *detail, size_t detail_sz) {
+    snprintf(detail, detail_sz, "store_unreadable");
     cbm_store_t *s = cbm_store_open_path(db_path);
     if (!s) {
         return false;
@@ -527,9 +558,11 @@ static bool db_hashes_match_disk(const char *repo_path, const char *db_path, con
     int count = 0;
     bool match = true;
     if (cbm_store_get_file_hashes(s, project, &hashes, &count) != CBM_STORE_OK) {
+        snprintf(detail, detail_sz, "file_hashes_unreadable project=%s", project);
         cbm_store_close(s);
         return false;
     }
+    detail[0] = '\0';
     for (int i = 0; i < count; i++) {
         if (reconcile_is_synthetic_row(hashes[i].rel_path)) {
             continue;
@@ -538,12 +571,29 @@ static bool db_hashes_match_disk(const char *repo_path, const char *db_path, con
         int n = snprintf(abs, sizeof(abs), "%s/%s", repo_path, hashes[i].rel_path);
         if (n < 0 || n >= (int)sizeof(abs)) {
             match = false;
+            snprintf(detail, detail_sz, "path=%s reason=path_too_long", hashes[i].rel_path);
             break;
         }
-        struct stat st;
-        if (reconcile_stat_no_symlink(abs, &st) != 0 ||
-            art_stat_mtime_ns(&st) != hashes[i].mtime_ns || (int64_t)st.st_size != hashes[i].size) {
+        cbm_path_info_t info;
+        if (cbm_path_info_utf8(abs, &info) != 0 || !info.is_regular || info.is_symlink) {
             match = false;
+            snprintf(detail, detail_sz, "path=%s reason=not_a_readable_regular_file",
+                     hashes[i].rel_path);
+            break;
+        }
+        if (info.mtime_ns != hashes[i].mtime_ns || info.size != hashes[i].size) {
+            match = false;
+            /* BOTH stamps are reported: a stale/swapped DB and a stamp-encoding
+             * mismatch look identical at the boolean, and the numbers are the
+             * only thing that separates them on a platform we cannot attach a
+             * debugger to. */
+            snprintf(detail, detail_sz,
+                     "path=%s reason=%s stored_mtime_ns=%s disk_mtime_ns=%s stored_size=%s "
+                     "disk_size=%s",
+                     hashes[i].rel_path,
+                     info.size != hashes[i].size ? "size_differs" : "mtime_differs",
+                     i64_buf(hashes[i].mtime_ns), i64_buf(info.mtime_ns), i64_buf(hashes[i].size),
+                     i64_buf(info.size));
             break;
         }
     }
@@ -578,6 +628,49 @@ static bool read_metadata_reconcile_trusted(const char *repo_path) {
     }
     yyjson_doc_free(doc);
     return trusted;
+}
+
+/* Description of why the last export on THIS thread withheld the clean-basis
+ * marker; empty when it wrote one. See cbm_artifact_reconcile_basis_last_blocker. */
+static _Thread_local char g_basis_blocker[CBM_SZ_512];
+
+const char *cbm_artifact_reconcile_basis_last_blocker(void) {
+    return g_basis_blocker[0] ? g_basis_blocker : NULL;
+}
+
+/* Evaluate export's four clean-basis preconditions, recording the first one
+ * that fails in g_basis_blocker. Returns true iff all four hold.
+ *
+ * Split out of cbm_artifact_export deliberately: as one short-circuiting &&
+ * chain the four gates collapsed into a single bool, and a marker that went
+ * missing on one platform gave no way to tell "HEAD unresolved" from "tree
+ * dirty" from "DB does not match disk" — which is exactly how a Windows-only
+ * stamp-encoding bug hid behind a suspected quoting bug for two diagnoses.
+ * The reason is recorded rather than merely logged so a caller can quote it
+ * verbatim: recomputing it after the fact reports a DIFFERENT gate, because
+ * export's own ensure_gitattributes leaves an untracked .gitattributes behind
+ * and every later evaluation then answers tree_not_clean. */
+static bool reconcile_basis_trusted(const char *repo_path, const char *db_path,
+                                    const char *project_name, const char *commit, bool has_commit) {
+    g_basis_blocker[0] = '\0';
+    if (!has_commit) {
+        snprintf(g_basis_blocker, sizeof(g_basis_blocker), "head_unresolved");
+        return false;
+    }
+    if (!is_hex_oid(commit)) {
+        snprintf(g_basis_blocker, sizeof(g_basis_blocker), "head_not_hex_oid");
+        return false;
+    }
+    if (!tree_clean_for_reconcile(repo_path)) {
+        snprintf(g_basis_blocker, sizeof(g_basis_blocker), "tree_not_clean");
+        return false;
+    }
+    char detail[CBM_SZ_256] = "";
+    if (!db_hashes_match_disk(repo_path, db_path, project_name, detail, sizeof(detail))) {
+        snprintf(g_basis_blocker, sizeof(g_basis_blocker), "db_hashes_differ_from_disk %s", detail);
+        return false;
+    }
+    return true;
 }
 
 /* ── Metadata read/write ─────────────────────────────────────────── */
@@ -951,9 +1044,11 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
      * bootstrap falls back to today's slow-safe full re-parse. */
     char commit[CBM_SZ_64] = "";
     bool has_commit = git_head_hash(repo_path, commit, sizeof(commit));
-    bool reconcile_trusted = has_commit && is_hex_oid(commit) &&
-                             tree_clean_for_reconcile(repo_path) &&
-                             db_hashes_match_disk(repo_path, db_path, project_name);
+    bool reconcile_trusted =
+        reconcile_basis_trusted(repo_path, db_path, project_name, commit, has_commit);
+    if (!reconcile_trusted) {
+        cbm_log_info("artifact.reconcile_basis_omitted", "reason", g_basis_blocker);
+    }
 
     /* Write metadata */
     if (write_metadata(repo_path, project_name, commit, nodes, edges, db_size, (size_t)clen,
@@ -1352,6 +1447,15 @@ static int reconcile_restamp_rows(const char *repo_path, const char *cache_db_pa
         batch[batch_n].project = project_name;
         batch[batch_n].rel_path = stored[i].rel_path;
         batch[batch_n].sha256 = stored[i].sha256;
+        /* art_stat_mtime_ns, NOT cbm_path_info_utf8 (which db_hashes_match_disk
+         * uses): the two disagree on Windows and each side must match ITS OWN
+         * consumer. A restamped row exists to be read by the incremental
+         * classifier (pipeline_incremental.c classify_files) and by
+         * check_index_coverage (mcp.c coverage_path_freshness) — both stat()
+         * the file and encode whole seconds on Windows. Stamping a 100-ns
+         * FILETIME value here would make every restamped row read as changed
+         * there and reconcile would buy nothing. Do not unify these two call
+         * sites without changing those consumers first. */
         batch[batch_n].mtime_ns = art_stat_mtime_ns(&st);
         batch[batch_n].size = (int64_t)st.st_size;
         batch_n++;

@@ -634,10 +634,48 @@ static bool stamp_row_mtime(const char *db, const char *proj, const char *rel, i
     return rc == CBM_STORE_OK;
 }
 
+/* Why the last build_trusted_artifact_repo() call returned NULL. Read by the
+ * BUILD_TRUSTED_REPO_OR_FAIL() call sites.
+ *
+ * A setup helper whose only failure signal is "NULL" is untestable on a
+ * platform nobody can attach to: six distinct exits (git commit, pipeline
+ * construction, pipeline run, marker absence, artifact commit, project-name
+ * derivation) all reported the same thing, and CI could not tell a failed
+ * `git commit` from a missing reconcile_basis marker. Every exit now names
+ * itself and carries the number that decided it. */
+static char g_build_repo_err[4096];
+
+static void build_repo_errf(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_build_repo_err, sizeof(g_build_repo_err), fmt, ap);
+    va_end(ap);
+}
+
+/* Report which of export's four clean-basis preconditions denied the marker.
+ * Read straight from export's recorded blocker rather than recomputed: export's
+ * own ensure_gitattributes leaves an untracked .gitattributes behind, so any
+ * later evaluation answers tree_not_clean whatever the real cause was. Must run
+ * on the thread that ran the pipeline (cbm_pipeline_run exports inline). */
+static void describe_missing_marker(const char *repo) {
+    const char *blocker = cbm_artifact_reconcile_basis_last_blocker();
+    char meta[1152];
+    snprintf(meta, sizeof(meta), "%s/.codebase-memory/artifact.json", repo);
+    struct stat st;
+    build_repo_errf(
+        "step=reconcile_basis: marker absent from %s (artifact.json %s); export blocked by: %s",
+        meta, stat(meta, &st) == 0 ? "present" : "MISSING",
+        blocker ? blocker
+                : "<nothing — export believed it wrote the marker, so the file read here is not "
+                  "the file export wrote>");
+}
+
 /* Build a git repo at g_repo with 5 .rs files, full-index + export (clean tree
  * -> reconcile_basis marker set), and commit .codebase-memory so a clone receives
- * the artifact. Returns the derived project name (caller frees) or NULL. */
+ * the artifact. Returns the derived project name (caller frees) or NULL, with
+ * g_build_repo_err naming the failing step. */
 static char *build_trusted_artifact_repo(void) {
+    g_build_repo_err[0] = '\0';
     git_init(g_repo);
     const char *names[] = {"a.rs", "b.rs", "c.rs", "d.rs", "e.rs"};
     for (int i = 0; i < 5; i++) {
@@ -647,28 +685,57 @@ static char *build_trusted_artifact_repo(void) {
         snprintf(body, sizeof(body), "pub fn f%d() {}\n", i);
         write_text_file(p, body);
     }
-    if (runf("git -C \"%s\" add -A && git -C \"%s\" commit -qm init", g_repo, g_repo) != 0) {
+    int git_rc = runf("git -C \"%s\" add -A && git -C \"%s\" commit -qm init", g_repo, g_repo);
+    if (git_rc != 0) {
+        build_repo_errf("step=commit_sources: `git add -A && git commit -qm init` in %s "
+                        "exited status=%d",
+                        g_repo, git_rc);
         return NULL;
     }
     cbm_pipeline_t *p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
     if (!p) {
+        build_repo_errf("step=pipeline_new: cbm_pipeline_new(repo=%s, db=%s) returned NULL", g_repo,
+                        g_db);
         return NULL;
     }
     cbm_pipeline_set_persistence(p, true);
     int rc = cbm_pipeline_run(p);
     cbm_pipeline_free(p);
     if (rc != 0) {
+        build_repo_errf("step=pipeline_run: cbm_pipeline_run(repo=%s) rc=%d", g_repo, rc);
+        return NULL;
+    }
+    char *project = cbm_project_name_from_path(g_repo);
+    if (!project) {
+        build_repo_errf("step=project_name: cbm_project_name_from_path(%s) returned NULL", g_repo);
         return NULL;
     }
     /* Clean source tree at export -> marker must be present. */
     if (!meta_contains(g_repo, "\"reconcile_basis\"")) {
+        describe_missing_marker(g_repo);
+        free(project);
         return NULL;
     }
-    if (runf("git -C \"%s\" add -A && git -C \"%s\" commit -qm artifact", g_repo, g_repo) != 0) {
+    git_rc = runf("git -C \"%s\" add -A && git -C \"%s\" commit -qm artifact", g_repo, g_repo);
+    if (git_rc != 0) {
+        build_repo_errf("step=commit_artifact: `git add -A && git commit -qm artifact` in %s "
+                        "exited status=%d",
+                        g_repo, git_rc);
+        free(project);
         return NULL;
     }
-    return cbm_project_name_from_path(g_repo);
+    return project;
 }
+
+/* Call-site form: keeps file:line on the failing TEST while printing the step
+ * that actually failed inside the helper. */
+#define BUILD_TRUSTED_REPO_OR_FAIL(var)        \
+    do {                                       \
+        (var) = build_trusted_artifact_repo(); \
+        if (!(var)) {                          \
+            FAIL(g_build_repo_err);            \
+        }                                      \
+    } while (0)
 
 /* Clones g_repo (A) into <tmp>/work/repo (B) so both share the basename "repo"
  * and thus the derived project name — required for artifact bootstrap. */
@@ -708,7 +775,11 @@ TEST(artifact_export_marks_clean_basis) {
     cbm_pipeline_set_persistence(p, true);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     cbm_pipeline_free(p);
-    ASSERT(meta_contains(g_repo, "\"reconcile_basis\""));
+    if (!meta_contains(g_repo, "\"reconcile_basis\"")) {
+        describe_missing_marker(g_repo);
+        free(proj);
+        FAIL(g_build_repo_err);
+    }
 
     /* Dirty the source tree (uncommitted edit). Re-export must omit the marker:
      * the tree is non-clean outside .codebase-memory (and the a.rs hash row no
@@ -724,8 +795,8 @@ TEST(artifact_export_marks_clean_basis) {
 
 TEST(artifact_reconcile_restamps_unchanged) {
     setup_artifact_test();
-    char *proj = build_trusted_artifact_repo();
-    ASSERT_NOT_NULL(proj);
+    char *proj = NULL;
+    BUILD_TRUSTED_REPO_OR_FAIL(proj);
 
     char repoB[1024];
     ASSERT(clone_to_b(repoB, sizeof(repoB)));
@@ -775,8 +846,8 @@ TEST(artifact_reconcile_restamps_unchanged) {
 
 TEST(artifact_reconcile_skips_untracked_rows) {
     setup_artifact_test();
-    char *proj = build_trusted_artifact_repo();
-    ASSERT_NOT_NULL(proj);
+    char *proj = NULL;
+    BUILD_TRUSTED_REPO_OR_FAIL(proj);
     char repoB[1024];
     ASSERT(clone_to_b(repoB, sizeof(repoB)));
 
@@ -822,8 +893,8 @@ TEST(artifact_reconcile_skips_untracked_rows) {
 
 TEST(artifact_reconcile_skips_untrusted_metadata) {
     setup_artifact_test();
-    char *proj = build_trusted_artifact_repo();
-    ASSERT_NOT_NULL(proj);
+    char *proj = NULL;
+    BUILD_TRUSTED_REPO_OR_FAIL(proj);
     char repoB[1024];
     ASSERT(clone_to_b(repoB, sizeof(repoB)));
 
@@ -867,8 +938,8 @@ TEST(artifact_reconcile_skips_untrusted_metadata) {
 
 TEST(artifact_reconcile_skips_unknown_commit) {
     setup_artifact_test();
-    char *proj = build_trusted_artifact_repo();
-    ASSERT_NOT_NULL(proj);
+    char *proj = NULL;
+    BUILD_TRUSTED_REPO_OR_FAIL(proj);
     char repoB[1024];
     ASSERT(clone_to_b(repoB, sizeof(repoB)));
 
@@ -897,8 +968,8 @@ TEST(artifact_reconcile_skips_unknown_commit) {
 
 TEST(artifact_reconcile_skips_non_hex_commit) {
     setup_artifact_test();
-    char *proj = build_trusted_artifact_repo();
-    ASSERT_NOT_NULL(proj);
+    char *proj = NULL;
+    BUILD_TRUSTED_REPO_OR_FAIL(proj);
     char repoB[1024];
     ASSERT(clone_to_b(repoB, sizeof(repoB)));
 
@@ -930,8 +1001,8 @@ TEST(artifact_reconcile_skips_non_hex_commit) {
 
 TEST(artifact_reconcile_skips_without_git) {
     setup_artifact_test();
-    char *proj = build_trusted_artifact_repo();
-    ASSERT_NOT_NULL(proj);
+    char *proj = NULL;
+    BUILD_TRUSTED_REPO_OR_FAIL(proj);
     char repoB[1024];
     ASSERT(clone_to_b(repoB, sizeof(repoB)));
 
