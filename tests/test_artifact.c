@@ -677,7 +677,14 @@ static bool clone_to_b(char *repoB_out, size_t repoB_sz) {
     snprintf(work, sizeof(work), "%s/work", g_tmpdir);
     cbm_mkdir_p(work, 0755);
     snprintf(repoB_out, repoB_sz, "%s/repo", work);
-    return runf("git clone -q \"%s\" \"%s\"", g_repo, repoB_out) == 0;
+    if (runf("git clone -q \"%s\" \"%s\"", g_repo, repoB_out) != 0) {
+        return false;
+    }
+    /* A clone does NOT inherit the source repo's local user config, and CI
+     * runners have no global identity -- `git commit` then exits 128. Set it
+     * on the clone the same way git_init() does for the source repo. */
+    return runf("git -C \"%s\" config user.email t@t.com", repoB_out) == 0 &&
+           runf("git -C \"%s\" config user.name t", repoB_out) == 0;
 }
 
 TEST(artifact_export_marks_clean_basis) {
