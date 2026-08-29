@@ -737,6 +737,7 @@ TEST(contract_chialisp_constant_resolves_across_files) {
         if (src.file_path && strstr(src.file_path, "puzzle.clsp")) {
             cross_file++;
         }
+        cbm_node_free_fields(&src);
     }
     cbm_store_free_edges(edges, nedges);
     cbm_store_free_nodes(consts, nconst);
