@@ -12457,6 +12457,142 @@ TEST(pipeline_ensemble_routing_method_scoping) {
     PASS();
 }
 
+/* #518/#519 item-7 regression: the DELTA merge is the warm path most users
+ * hit. It used to write nodes_fts with a hand-rolled four-column INSERT of
+ * its own; with a fifth `body` column that literal leaves prose NULL for every
+ * node arriving by delta, invisibly — a full reindex still looks perfect.
+ * Routing the write through cbm_store_fts_rebuild() is what this test binds:
+ * revert pipeline_delta.c to a four-column INSERT and it fails. */
+TEST(pipeline_delta_patch_indexes_docstring_into_fts_body) {
+    char *td = th_mktempdir("cbm_delta_fts");
+    ASSERT_NOT_NULL(td);
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/delta.db", td);
+
+    cbm_store_t *store = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(store);
+    const char *proj = "deltafts";
+    ASSERT_EQ(cbm_store_upsert_project(store, proj, td), CBM_STORE_OK);
+
+    /* A previous generation already on disk, so the patch runs against a real
+     * id watermark rather than an empty database. */
+    cbm_node_t existing = {.project = proj,
+                           .label = "Function",
+                           .name = "alreadyThere",
+                           .qualified_name = "deltafts.main.alreadyThere",
+                           .file_path = "main.c"};
+    ASSERT_TRUE(cbm_store_upsert_node(store, &existing) > 0);
+    ASSERT_EQ(cbm_store_fts_rebuild(store, NULL, 0), CBM_STORE_OK);
+
+    /* The delta patch: preseed proxies the resident rows and sets the
+     * watermark, then the NEW node is minted above it. */
+    cbm_gbuf_t *gb = cbm_gbuf_new(proj, td);
+    ASSERT_NOT_NULL(gb);
+    int64_t max_db_id = cbm_delta_preseed(store, proj, gb);
+    ASSERT_TRUE(max_db_id > 0);
+    int64_t new_id = cbm_gbuf_upsert_node(
+        gb, "Section", "Upgrading", "deltafts.README.Upgrading", "README.md", 1, 9,
+        "{\"docstring\":\"migrates the retention ledger before the cutover\"}");
+    ASSERT_TRUE(new_id > max_db_id);
+
+    ASSERT_EQ(cbm_delta_patch(store, proj, gb, max_db_id, NULL, 0), 0);
+    cbm_gbuf_free(gb);
+
+    /* nodes_fts is contentless, so a column-filtered MATCH is the only way to
+     * observe WHICH column a token landed in — and the only assertion that
+     * distinguishes "indexed" from "indexed without its prose". */
+    sqlite3_stmt *st = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store),
+                                 "SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?1", -1, &st,
+                                 NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(st, 1, "body:retention", -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(st), SQLITE_ROW);
+    ASSERT_EQ((long long)sqlite3_column_int64(st, 0), (long long)new_id);
+    ASSERT_EQ(sqlite3_step(st), SQLITE_DONE);
+    sqlite3_finalize(st);
+
+    /* The identifier columns are still written on the same path. */
+    st = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store),
+                                 "SELECT COUNT(*) FROM nodes_fts WHERE nodes_fts MATCH ?1", -1, &st,
+                                 NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(st, 1, "name:Upgrading", -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(st), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(st, 0), 1);
+    sqlite3_finalize(st);
+
+    cbm_store_close(store);
+    th_rmtree(td);
+    PASS();
+}
+
+
+/* End-to-end for #518/#519: source → docstring → properties JSON → nodes_fts
+ * `body` → findable. Each layer has its own test; this one proves they connect.
+ * It is also the guard on the size budget: build_def_props drops an oversized
+ * field ATOMICALLY, so a 500-byte section body that did not fit the 2 KB
+ * properties buffer would vanish silently and every narrower test would still
+ * pass. */
+TEST(pipeline_markdown_and_config_prose_reaches_fts_body) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_prose_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char path[512];
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/prose.db", tmp);
+
+    /* A section body well past the 500-byte cap, so the truncating path — the
+     * one that produces the longest properties JSON — is what gets indexed. */
+    snprintf(path, sizeof(path), "%s/README.md", tmp);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "# Installation\n\nThe phlogiston bootstrap provisions a workstation.\n");
+    for (int i = 0; i < 40; i++) {
+        fprintf(f, "Filler prose line %d that pads the section well past the cap.\n", i);
+    }
+    fclose(f);
+
+    snprintf(path, sizeof(path), "%s/META.yaml", tmp);
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "name: widget\ndescription: Aggregates quicksilver telemetry per shard.\n");
+    fclose(f);
+
+    /* One code file so the run is a normal index rather than a docs-only edge. */
+    snprintf(path, sizeof(path), "%s/main.go", tmp);
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "package main\n\nfunc main() {}\n");
+    fclose(f);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(s);
+    sqlite3_stmt *st = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(s),
+                                 "SELECT COUNT(*) FROM nodes_fts WHERE nodes_fts MATCH ?1", -1, &st,
+                                 NULL),
+              SQLITE_OK);
+    const char *cases[] = {"body:phlogiston", "body:quicksilver"};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        sqlite3_reset(st);
+        sqlite3_bind_text(st, 1, cases[i], -1, SQLITE_TRANSIENT);
+        ASSERT_EQ(sqlite3_step(st), SQLITE_ROW);
+        ASSERT_GT(sqlite3_column_int(st, 0), 0);
+    }
+    sqlite3_finalize(st);
+    cbm_store_close(s);
+
+    th_rmtree(tmp);
+    PASS();
+}
+
 SUITE(pipeline) {
     RUN_TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant);
     /* Index lock */
@@ -12774,6 +12910,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_ensemble_routing_attr_does_not_leak_across_items);
     RUN_TEST(pipeline_ensemble_routing_settings_targets);
     RUN_TEST(pipeline_ensemble_routing_unterminated_item_is_safe);
+    RUN_TEST(pipeline_delta_patch_indexes_docstring_into_fts_body);
+    RUN_TEST(pipeline_markdown_and_config_prose_reaches_fts_body);
 }
 
 /* Focused semantic-manifest and publication contracts. Kept separate from the

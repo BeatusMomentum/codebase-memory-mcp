@@ -2951,6 +2951,25 @@ enum {
     BM25_INNER_LIMIT = 2000,
 };
 
+/* Column weights for nodes_fts (name, qualified_name, label, file_path, body).
+ * The four identifier columns stay at parity; prose sits well below them.
+ * FTS5 applies these to per-column term frequency BEFORE the tf-saturation
+ * term, which is what makes the weighting BM25F-correct rather than a post-hoc
+ * rescale. 0.3 is the findability-favouring end of the field weighting the IR
+ * literature settles on for body text (typical title:body ratios run 3:1 to
+ * 10:1): a prose-only hit still surfaces, but never outranks a node whose
+ * IDENTIFIER matches.
+ *
+ * Defined once and used by BOTH the ranked query and the count query — they
+ * share an inner candidate window, so different weights would silently
+ * desynchronise the reported total from the rows returned.
+ *
+ * Safe against a legacy four-column nodes_fts: FTS5's bm25() reads a weight
+ * only when an instance actually lands in that column (`nVal > ic`), so the
+ * fifth weight is simply never consulted on a table that has no fifth
+ * column. */
+#define BM25_WEIGHTS "bm25(nodes_fts, 1.0, 1.0, 1.0, 1.0, 0.3)"
+
 /* Module-local SQLITE_TRANSIENT wrapper to dodge performance-no-int-to-ptr.
  * See the matching helper in src/store/store.c for the same pattern. */
 static sqlite3_destructor_type mcp_sqlite_transient(void) {
@@ -3046,7 +3065,7 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
      * matches, this causes multi-minute queries.
      *
      * The fix: let FTS5 drive the inner subquery alone.  SQLite CAN early-terminate
-     *   SELECT rowid, bm25(nodes_fts) FROM nodes_fts WHERE MATCH ? ORDER BY bm25() LIMIT N
+     *   SELECT rowid, bm25(nodes_fts,...) FROM nodes_fts WHERE MATCH ? ORDER BY bm25() LIMIT N
      * because no outer predicate blocks it.  We fetch BM25_INNER_LIMIT top candidates
      * from the FTS5 index, then join/filter/boost only those rows.  bm25() returns a
      * NEGATIVE score (lower = more relevant). */
@@ -3061,13 +3080,18 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         "               WHEN n.label IN (" CBM_SQL_RELATION_LABELS ") THEN 5.0 "
         "               ELSE 0.0 END) AS rank "
         "FROM ("
-        "    SELECT rowid, bm25(nodes_fts) AS base_rank"
+        "    SELECT rowid, " BM25_WEIGHTS " AS base_rank"
         "    FROM nodes_fts WHERE nodes_fts MATCH ?1"
         "    ORDER BY base_rank LIMIT ?5"
         ") fts "
         "JOIN nodes n ON n.id = fts.rowid "
         "WHERE n.project = ?2 "
-        "  AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project') "
+        /* Section and Module are NO LONGER excluded (#518/#519): they are the
+         * labels that carry prose — a Markdown section's body, a config file's
+         * description — so excluding them made the body column unreachable.
+         * This exclusion list is MIRRORED in the count query below; the two
+         * must be changed together or results desynchronise from counts. */
+        "  AND n.label NOT IN ('File','Folder','Variable','Project') "
         "  AND (?6 IS NULL OR n.file_path LIKE ?6) "
         /* rank ties are common (boosted floats) — the id tie-break makes
          * offset pages contractually stable across calls. */
@@ -3094,17 +3118,19 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
      * Uses the identical subquery structure so the FTS5 early-exit applies here too. */
     int total = 0;
     {
-        const char *count_sql =
-            "SELECT COUNT(*) FROM ("
-            "    SELECT fts.rowid FROM ("
-            "        SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?1"
-            "        ORDER BY bm25(nodes_fts) LIMIT ?3"
-            "    ) fts "
-            "    JOIN nodes n ON n.id = fts.rowid "
-            "    WHERE n.project = ?2 "
-            "      AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project')"
-            "      AND (?6 IS NULL OR n.file_path LIKE ?6)"
-            ")";
+        const char *count_sql = "SELECT COUNT(*) FROM ("
+                                "    SELECT fts.rowid FROM ("
+                                "        SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?1"
+                                "        ORDER BY " BM25_WEIGHTS " LIMIT ?3"
+                                "    ) fts "
+                                "    JOIN nodes n ON n.id = fts.rowid "
+                                "    WHERE n.project = ?2 "
+                                /* MIRRORS the ranked query's filter verbatim — same weights, same
+                                 * label exclusions. Changing one alone reports a total that does
+                                 * not describe the rows returned. */
+                                "      AND n.label NOT IN ('File','Folder','Variable','Project')"
+                                "      AND (?6 IS NULL OR n.file_path LIKE ?6)"
+                                ")";
         sqlite3_stmt *cs = NULL;
         if (sqlite3_prepare_v2(db, count_sql, BM25_SQL_AUTO_LEN, &cs, NULL) == SQLITE_OK) {
             sqlite3_bind_text(cs, BM25_BIND_QUERY, fts_query, BM25_SQL_AUTO_LEN,
