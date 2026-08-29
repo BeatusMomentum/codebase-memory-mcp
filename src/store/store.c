@@ -8900,6 +8900,44 @@ static void adr_find_cb(void *ctx, const cbm_adr_heading_t *h) {
     f->body_end = h->body_end;
 }
 
+/* The line ending this code should WRITE into `doc`: whichever of "\r\n" and
+ * "\n" the document already uses more often, LF on a tie or an empty document.
+ * Lines that already exist are never rewritten — this decides only the
+ * separator and the "## NAME" line an append adds, so a CRLF document does not
+ * acquire a stray bare newline nobody asked for. */
+static const char *adr_dominant_eol(const char *doc, size_t doc_len) {
+    size_t crlf = 0;
+    size_t lf = 0;
+    for (size_t i = 0; i < doc_len; i++) {
+        if (doc[i] != '\n') {
+            continue;
+        }
+        if (i > 0 && doc[i - SKIP_ONE] == '\r') {
+            crlf++;
+        } else {
+            lf++;
+        }
+    }
+    return crlf > lf ? "\r\n" : "\n";
+}
+
+/* Trailing line breaks, counting a "\r\n" PAIR as ONE break. Counting raw '\n'
+ * characters gets the count right but loses the shape, and the separator that
+ * is then appended has to match the ending it is continuing. */
+static size_t adr_trailing_breaks(const char *doc, size_t doc_len) {
+    size_t idx = doc_len;
+    size_t breaks = 0;
+    while (idx > 0 && (doc[idx - SKIP_ONE] == '\n' || doc[idx - SKIP_ONE] == '\r')) {
+        bool was_lf = doc[idx - SKIP_ONE] == '\n';
+        idx--;
+        if (was_lf && idx > 0 && doc[idx - SKIP_ONE] == '\r') {
+            idx--;
+        }
+        breaks++;
+    }
+    return breaks;
+}
+
 char *cbm_adr_splice_section(const char *content, const char *name, const char *body) {
     if (!name || !body) {
         return NULL;
@@ -8951,37 +8989,40 @@ char *cbm_adr_splice_section(const char *content, const char *name, const char *
         return out;
     }
 
-    /* Absent: append. Enough newlines are added to leave exactly one blank
+    /* Absent: append. Enough line breaks are added to leave exactly one blank
      * line before the new heading — never fewer, and never rewriting the
-     * newlines the document already ends with. */
-    size_t trailing = 0;
-    while (trailing < doc_len && doc[doc_len - SKIP_ONE - trailing] == '\n') {
-        trailing++;
-    }
+     * breaks the document already ends with. Both the separator and the
+     * heading line use the document's OWN ending: counting raw '\n' here would
+     * drop a bare newline into a CRLF document, leaving it mixed. */
+    const char *eol = adr_dominant_eol(doc, doc_len);
+    size_t eol_len = strlen(eol);
+    size_t breaks = adr_trailing_breaks(doc, doc_len);
     size_t sep = 0;
-    if (doc_len > 0 && trailing < PAIR_LEN) {
-        sep = PAIR_LEN - trailing;
+    if (doc_len > 0 && breaks < PAIR_LEN) {
+        sep = PAIR_LEN - breaks;
     }
     size_t name_len = strlen(name);
-    size_t total = doc_len + sep + ST_HEADER_PREFIX + name_len + SKIP_ONE + body_len;
+    size_t total = doc_len + (sep * eol_len) + ST_HEADER_PREFIX + name_len + eol_len + body_len;
     out = malloc(total + SKIP_ONE);
     if (!out) {
         return NULL;
     }
-    size_t at = 0;
+    size_t cursor = 0;
     memcpy(out, doc, doc_len);
-    at += doc_len;
+    cursor += doc_len;
     for (size_t i = 0; i < sep; i++) {
-        out[at++] = '\n';
+        memcpy(out + cursor, eol, eol_len);
+        cursor += eol_len;
     }
-    memcpy(out + at, "## ", ST_HEADER_PREFIX);
-    at += ST_HEADER_PREFIX;
-    memcpy(out + at, name, name_len);
-    at += name_len;
-    out[at++] = '\n';
-    memcpy(out + at, body, body_len);
-    at += body_len;
-    out[at] = '\0';
+    memcpy(out + cursor, "## ", ST_HEADER_PREFIX);
+    cursor += ST_HEADER_PREFIX;
+    memcpy(out + cursor, name, name_len);
+    cursor += name_len;
+    memcpy(out + cursor, eol, eol_len);
+    cursor += eol_len;
+    memcpy(out + cursor, body, body_len);
+    cursor += body_len;
+    out[cursor] = '\0';
     return out;
 }
 

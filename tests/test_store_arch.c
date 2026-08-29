@@ -1011,6 +1011,103 @@ TEST(adr_splice_preserves_untouched_bytes) {
     PASS();
 }
 
+/* Line endings. Every other ADR fixture in this file uses \n, so nothing
+ * exercised a CRLF-stored document — and CI could not have caught that,
+ * because the fixtures are LF whichever platform runs them.
+ *
+ * The exposure is specific to splicing: the old rebuild normalised everything
+ * on the way out, so ending confusion was invisible. A byte-span replacement
+ * can cut mid-"\r\n" or miscount a separator run, and byte-identity is the
+ * property this design exists to provide.
+ *
+ * Contract: bytes that already exist are never rewritten, so each line keeps
+ * whatever ending it had. Text this code writes itself — the separator before
+ * an appended section and the "## NAME" line — follows the document's majority
+ * ending, LF on a tie. A caller's body is inserted verbatim; rewriting the
+ * bytes a caller supplied would be the same silent modification this whole
+ * change removes. */
+TEST(adr_splice_preserves_line_endings) {
+    /* CRLF throughout: untouched bytes keep their \r\n. */
+    CHECK_SPLICE("## PURPOSE\r\nFoo\r\n\r\n## STACK\r\nBar", "STACK", "New bar",
+                 "## PURPOSE\r\nFoo\r\n\r\n## STACK\r\nNew bar");
+
+    /* The separator run before the next heading survives as CRLF, not as the
+     * two bare newlines a naive walk-back would leave. */
+    CHECK_SPLICE("## A\r\nx\r\n\r\n## B\r\ny", "A", "z", "## A\r\nz\r\n\r\n## B\r\ny");
+
+    /* A trailing CRLF on the document is preserved as CRLF. */
+    CHECK_SPLICE("## A\r\nx\r\n", "A", "z", "## A\r\nz\r\n");
+
+    /* Appending to a CRLF document writes CRLF — a bare \n here would leave a
+     * mixed document that neither the author nor the tool asked for. */
+    CHECK_SPLICE("## PURPOSE\r\nFoo", "DECISIONS", "- New.",
+                 "## PURPOSE\r\nFoo\r\n\r\n## DECISIONS\r\n- New.");
+
+    /* One existing trailing break means one more is added, counting \r\n as a
+     * single break rather than as two characters. */
+    CHECK_SPLICE("## PURPOSE\r\nFoo\r\n", "DECISIONS", "- New.",
+                 "## PURPOSE\r\nFoo\r\n\r\n## DECISIONS\r\n- New.");
+
+    /* A document already ending in a CRLF blank line gains no extra break. */
+    CHECK_SPLICE("## PURPOSE\r\nFoo\r\n\r\n", "DECISIONS", "- New.",
+                 "## PURPOSE\r\nFoo\r\n\r\n## DECISIONS\r\n- New.");
+
+    /* LF documents are unaffected by any of the above. */
+    CHECK_SPLICE("## PURPOSE\nFoo\n", "DECISIONS", "- New.",
+                 "## PURPOSE\nFoo\n\n## DECISIONS\n- New.");
+    PASS();
+}
+
+/* Mixed endings are what real files become through editors and merges. Lines
+ * that already exist keep their own endings; the majority decides only what
+ * this code writes itself. */
+TEST(adr_splice_mixed_line_endings) {
+    /* Majority CRLF (2 of 3) -> the appended block is CRLF, and the one bare
+     * LF line in the middle is left exactly as it was. */
+    CHECK_SPLICE("## PURPOSE\r\nFoo\nBar\r\n", "DECISIONS", "- New.",
+                 "## PURPOSE\r\nFoo\nBar\r\n\r\n## DECISIONS\r\n- New.");
+
+    /* Majority LF (2 of 3) -> the appended block is LF, and the lone CRLF line
+     * survives untouched. */
+    CHECK_SPLICE("## PURPOSE\nFoo\r\nBar\n", "DECISIONS", "- New.",
+                 "## PURPOSE\nFoo\r\nBar\n\n## DECISIONS\n- New.");
+
+    /* A tie falls to LF. */
+    CHECK_SPLICE("## PURPOSE\r\nFoo\n", "DECISIONS", "- New.",
+                 "## PURPOSE\r\nFoo\n\n## DECISIONS\n- New.");
+
+    /* Replacing a section in a mixed document rewrites nothing around it. */
+    CHECK_SPLICE("## PURPOSE\r\nFoo\n\n## STACK\nBar\r\n", "STACK", "New",
+                 "## PURPOSE\r\nFoo\n\n## STACK\nNew\r\n");
+    PASS();
+}
+
+/* "## PURPOSE\r\n" must locate exactly as "## PURPOSE\n" does. The scanner
+ * trims \r from heading names, but trimming and matching are different claims
+ * and only one of them was pinned. */
+TEST(adr_splice_matches_headings_across_line_endings) {
+    adr_name_collect_t c;
+    memset(&c, 0, sizeof(c));
+    ASSERT_EQ(cbm_adr_scan_headings("## PURPOSE\r\nFoo\r\n\r\n## STACK\r\nBar",
+                                    adr_collect_names, &c),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(c.buf, "[PURPOSE][STACK]");
+
+    /* A fenced block with CRLF still hides its heading, and still closes. */
+    memset(&c, 0, sizeof(c));
+    ASSERT_EQ(cbm_adr_scan_headings("## PURPOSE\r\nFoo\r\n\r\n```md\r\n## Example\r\n```"
+                                    "\r\n\r\n## STACK\r\nBar",
+                                    adr_collect_names, &c),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(c.buf, "[PURPOSE][STACK]");
+
+    /* And an unterminated CRLF fence is still refused. */
+    char errbuf[256];
+    ASSERT_TRUE(cbm_adr_check_structure("## PURPOSE\r\nFoo\r\n\r\n```\r\nopen\r\n", errbuf,
+                                        sizeof(errbuf)) != CBM_STORE_OK);
+    PASS();
+}
+
 /* The original use case: add an entry under its own heading. */
 TEST(adr_splice_appends_arbitrary_heading) {
     CHECK_SPLICE("## PURPOSE\nFoo", "DECISIONS", "- Chose SQLite.",
@@ -1620,6 +1717,9 @@ SUITE(store_arch) {
     RUN_TEST(adr_validate_keys_accepts_arbitrary_names);
     RUN_TEST(adr_validate_keys_rejects_unroundtrippable);
     RUN_TEST(adr_splice_preserves_untouched_bytes);
+    RUN_TEST(adr_splice_preserves_line_endings);
+    RUN_TEST(adr_splice_mixed_line_endings);
+    RUN_TEST(adr_splice_matches_headings_across_line_endings);
     RUN_TEST(adr_splice_appends_arbitrary_heading);
     RUN_TEST(adr_splice_is_idempotent);
     RUN_TEST(adr_splice_matches_case_exactly);
