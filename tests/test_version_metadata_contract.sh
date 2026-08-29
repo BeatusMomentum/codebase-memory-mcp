@@ -65,12 +65,18 @@ fail() {
 # a user can actually fetch.
 newest_tag=""
 if git rev-parse --git-dir >/dev/null 2>&1; then
+    # `|| true` is load-bearing: under pipefail a tagless clone makes grep exit
+    # 1, and set -e would kill the contract HERE — exiting non-zero with no
+    # output at all, in exactly the venue (a --no-tags CI checkout) where this
+    # gate most needs to say what it could and could not verify.
     newest_tag=$(
-        git tag -l 'v*' 2>/dev/null |
-            grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
-            sed 's/^v//' |
-            sort -t. -k1,1n -k2,2n -k3,3n |
-            tail -1
+        {
+            git tag -l 'v*' 2>/dev/null |
+                grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
+                sed 's/^v//' |
+                sort -t. -k1,1n -k2,2n -k3,3n |
+                tail -1
+        } || true
     )
 fi
 
