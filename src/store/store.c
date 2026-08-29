@@ -8708,46 +8708,323 @@ int cbm_adr_validate_content(const char *content, char *errbuf, int errbuf_size)
     return CBM_STORE_OK;
 }
 
-int cbm_adr_validate_section_keys(const char **keys, int count, char *errbuf, int errbuf_size) {
-    char invalid[CBM_SZ_256] = "";
-    int ilen = 0;
-    int ninvalid = 0;
+/* ── ADR heading scanning and splicing ──────────────────────────── */
 
-    /* Collect and sort invalid keys */
-    const char *inv_keys[ST_MAX_SECTIONS];
-    int inv_n = 0;
-    for (int i = 0; i < count; i++) {
-        if (!is_canonical_section(keys[i])) {
-            if (inv_n < ST_BUF_16) {
-                inv_keys[inv_n++] = keys[i];
+/* Length of a code-fence run (``` or ~~~, after at most three spaces of
+ * indent), or 0 when the line does not open or close a fence. */
+static int adr_fence_run(const char *line, int line_len, char *ch_out) {
+    int i = 0;
+    while (i < line_len && i < ST_HEADER_PREFIX && line[i] == ' ') {
+        i++;
+    }
+    if (i >= line_len || (line[i] != '`' && line[i] != '~')) {
+        return 0;
+    }
+    char c = line[i];
+    int n = 0;
+    while (i + n < line_len && line[i + n] == c) {
+        n++;
+    }
+    if (n < ST_HEADER_PREFIX) {
+        return 0;
+    }
+    *ch_out = c;
+    return n;
+}
+
+/* True when the line is a closing fence for an open run of `open_n` `open_ch`:
+ * same character, at least as long, and nothing but whitespace after it. */
+static bool adr_fence_closes(const char *line, int line_len, char open_ch, int open_n) {
+    char ch = 0;
+    int n = adr_fence_run(line, line_len, &ch);
+    if (n == 0 || ch != open_ch || n < open_n) {
+        return false;
+    }
+    int i = 0;
+    while (i < line_len && line[i] != open_ch) {
+        i++;
+    }
+    i += n;
+    while (i < line_len) {
+        if (line[i] != ' ' && line[i] != '\t' && line[i] != '\r') {
+            return false;
+        }
+        i++;
+    }
+    return true;
+}
+
+/* Name length of a "## NAME" heading line, or 0 when it is not a heading.
+ * "###" fails on the third '#', so deeper markdown headings are body text. */
+static int adr_heading_name_len(const char *line, int line_len) {
+    if (line_len <= ST_HEADER_PREFIX || line[0] != '#' || line[SKIP_ONE] != '#' ||
+        line[PAIR_LEN] != ' ') {
+        return 0;
+    }
+    int len = line_len - ST_HEADER_PREFIX;
+    const char *name = line + ST_HEADER_PREFIX;
+    while (len > 0 && (name[len - SKIP_ONE] == ' ' || name[len - SKIP_ONE] == '\t' ||
+                       name[len - SKIP_ONE] == '\r')) {
+        len--;
+    }
+    /* A leading space would not survive a render/scan round-trip. */
+    if (len == 0 || name[0] == ' ' || name[0] == '\t') {
+        return 0;
+    }
+    return len;
+}
+
+/* True when the document leaves a code fence open. Such a document cannot be
+ * spliced: every heading after the opener is hidden, so an update would append
+ * a duplicate heading instead of replacing the existing one. */
+static bool adr_has_unterminated_fence(const char *content) {
+    const char *p = content;
+    bool in_fence = false;
+    char fence_ch = 0;
+    int fence_n = 0;
+    while (p && *p) {
+        const char *eol = strchr(p, '\n');
+        int line_len = eol ? (int)(eol - p) : (int)strlen(p);
+        if (in_fence) {
+            if (adr_fence_closes(p, line_len, fence_ch, fence_n)) {
+                in_fence = false;
+            }
+        } else {
+            char ch = 0;
+            int n = adr_fence_run(p, line_len, &ch);
+            if (n > 0) {
+                in_fence = true;
+                fence_ch = ch;
+                fence_n = n;
             }
         }
-    }
-    /* Sort alphabetically */
-    for (int i = SKIP_ONE; i < inv_n; i++) {
-        int j = i;
-        while (j > 0 && strcmp(inv_keys[j], inv_keys[j - SKIP_ONE]) < 0) {
-            const char *tmp = inv_keys[j];
-            inv_keys[j] = inv_keys[j - SKIP_ONE];
-            inv_keys[j - SKIP_ONE] = tmp;
-            j--;
+        if (!eol) {
+            break;
         }
+        p = eol + SKIP_ONE;
     }
+    return in_fence;
+}
 
-    for (int i = 0; i < inv_n; i++) {
-        if (ilen > 0) {
-            ilen += snprintf(invalid + ilen, sizeof(invalid) - ilen, ", ");
-        }
-        ilen += snprintf(invalid + ilen, sizeof(invalid) - ilen, "%s", inv_keys[i]);
-        ninvalid++;
+int cbm_adr_scan_headings(const char *content, void (*cb)(void *ctx, const cbm_adr_heading_t *h),
+                          void *ctx) {
+    if (!content || !cb) {
+        return content ? CBM_STORE_ERR : CBM_STORE_OK;
     }
-
-    if (ninvalid > 0) {
-        snprintf(errbuf, errbuf_size,
-                 "invalid section names: %s. Valid sections: PURPOSE, STACK, ARCHITECTURE, "
-                 "PATTERNS, TRADEOFFS, PHILOSOPHY",
-                 invalid);
+    if (adr_has_unterminated_fence(content)) {
         return CBM_STORE_ERR;
+    }
+
+    cbm_adr_heading_t pending;
+    memset(&pending, 0, sizeof(pending));
+    bool have_pending = false;
+    bool in_fence = false;
+    char fence_ch = 0;
+    int fence_n = 0;
+
+    const char *p = content;
+    while (*p) {
+        const char *eol = strchr(p, '\n');
+        int line_len = eol ? (int)(eol - p) : (int)strlen(p);
+        size_t line_off = (size_t)(p - content);
+
+        if (in_fence) {
+            if (adr_fence_closes(p, line_len, fence_ch, fence_n)) {
+                in_fence = false;
+            }
+        } else {
+            char ch = 0;
+            int fn = adr_fence_run(p, line_len, &ch);
+            if (fn > 0) {
+                in_fence = true;
+                fence_ch = ch;
+                fence_n = fn;
+            } else {
+                int name_len = adr_heading_name_len(p, line_len);
+                if (name_len > 0) {
+                    /* The previous heading's body ends where this one starts. */
+                    if (have_pending) {
+                        pending.body_end = line_off;
+                        cb(ctx, &pending);
+                    }
+                    pending.name = p + ST_HEADER_PREFIX;
+                    pending.name_len = name_len;
+                    pending.heading_start = line_off;
+                    pending.body_start =
+                        eol ? line_off + (size_t)line_len + SKIP_ONE : line_off + (size_t)line_len;
+                    have_pending = true;
+                }
+            }
+        }
+        if (!eol) {
+            break;
+        }
+        p = eol + SKIP_ONE;
+    }
+    if (have_pending) {
+        pending.body_end = strlen(content);
+        cb(ctx, &pending);
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_adr_check_structure(const char *content, char *errbuf, int errbuf_size) {
+    if (content && adr_has_unterminated_fence(content)) {
+        snprintf(errbuf, (size_t)errbuf_size,
+                 "the stored ADR leaves a code fence open, so its section boundaries are "
+                 "ambiguous and a section write could splice into a code sample; repair it "
+                 "with mode='update'");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+typedef struct {
+    const char *name;
+    int name_len;
+    bool found;
+    size_t body_start;
+    size_t body_end;
+} adr_find_ctx_t;
+
+static void adr_find_cb(void *ctx, const cbm_adr_heading_t *h) {
+    adr_find_ctx_t *f = (adr_find_ctx_t *)ctx;
+    /* First occurrence wins, so a document that repeats a heading updates
+     * deterministically rather than depending on scan order. */
+    if (f->found || h->name_len != f->name_len ||
+        memcmp(h->name, f->name, (size_t)f->name_len) != 0) {
+        return;
+    }
+    f->found = true;
+    f->body_start = h->body_start;
+    f->body_end = h->body_end;
+}
+
+char *cbm_adr_splice_section(const char *content, const char *name, const char *body) {
+    if (!name || !body) {
+        return NULL;
+    }
+    const char *doc = content ? content : "";
+    size_t doc_len = strlen(doc);
+
+    /* Trailing newlines are stripped from the incoming body so that splicing
+     * the same body twice is byte-identical: without this the separator run
+     * would grow by one blank line on every repeat. */
+    size_t body_len = strlen(body);
+    while (body_len > 0 &&
+           (body[body_len - SKIP_ONE] == '\n' || body[body_len - SKIP_ONE] == '\r')) {
+        body_len--;
+    }
+
+    adr_find_ctx_t find;
+    memset(&find, 0, sizeof(find));
+    find.name = name;
+    find.name_len = (int)strlen(name);
+    if (cbm_adr_scan_headings(doc, adr_find_cb, &find) != CBM_STORE_OK) {
+        return NULL;
+    }
+
+    char *out = NULL;
+    if (find.found) {
+        /* Keep the replaced region's own trailing newline run, so the blank
+         * line that separates this section from the next survives untouched. */
+        size_t ws = find.body_end;
+        while (ws > find.body_start && (doc[ws - SKIP_ONE] == '\n' || doc[ws - SKIP_ONE] == '\r')) {
+            ws--;
+        }
+        size_t ws_len = find.body_end - ws;
+        size_t total = find.body_start + body_len + ws_len + (doc_len - find.body_end);
+        out = malloc(total + SKIP_ONE);
+        if (!out) {
+            return NULL;
+        }
+        size_t at = 0;
+        memcpy(out, doc, find.body_start);
+        at += find.body_start;
+        memcpy(out + at, body, body_len);
+        at += body_len;
+        memcpy(out + at, doc + ws, ws_len);
+        at += ws_len;
+        memcpy(out + at, doc + find.body_end, doc_len - find.body_end);
+        at += doc_len - find.body_end;
+        out[at] = '\0';
+        return out;
+    }
+
+    /* Absent: append. Enough newlines are added to leave exactly one blank
+     * line before the new heading — never fewer, and never rewriting the
+     * newlines the document already ends with. */
+    size_t trailing = 0;
+    while (trailing < doc_len && doc[doc_len - SKIP_ONE - trailing] == '\n') {
+        trailing++;
+    }
+    size_t sep = 0;
+    if (doc_len > 0 && trailing < PAIR_LEN) {
+        sep = PAIR_LEN - trailing;
+    }
+    size_t name_len = strlen(name);
+    size_t total = doc_len + sep + ST_HEADER_PREFIX + name_len + SKIP_ONE + body_len;
+    out = malloc(total + SKIP_ONE);
+    if (!out) {
+        return NULL;
+    }
+    size_t at = 0;
+    memcpy(out, doc, doc_len);
+    at += doc_len;
+    for (size_t i = 0; i < sep; i++) {
+        out[at++] = '\n';
+    }
+    memcpy(out + at, "## ", ST_HEADER_PREFIX);
+    at += ST_HEADER_PREFIX;
+    memcpy(out + at, name, name_len);
+    at += name_len;
+    out[at++] = '\n';
+    memcpy(out + at, body, body_len);
+    at += body_len;
+    out[at] = '\0';
+    return out;
+}
+
+int cbm_adr_validate_section_name(const char *name, char *errbuf, int errbuf_size) {
+    if (!name || !name[0]) {
+        snprintf(errbuf, (size_t)errbuf_size, "section name must not be empty");
+        return CBM_STORE_ERR;
+    }
+    size_t len = strlen(name);
+    if (len >= CBM_SZ_64) {
+        snprintf(errbuf, (size_t)errbuf_size, "section name must be shorter than %d characters",
+                 CBM_SZ_64);
+        return CBM_STORE_ERR;
+    }
+    /* Everything below would make the written "## NAME" line scan back as a
+     * different heading, or as no heading at all. */
+    if (name[0] == '#') {
+        snprintf(errbuf, (size_t)errbuf_size, "section name must not start with '#': %s", name);
+        return CBM_STORE_ERR;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (name[i] == '\n' || name[i] == '\r') {
+            snprintf(errbuf, (size_t)errbuf_size, "section name must not contain a line break");
+            return CBM_STORE_ERR;
+        }
+    }
+    if (name[0] == ' ' || name[0] == '\t' || name[len - SKIP_ONE] == ' ' ||
+        name[len - SKIP_ONE] == '\t') {
+        snprintf(errbuf, (size_t)errbuf_size,
+                 "section name must not start or end with whitespace: '%s'", name);
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_adr_validate_section_keys(const char **keys, int count, char *errbuf, int errbuf_size) {
+    /* Section names used to be restricted to the six canonical headings. They
+     * are now a convention rather than a privilege, so the only names refused
+     * are the ones that could not round-trip through a "## NAME" line. */
+    for (int i = 0; i < count; i++) {
+        if (cbm_adr_validate_section_name(keys[i], errbuf, errbuf_size) != CBM_STORE_OK) {
+            return CBM_STORE_ERR;
+        }
     }
     return CBM_STORE_OK;
 }
@@ -8906,35 +9183,32 @@ int cbm_store_adr_update_sections(cbm_store_t *s, const char *project, const cha
         return rc;
     }
 
-    /* Parse existing sections */
-    cbm_adr_sections_t sections = cbm_adr_parse_sections(existing.content);
-    cbm_store_adr_free(&existing);
-
-    /* Merge new sections */
-    for (int i = 0; i < count; i++) {
-        bool found = false;
-        for (int j = 0; j < sections.count; j++) {
-            if (strcmp(sections.keys[j], keys[i]) == 0) {
-                free(sections.values[j]);
-                sections.values[j] = heap_strdup(values[i]);
-                found = true;
-                break;
-            }
-        }
-        if (!found && sections.count < ST_BUF_16) {
-            sections.keys[sections.count] = heap_strdup(keys[i]);
-            sections.values[sections.count] = heap_strdup(values[i]);
-            sections.count++;
-        }
+    /* Splice each section in place. The document is NOT rebuilt from parsed
+     * sections: that model drops the preamble, drops headings it does not
+     * recognise (including a mis-cased '## Purpose', whose whole block then
+     * disappears) and reorders the rest, so rendering from it would silently
+     * rewrite text nobody asked to change. Replacing byte spans leaves every
+     * untouched byte exactly as it was. */
+    char structure_err[CBM_SZ_256] = "";
+    if (cbm_adr_check_structure(existing.content, structure_err, (int)sizeof(structure_err)) !=
+        CBM_STORE_OK) {
+        cbm_store_adr_free(&existing);
+        (void)cbm_store_rollback(s);
+        store_set_error(s, structure_err);
+        return CBM_STORE_ERR;
     }
 
-    /* Render merged */
-    char *merged = cbm_adr_render(&sections);
-    cbm_adr_sections_free(&sections);
+    char *merged = heap_strdup(existing.content ? existing.content : "");
+    cbm_store_adr_free(&existing);
+    for (int i = 0; merged && i < count; i++) {
+        char *next = cbm_adr_splice_section(merged, keys[i], values[i]);
+        free(merged);
+        merged = next;
+    }
 
     if (!merged) {
         (void)cbm_store_rollback(s);
-        store_set_error(s, "failed to render merged ADR");
+        store_set_error(s, "failed to splice ADR section");
         return CBM_STORE_ERR;
     }
 

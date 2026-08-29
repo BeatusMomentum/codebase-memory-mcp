@@ -713,12 +713,11 @@ static const tool_def_t TOOLS[] = {
      "document byte-identical, so retrying after a lost response is safe); sections only lists "
      "existing headings\"},\"content\":{\"type\":\"string\",\"description\":\"Complete replacement "
      "document required by update\"},\"section_updates\":{\"type\":\"object\",\"description\":"
-     "\"Required by set_sections: section name -> new body for that section. Only the six "
-     "canonical sections exist; any other name is rejected.\",\"properties\":{"
-     "\"PURPOSE\":{\"type\":\"string\"},\"STACK\":{\"type\":\"string\"},"
-     "\"ARCHITECTURE\":{\"type\":\"string\"},\"PATTERNS\":{\"type\":\"string\"},"
-     "\"TRADEOFFS\":{\"type\":\"string\"},\"PHILOSOPHY\":{\"type\":\"string\"}},"
-     "\"additionalProperties\":false}},\"additionalProperties\":false,"
+     "\"Required by set_sections: section name -> new body for that section. Any heading name "
+     "works, so a new entry can be added under its own heading; PURPOSE, STACK, ARCHITECTURE, "
+     "PATTERNS, TRADEOFFS and PHILOSOPHY are the conventional ones. Names match exactly, "
+     "including case, so 'Purpose' and 'PURPOSE' are different sections.\","
+     "\"additionalProperties\":{\"type\":\"string\"}}},\"additionalProperties\":false,"
      "\"required\":[\"project\"]}"},
 
     {"ingest_traces", "Ingest traces", "Ingest runtime traces to enhance the knowledge graph",
@@ -11763,31 +11762,33 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
 
 /* ── manage_adr ───────────────────────────────────────────────── */
 
-/* ADR "sections" mode: list markdown headers ('#'-prefixed lines) from the
- * ADR content string. */
+typedef struct {
+    yyjson_mut_doc *doc;
+    yyjson_mut_val *arr;
+} adr_sections_ctx_t;
+
+static void adr_sections_cb(void *ctx, const cbm_adr_heading_t *h) {
+    adr_sections_ctx_t *c = (adr_sections_ctx_t *)ctx;
+    char hdr[CBM_SZ_1K];
+    snprintf(hdr, sizeof(hdr), "## %.*s", h->name_len, h->name);
+    yyjson_mut_arr_add_strcpy(c->doc, c->arr, hdr);
+}
+
+/* ADR "sections" mode: list the section headings of the ADR.
+ *
+ * This uses cbm_adr_scan_headings(), the SAME classifier the section-write
+ * path splices with. It used to list any '#'-prefixed line, so a '## Foo' in
+ * prose — or inside a fenced code block — was reported as a section that no
+ * write could target. Two components disagreeing about what a section is was
+ * how a section write came to be able to destroy one. */
 static void adr_list_sections_from_content(yyjson_mut_doc *doc, yyjson_mut_val *root_obj,
                                            const char *content) {
     yyjson_mut_val *sections = yyjson_mut_arr(doc);
-    const char *p = content;
-    while (p && *p) {
-        const char *eol = strchr(p, '\n');
-        size_t linelen = eol ? (size_t)(eol - p) : strlen(p);
-        while (linelen > 0 && p[linelen - SKIP_ONE] == '\r') {
-            linelen--;
-        }
-        if (linelen > 0 && p[0] == '#') {
-            char hdr[CBM_SZ_1K];
-            if (linelen >= sizeof(hdr)) {
-                linelen = sizeof(hdr) - SKIP_ONE;
-            }
-            memcpy(hdr, p, linelen);
-            hdr[linelen] = '\0';
-            yyjson_mut_arr_add_strcpy(doc, sections, hdr);
-        }
-        if (!eol) {
-            break;
-        }
-        p = eol + SKIP_ONE;
+    adr_sections_ctx_t ctx = {doc, sections};
+    if (content && cbm_adr_scan_headings(content, adr_sections_cb, &ctx) != CBM_STORE_OK) {
+        /* The ambiguity that refuses a section write is reported here too,
+         * rather than answering with a heading list that is quietly partial. */
+        yyjson_mut_obj_add_str(doc, root_obj, "sections_status", "unterminated_code_fence");
     }
     yyjson_mut_obj_add_val(doc, root_obj, "sections", sections);
 }
@@ -12011,12 +12012,12 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     char section_key_err[CBM_SZ_256] = "";
     if (set_sections_mode) {
         updates = adr_parse_section_updates(args);
-        /* Only the six canonical names are writable, and that is a correctness
-         * constraint rather than a house style: adr_try_section_header() parses
-         * ONLY canonical headers, so a '## FOO' written here would be read back
-         * as body text of the section above it and a second identical write
-         * would append a duplicate — destroying exactly the idempotence this
-         * mode exists to provide. */
+        /* Any heading name is writable — the canonical six are a convention,
+         * not a privilege. What is still refused is a name that could not
+         * round-trip through a "## NAME" line (empty, '#'-leading, newline- or
+         * edge-whitespace-bearing, over-long): such a name would scan back as
+         * a different heading or as none, so a second identical write would
+         * append a duplicate instead of being a no-op. */
         if (!updates.status && cbm_adr_validate_section_keys(
                                    (const char **)updates.keys, updates.count, section_key_err,
                                    (int)sizeof(section_key_err)) != CBM_STORE_OK) {
