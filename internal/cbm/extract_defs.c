@@ -6962,6 +6962,13 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
             continue;
         }
 
+        /* Go: `_` is the blank identifier, used for explicit struct padding in
+         * generated code. It is not a referenceable field, and emitting it gives
+         * every `_` in the repository a same-named node to collide with. */
+        if (ctx->language == CBM_LANG_GO && strcmp(name, "_") == 0) {
+            continue;
+        }
+
         const char *field_qn = cbm_arena_sprintf(a, "%s.%s", class_qn, name);
 
         CBMDefinition def;
