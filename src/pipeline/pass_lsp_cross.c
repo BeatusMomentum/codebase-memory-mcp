@@ -423,8 +423,8 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
  * so scanning the file's own defs covers every case. Runs inside
  * cbm_pxc_collect_all_defs — one site covers both the prebuilt-registry path
  * and the per-file fallback, since both consume all_defs. */
-static void pxc_fold_go_struct_fields(CBMArena *arena, const CBMFileResult *result,
-                                      CBMLSPDef *defs, int start, int end) {
+static void pxc_fold_go_struct_fields(CBMArena *arena, const CBMFileResult *result, CBMLSPDef *defs,
+                                      int start, int end) {
     if (!arena || !result || !defs || start >= end) {
         return;
     }
