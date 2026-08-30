@@ -839,6 +839,26 @@ TEST(cross_language_ref_drops_go_vs_c) {
     PASS();
 }
 
+TEST(go_bare_ref_never_binds_field) {
+    /* #1942: a bare (dot-less) Go reference can never denote a struct field —
+     * field access is always a selector expression. */
+    ASSERT_TRUE(cbm_go_suppress_bare_field_ref(true, "err", "Field"));
+    ASSERT_TRUE(cbm_go_suppress_bare_field_ref(true, "config", "Field"));
+    /* A selector-shaped reference may bind a field. */
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "t.err", "Field"));
+    /* Bare references to non-fields are untouched. */
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "err", "Variable"));
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "err", "Function"));
+    /* Other languages reference their own members bare inside methods —
+     * never suppressed (cp_reads_writes_cs_static_field pins the C# shape). */
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(false, "_count", "Field"));
+    /* Degenerate inputs → nothing to judge. */
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, NULL, "Field"));
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "", "Field"));
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "err", NULL));
+    PASS();
+}
+
 TEST(dynamic_suppress_drops_weak_method_matches) {
     /* #592/#606/#1276: a member call whose receiver the LSP could not type, that
      * landed via a WEAK short-name strategy, is generic-resolver noise → drop.
@@ -974,6 +994,7 @@ SUITE(registry) {
     RUN_TEST(perl_suppress_keeps_high_confidence_and_genuine_calls);
     RUN_TEST(cross_language_suffix_match_drops_py_vs_js);
     RUN_TEST(cross_language_ref_drops_go_vs_c);
+    RUN_TEST(go_bare_ref_never_binds_field);
     RUN_TEST(dynamic_suppress_drops_weak_method_matches);
     RUN_TEST(dynamic_suppress_keeps_high_confidence_and_non_methods);
 }

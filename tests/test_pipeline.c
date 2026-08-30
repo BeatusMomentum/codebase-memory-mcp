@@ -4832,6 +4832,108 @@ TEST(pipeline_go_rw_usage_never_cross_into_c_parallel) {
     PASS();
 }
 
+static int count_nodes_named(cbm_store_t *s, const char *project, const char *name);
+
+/* Fixture for the #1942 bare-reference-vs-Field probes: a Go struct field
+ * named like the commonest local (`err`), and a function whose local of the
+ * same name must NOT bind it — in Go a field is only reachable through a
+ * selector expression, never a bare identifier. Needs Go Field extraction
+ * (#1935) to have anything to falsely bind. */
+static void write_go_bare_field_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "go.mod", "module example.com/fxbare\n\ngo 1.22\n");
+    write_temp_file(tmp, "state/state.go",
+                    "package state\n"
+                    "\n"
+                    "type Tracker struct {\n"
+                    "\terr error\n"
+                    "\tn   int\n"
+                    "}\n");
+    write_temp_file(tmp, "app/app.go",
+                    "package app\n"
+                    "\n"
+                    "import \"errors\"\n"
+                    "\n"
+                    "func Run() error {\n"
+                    "\terr := errors.New(\"x\")\n"
+                    "\treturn err\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/filler%d.go", i);
+        snprintf(body, sizeof(body), "package pad\n\nfunc filler%d() int { return %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+TEST(pipeline_go_bare_ref_never_binds_field) {
+    /* #1942: the READS/WRITES resolvers and the USAGE registry fallback hand
+     * bare reference text to the short-name registry, which contains Field
+     * nodes — so every Go local `err := …` bound whichever struct field was
+     * named err (21308 USAGE / 5191 WRITES onto Go fields on the measured
+     * repo, top target a test struct's field collecting 3013 edges).
+     * Sequential-path twin; the parallel twin follows. */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_bare_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_go_bare_field_fixture(tmp, 0);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_bare.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* The field must exist for the probe to mean anything (#1935's fix). */
+    ASSERT_TRUE(count_nodes_named(s, project, "err") >= 1);
+    /* Reproduce-first: RED before the fix — the bare local binds the field. */
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "WRITES"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "READS"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "USAGE"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_go_bare_ref_never_binds_field_parallel) {
+    /* Parallel twin: resolve_file_rw / resolve_file_usages are independent
+     * resolvers and must consult the same predicate (#1928's lesson). */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_barep_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_go_bare_field_fixture(tmp, 52);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_barep.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_TRUE(count_nodes_named(s, project, "err") >= 1);
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "WRITES"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "READS"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "USAGE"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Count nodes with the given exact name in the project (e.g. a Route path). */
 static int count_nodes_named(cbm_store_t *s, const char *project, const char *name) {
     cbm_node_t *ns = NULL;
@@ -12951,6 +13053,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c_parallel);
+    RUN_TEST(pipeline_go_bare_ref_never_binds_field);
+    RUN_TEST(pipeline_go_bare_ref_never_binds_field_parallel);
     RUN_TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges);
     RUN_TEST(pipeline_python_receiver_parallel_suppresses_weak_method_edges);
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
