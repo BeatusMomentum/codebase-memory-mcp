@@ -288,6 +288,14 @@ bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *st
 bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const char *target_file_path,
                                               const char *strategy);
 
+/* #1928: USAGE/WRITES/READS analog of the CALLS guard above. Reference edges
+ * resolved by the short-name registry carry no import-closure evidence, so a
+ * cross-language binding is a bare-name collision for EVERY strategy — drop
+ * it whenever the caller's language and the target file's language disagree
+ * (JS/TS family members and the C/C++ header family excepted). Pure;
+ * unit-tested in test_registry.c. */
+bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target_file_path);
+
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);
 

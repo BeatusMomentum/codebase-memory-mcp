@@ -469,6 +469,13 @@ static bool js_ts_family(CBMLanguage lang) {
            lang == CBM_LANG_ARKTS;
 }
 
+/* C and C++ are one family for cross-language checks: .h maps to CBM_LANG_CPP
+ * in the extension table, so a .c file referencing a symbol declared in its
+ * own header would otherwise read as a language boundary. */
+static bool c_cpp_family(CBMLanguage lang) {
+    return lang == CBM_LANG_C || lang == CBM_LANG_CPP;
+}
+
 static const char *path_basename(const char *path) {
     if (!path || !path[0]) {
         return path;
@@ -503,6 +510,37 @@ bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const cha
         return false;
     }
     if (js_ts_family(caller_lang) && js_ts_family(target_lang)) {
+        return false;
+    }
+    return true;
+}
+
+bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target_file_path) {
+    /* #1928: USAGE / WRITES / READS analog of the CALLS guard above. A
+     * variable or field reference resolved by the short-name registry must
+     * not cross a language boundary: unlike CALLS, a reference edge carries
+     * no import-closure evidence at all — a Go test's local `event` and an
+     * eBPF C probe's automatic `event` share nothing but the spelling, so
+     * EVERY registry strategy is a bare-name guess here and none is exempt.
+     * LSP-backed semantic references resolve before the registry fallback
+     * and never reach this predicate, which is where a genuine cross-language
+     * binding (a future cgo resolver) would live. The JS/TS family keeps its
+     * exemption (.js/.ts/.d.ts pairs legitimately share symbols), and C/C++
+     * count as one family (.h maps to CBM_LANG_CPP). */
+    if (caller_lang == CBM_LANG_COUNT || !target_file_path || !target_file_path[0]) {
+        return false;
+    }
+    CBMLanguage target_lang = cbm_language_for_filename(path_basename(target_file_path));
+    if (target_lang == CBM_LANG_COUNT) {
+        return false;
+    }
+    if (caller_lang == target_lang) {
+        return false;
+    }
+    if (js_ts_family(caller_lang) && js_ts_family(target_lang)) {
+        return false;
+    }
+    if (c_cpp_family(caller_lang) && c_cpp_family(target_lang)) {
         return false;
     }
     return true;
