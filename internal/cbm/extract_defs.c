@@ -4780,6 +4780,20 @@ static TSNode find_class_member_body(TSNode class_node, CBMLanguage lang) {
     return ts_node_is_null(declarations) ? body : declarations;
 }
 
+/* Go structs keep their field_declaration nodes one level below the body that
+ * find_class_body() returns: type_spec's `type` child is a struct_type whose
+ * only named child is a field_declaration_list. Interfaces need no such step --
+ * interface_type holds its method specs directly, which is why interface members
+ * extracted correctly while every struct field was silently skipped. Normalize
+ * here, the same way the Java enum_body_declarations step above does. */
+static TSNode go_normalize_struct_body(TSNode body) {
+    if (ts_node_is_null(body) || strcmp(ts_node_type(body), "struct_type") != 0) {
+        return body;
+    }
+    TSNode list = cbm_find_child_by_kind(body, "field_declaration_list");
+    return ts_node_is_null(list) ? body : list;
+}
+
 // Dart: resolve method name from method_signature/function_signature.
 static TSNode resolve_dart_method_name(TSNode child, const char *ck) {
     if (strcmp(ck, "method_signature") == 0) {
@@ -6656,6 +6670,9 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
     }
 
     TSNode body = find_class_member_body(class_node, ctx->language);
+    if (ctx->language == CBM_LANG_GO) {
+        body = go_normalize_struct_body(body);
+    }
     if (ts_node_is_null(body)) {
         return;
     }
@@ -6942,6 +6959,13 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
 
         char *name = cbm_node_text(a, name_node, ctx->source);
         if (!name || !name[0]) {
+            continue;
+        }
+
+        /* Go: `_` is the blank identifier, used for explicit struct padding in
+         * generated code. It is not a referenceable field, and emitting it gives
+         * every `_` in the repository a same-named node to collide with. */
+        if (ctx->language == CBM_LANG_GO && strcmp(name, "_") == 0) {
             continue;
         }
 
