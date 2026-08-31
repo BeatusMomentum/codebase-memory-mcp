@@ -3282,6 +3282,7 @@ static cbm_gbuf_t *run_go_field_chain_sequential(const char *project, const char
         cbm_free_result(cache[i]);
     }
     free(cache);
+    harness_ctx_free_tables(&ctx);
     cbm_registry_free(reg);
     if (ctx.seq_cross_arena_live) {
         cbm_arena_destroy(&ctx.seq_cross_arena);
