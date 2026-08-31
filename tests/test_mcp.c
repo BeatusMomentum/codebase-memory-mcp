@@ -1339,9 +1339,9 @@ static int issue403_initialize_count_calls(const char *session_root, bool approv
     cbm_setenv("CBM_CACHE_DIR", cache, 1);
 
     char err[1024];
-    bool approved = !approve_sensitive ||
-                    cbm_workspace_grant_add(cache, cbm_workspace_home_dir(), session_root, true,
-                                            err, sizeof(err));
+    bool approved =
+        !approve_sensitive || cbm_workspace_grant_add(cache, cbm_workspace_home_dir(), session_root,
+                                                      true, err, sizeof(err));
     cbm_config_t *cfg = approved ? cbm_config_open(cache) : NULL;
     cbm_mcp_server_t *srv = cfg ? cbm_mcp_server_new(NULL) : NULL;
     int calls = -2;
@@ -1371,8 +1371,8 @@ static int issue403_initialize_count_calls(const char *session_root, bool approv
 }
 
 TEST(mcp_issue403_sensitive_root_stops_before_discovery_count) {
-    int sensitive = issue403_initialize_count_calls(
-        "C:/Users/dev/AppData/Local/Programs/Antigravity", false);
+    int sensitive =
+        issue403_initialize_count_calls("C:/Users/dev/AppData/Local/Programs/Antigravity", false);
     int ordinary = issue403_initialize_count_calls("C:/Users/dev/projects/app", false);
     ASSERT_EQ(sensitive, 0);
     ASSERT_EQ(ordinary, 1);
@@ -1490,9 +1490,9 @@ TEST(server_handle_analysis_profile_filters_and_rejects_mutators) {
     resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":220,\"method\":\"tools/list\"}");
     ASSERT_NOT_NULL(resp);
     static const char *const analysis_tools[] = {
-        "search_graph",     "query_graph",      "trace_path",           "get_code_snippet",
-        "get_file_outline", "get_graph_schema", "compare_graphs",       "get_architecture",
-        "search_code",      "list_projects",    "index_status",         "check_index_coverage",
+        "search_graph",     "query_graph",      "trace_path",     "get_code_snippet",
+        "get_file_outline", "get_graph_schema", "compare_graphs", "get_architecture",
+        "search_code",      "list_projects",    "index_status",   "check_index_coverage",
         "detect_changes",
     };
     ASSERT_EQ(mcp_response_tool_count(resp), sizeof(analysis_tools) / sizeof(analysis_tools[0]));

@@ -825,9 +825,9 @@ static void mcp_add_tool_def(yyjson_mut_doc *doc, yyjson_mut_val *tools, int i) 
 
 static bool mcp_tool_allowed(cbm_mcp_tool_profile_t profile, const char *name) {
     static const char *const analysis_tools[] = {
-        "search_graph",     "query_graph",      "trace_path",           "get_code_snippet",
-        "get_file_outline", "get_graph_schema", "compare_graphs",       "get_architecture",
-        "search_code",      "list_projects",    "index_status",         "check_index_coverage",
+        "search_graph",     "query_graph",      "trace_path",     "get_code_snippet",
+        "get_file_outline", "get_graph_schema", "compare_graphs", "get_architecture",
+        "search_code",      "list_projects",    "index_status",   "check_index_coverage",
         "detect_changes",
     };
     static const char *const scout_tools[] = {
