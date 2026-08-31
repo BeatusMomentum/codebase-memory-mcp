@@ -382,6 +382,9 @@ static bool runtime_test_copy_executable(const char *source, const char *destina
     return ok;
 }
 
+/* PATH must be a copy of this runner: the child runs the
+ * __cbm_runtime_image_holder mode, which blocks reading the release pipe
+ * wired to its stdin. */
 static pid_t runtime_test_spawn_blocked_executable(const char *path, int *release_fd_out) {
     int ready[2] = {-1, -1};
     int input[2] = {-1, -1};
@@ -427,7 +430,7 @@ static pid_t runtime_test_spawn_blocked_executable(const char *path, int *releas
     if (input[0] != STDIN_FILENO) {
         (void)posix_spawn_file_actions_addclose(&actions, input[0]);
     }
-    char *const child_argv[] = {(char *)path, NULL};
+    char *const child_argv[] = {(char *)path, "__cbm_runtime_image_holder", NULL};
     pid_t child = -1;
     if (posix_spawn(&child, path, &actions, NULL, child_argv, environ) != 0) {
         child = -1;
@@ -4518,10 +4521,20 @@ TEST(daemon_runtime_process_fingerprint_never_hashes_replacement_path) {
     int replacement_written =
         setup ? snprintf(replacement_path, sizeof(replacement_path), "%s/replacement", directory)
               : -1;
+    /* The copied image is this runner in holder mode, not a system utility:
+     * a multi-call coreutils /bin/cat (uutils) prints "unknown program" and
+     * exits when executed under the copied name. */
     setup = setup && image_written > 0 && image_written < (int)sizeof(image_path) &&
             replacement_written > 0 && replacement_written < (int)sizeof(replacement_path) &&
-            runtime_test_copy_executable("/bin/cat", image_path) &&
-            runtime_test_copy_executable("/bin/echo", replacement_path);
+            runtime_test_copy_self_image(image_path);
+
+    FILE *replacement_file = setup ? cbm_fopen(replacement_path, "wb") : NULL;
+    bool replacement_written_ok =
+        replacement_file && fputs("cbm-posix-replacement-image", replacement_file) >= 0;
+    if (replacement_file) {
+        replacement_written_ok = fclose(replacement_file) == 0 && replacement_written_ok;
+    }
+    setup = setup && replacement_written_ok;
 
     char original[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
     char replacement[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
