@@ -2660,6 +2660,11 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             if (tgt && cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
                 continue;
             }
+            /* #1942: a bare Go reference can never denote a struct field. */
+            if (tgt &&
+                cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, usage->ref_name, tgt->label)) {
+                continue;
+            }
             if (usage->semantic_reference_blocked && (usage->semantic_reference_local_shadow ||
                                                       cbm_pipeline_node_is_callable_target(tgt))) {
                 continue;
@@ -2743,6 +2748,10 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
          * let it bind a read/write across a language boundary. Mirrors the
          * sequential twin (pass_usages.c). */
         if (cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
+            continue;
+        }
+        /* #1942: a bare Go reference can never denote a struct field. */
+        if (cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, rw->var_name, tgt->label)) {
             continue;
         }
         const char *etype = rw->is_write ? "WRITES" : "READS";

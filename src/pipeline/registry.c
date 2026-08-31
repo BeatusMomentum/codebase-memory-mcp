@@ -546,6 +546,24 @@ bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target
     return true;
 }
 
+bool cbm_go_suppress_bare_field_ref(bool is_go, const char *ref_name, const char *target_label) {
+    /* #1942: a bare (dot-less) Go reference can never denote a struct field —
+     * field access is always a selector expression (x.f), and selector
+     * references resolve through the LSP join, never through the bare-name
+     * registry fallback. Every Field-targeted reference edge in the field
+     * census carried dot-less text, so dropping the bind loses nothing real.
+     * Go-gated: a C#/Java/C++/Python method body legitimately references its
+     * own members bare (cp_reads_writes_cs_static_field pins that shape as
+     * required), so a global veto would break those languages. */
+    if (!is_go || !ref_name || !ref_name[0] || !target_label) {
+        return false;
+    }
+    if (strcmp(target_label, "Field") != 0) {
+        return false;
+    }
+    return strchr(ref_name, '.') == NULL;
+}
+
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
 cbm_registry_t *cbm_registry_new(void) {
