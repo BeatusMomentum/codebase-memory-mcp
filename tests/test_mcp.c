@@ -1437,13 +1437,37 @@ TEST(server_handle_tools_list_defaults_to_all_tools_and_accepts_cursor) {
     ASSERT_NOT_NULL(strstr(resp, "ingest_traces"));
     free(resp);
 
-    resp = cbm_mcp_server_handle(
-        srv,
-        "{\"jsonrpc\":\"2.0\",\"id\":201,\"method\":\"tools/list\",\"params\":{\"cursor\":\"8\"}}");
+    /* A cursored page advertises nextCursor exactly while tools remain after
+     * it. This used to pass the literal cursor "8", which silently encoded
+     * "there are at most MCP_TOOLS_PAGE_SIZE * 2 tools" -- so registering a
+     * 17th tool broke it for a reason that had nothing to do with pagination.
+     * Derive the offset from the live count instead: the final page, wherever
+     * it falls, is the one that must not advertise more. */
+    resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":203,\"method\":\"tools/list\"}");
+    ASSERT_NOT_NULL(resp);
+    size_t total_tools = mcp_response_tool_count(resp);
+    free(resp);
+    ASSERT_TRUE(total_tools > 1U);
+
+    char last_page_req[160];
+    snprintf(last_page_req, sizeof(last_page_req),
+             "{\"jsonrpc\":\"2.0\",\"id\":201,\"method\":\"tools/list\","
+             "\"params\":{\"cursor\":\"%zu\"}}",
+             total_tools - 1U);
+    resp = cbm_mcp_server_handle(srv, last_page_req);
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"id\":201"));
     ASSERT_NULL(strstr(resp, "\"nextCursor\""));
-    ASSERT_NOT_NULL(strstr(resp, "manage_adr"));
+    ASSERT_EQ(mcp_response_tool_count(resp), 1U);
+    free(resp);
+
+    /* ...and a page that does have tools after it MUST advertise the cursor,
+     * so the assertion above cannot pass merely because paging never emits. */
+    resp = cbm_mcp_server_handle(
+        srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":204,\"method\":\"tools/list\",\"params\":{\"cursor\":\"0\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"nextCursor\""));
     free(resp);
 
     cbm_mcp_server_free(srv);
