@@ -25,6 +25,7 @@ enum { REG_MAX_CANDIDATES = 256 };
 
 #define DEFAULT_CONFIDENCE 0.5
 #include "pipeline/pipeline.h"
+#include "cbm.h"               /* cbm_label_is_relation — the resolve-time relation veto */
 #include "foundation/compat.h" /* CBM_TLS */
 #include "foundation/hash_table.h"
 #include "foundation/dyn_array.h"
@@ -428,19 +429,27 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
     return true; /* weak short-name match (suffix_match / unique_name / …) → drop */
 }
 
-/* TS/JS analogue of the Perl guard above (#592/#606 direction; precedent #477).
- * A member call `x.foo()` reaches the weak textual cascade ONLY when the TS-LSP
- * could not resolve the receiver type — type-resolved calls win via lsp_*
- * strategies before the registry runs. Binding such a call to a project symbol
- * by a weak short-name strategy fabricates a CALLS edge (`re.test()` ->
- * SalesforceRestClient.test, `date.toISOString()` -> any project toISOString).
- * Drop ONLY the weak strategies; keep import/same-module/qualified-tail matches
- * and every lsp_* strategy. Uses an EXPLICIT drop-list (not keep-list +
- * default-drop) because the parallel resolver runs lsp_* strategies through the
- * same guard variable — a default-drop would silently kill lsp_ts_method. Pure
- * + side-effect-free so the contract is unit-testable without a full pipeline. */
-bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const char *strategy) {
-    if (!is_tsjs || !is_method || !strategy || !strategy[0]) {
+/* Dynamic-language analogue of the Perl guard above (#592/#606/#1276
+ * direction; precedent #477). A member call `x.foo()` reaches the weak textual
+ * cascade ONLY when the language's LSP could not resolve the receiver type —
+ * type-resolved calls win via lsp_* strategies before the registry runs.
+ * Binding such a call to a project symbol by a weak short-name strategy
+ * fabricates a CALLS edge (`re.test()` -> SalesforceRestClient.test,
+ * `accelerator.print()` -> MockAccelerator.print). Drop ONLY the weak
+ * strategies; keep import/same-module/qualified-tail matches and every lsp_*
+ * strategy. Uses an EXPLICIT drop-list (not keep-list + default-drop) because
+ * the parallel resolver runs lsp_* strategies through the same guard variable —
+ * a default-drop would silently kill lsp_ts_method. Pure + side-effect-free so
+ * the contract is unit-testable without a full pipeline.
+ *
+ * `enabled` is the CALLER's per-language gate, deliberately kept OUT of this
+ * helper: the guard applies only to the language set each call site enumerates
+ * (today Python plus the JS/TS family including ArkTS). Widening it is a
+ * per-language decision made at the call sites in pass_calls.c and
+ * pass_parallel.c, which MUST stay in lockstep — a gate added to only one of
+ * them diverges the sequential and parallel resolvers. */
+bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *strategy) {
+    if (!enabled || !is_method || !strategy || !strategy[0]) {
         return false;
     }
     /* Weak short-name strategies that actually reach the call-resolution guards:
@@ -456,7 +465,15 @@ bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const cha
 }
 
 static bool js_ts_family(CBMLanguage lang) {
-    return lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
+    return lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
+           lang == CBM_LANG_ARKTS;
+}
+
+/* C and C++ are one family for cross-language checks: .h maps to CBM_LANG_CPP
+ * in the extension table, so a .c file referencing a symbol declared in its
+ * own header would otherwise read as a language boundary. */
+static bool c_cpp_family(CBMLanguage lang) {
+    return lang == CBM_LANG_C || lang == CBM_LANG_CPP;
 }
 
 static const char *path_basename(const char *path) {
@@ -496,6 +513,55 @@ bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const cha
         return false;
     }
     return true;
+}
+
+bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target_file_path) {
+    /* #1928: USAGE / WRITES / READS analog of the CALLS guard above. A
+     * variable or field reference resolved by the short-name registry must
+     * not cross a language boundary: unlike CALLS, a reference edge carries
+     * no import-closure evidence at all — a Go test's local `event` and an
+     * eBPF C probe's automatic `event` share nothing but the spelling, so
+     * EVERY registry strategy is a bare-name guess here and none is exempt.
+     * LSP-backed semantic references resolve before the registry fallback
+     * and never reach this predicate, which is where a genuine cross-language
+     * binding (a future cgo resolver) would live. The JS/TS family keeps its
+     * exemption (.js/.ts/.d.ts pairs legitimately share symbols), and C/C++
+     * count as one family (.h maps to CBM_LANG_CPP). */
+    if (caller_lang == CBM_LANG_COUNT || !target_file_path || !target_file_path[0]) {
+        return false;
+    }
+    CBMLanguage target_lang = cbm_language_for_filename(path_basename(target_file_path));
+    if (target_lang == CBM_LANG_COUNT) {
+        return false;
+    }
+    if (caller_lang == target_lang) {
+        return false;
+    }
+    if (js_ts_family(caller_lang) && js_ts_family(target_lang)) {
+        return false;
+    }
+    if (c_cpp_family(caller_lang) && c_cpp_family(target_lang)) {
+        return false;
+    }
+    return true;
+}
+
+bool cbm_go_suppress_bare_field_ref(bool is_go, const char *ref_name, const char *target_label) {
+    /* #1942: a bare (dot-less) Go reference can never denote a struct field —
+     * field access is always a selector expression (x.f), and selector
+     * references resolve through the LSP join, never through the bare-name
+     * registry fallback. Every Field-targeted reference edge in the field
+     * census carried dot-less text, so dropping the bind loses nothing real.
+     * Go-gated: a C#/Java/C++/Python method body legitimately references its
+     * own members bare (cp_reads_writes_cs_static_field pins that shape as
+     * required), so a global veto would break those languages. */
+    if (!is_go || !ref_name || !ref_name[0] || !target_label) {
+        return false;
+    }
+    if (strcmp(target_label, "Field") != 0) {
+        return false;
+    }
+    return strchr(ref_name, '.') == NULL;
 }
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
@@ -662,11 +728,12 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
      * resolved.requireAdmin — not just resolved, which would point at the
      * module node and miss the function entirely. */
     /* Direct hit ONLY for suffix-less callees (an aliased direct-symbol
-     * import called bare: `from m import f as g; g()` — #875/#979). With a
-     * suffix present (`imported.method()`), returning the bare base here
-     * would swallow the suffix and bind the call to the imported symbol's
-     * own node (a Variable/Class/module) instead of base.method — exactly
-     * the mis-resolution the comment above warns about. That regressed
+     * import called bare: `from m import f as g; g()` — #875/#979; Yui
+     * `import execute as bridge_execute`). With a suffix present
+     * (`imported.method()`), returning the bare base here would swallow
+     * the suffix and bind the call to the imported symbol's own node
+     * (a Variable/Class/module) instead of base.method — exactly the
+     * mis-resolution the comment above warns about. That regressed
      * django-scale graphs by ~11K CALLS/TESTS edges (Signal.send calls
      * degraded to edges onto the signal variables themselves). #1000 */
     if (!suffix || !suffix[0]) {
@@ -867,24 +934,11 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
     return empty_result();
 }
 
-cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,
-                                      const char *module_qn, const char **import_map_keys,
-                                      const char **import_map_vals, int import_map_count) {
-    if (!r || !callee_name) {
-        return empty_result();
-    }
-
-    /* Per-file cache: same callee_name in N call sites → 1 chain walk
-     * + N-1 O(1) hash hits. module_qn is constant per file so the
-     * cache key only needs callee_name. */
-    if (_resolve_cache) {
-        resolve_cache_entry_t *cached =
-            (resolve_cache_entry_t *)cbm_ht_get(_resolve_cache, callee_name);
-        if (cached) {
-            return cached->res;
-        }
-    }
-
+/* The strategy chain shared by both public resolve variants (no caching here —
+ * cbm_registry_resolve owns the per-file cache). */
+static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const char *callee_name,
+                                               const char *module_qn, const char **import_map_keys,
+                                               const char **import_map_vals, int import_map_count) {
     /* Split callee at the first path separator: "pkg.Func" → prefix="pkg",
      * suffix="Func".  Rust/C++ use "::" rather than ".", so honor whichever
      * separator appears first ("lib::square" → prefix="lib", suffix="square").
@@ -923,6 +977,41 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
         /* Strategy 3+4: name lookup */
         res = resolve_name_lookup(r, callee_name, module_qn, import_map_vals, import_map_count);
     }
+    return res;
+}
+
+cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,
+                                      const char *module_qn, const char **import_map_keys,
+                                      const char **import_map_vals, int import_map_count) {
+    if (!r || !callee_name) {
+        return empty_result();
+    }
+
+    /* Per-file cache: same callee_name in N call sites → 1 chain walk
+     * + N-1 O(1) hash hits. module_qn is constant per file so the
+     * cache key only needs callee_name. */
+    if (_resolve_cache) {
+        resolve_cache_entry_t *cached =
+            (resolve_cache_entry_t *)cbm_ht_get(_resolve_cache, callee_name);
+        if (cached) {
+            return cached->res;
+        }
+    }
+
+    cbm_resolution_t res = registry_resolve_chain(r, callee_name, module_qn, import_map_keys,
+                                                  import_map_vals, import_map_count);
+
+    /* Data relations (Table/View) are lineage-only registry members: common
+     * table names (users, orders, config) collide with code identifiers across
+     * every language, so the DEFAULT resolve never returns them — a veto, not a
+     * re-route, so a name-collision does not fall through to a weaker strategy.
+     * Every consumer (CALLS/USAGE/READS/WRITES/THROWS/handlers/decorators,
+     * present and future) is thereby relation-safe by construction. The SQL
+     * lineage path opts in via cbm_registry_resolve_lineage. */
+    if (res.qualified_name && res.qualified_name[0] &&
+        cbm_label_is_relation(cbm_registry_label_of(r, res.qualified_name))) {
+        res = empty_result();
+    }
 
     /* Cache the result (including empty — caching the negative answer
      * is just as valuable; same name asks the same question). */
@@ -939,6 +1028,21 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
         }
     }
     return res;
+}
+
+cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const char *callee_name,
+                                              const char *module_qn, const char **import_map_keys,
+                                              const char **import_map_vals, int import_map_count) {
+    if (!r || !callee_name) {
+        return empty_result();
+    }
+    /* Relation-permitting variant for SQL FROM/JOIN lineage usages ONLY.
+     * Deliberately uncached: the per-file cache is keyed by bare callee_name
+     * and stores the relation-vetoed answer of the default variant — sharing
+     * it would poison one variant with the other's semantics. SQL files hold
+     * few distinct relation refs, so the chain walk stays cheap. */
+    return registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                                  import_map_count);
 }
 
 /* ── Fuzzy Resolve ──────────────────────────────────────────────── */

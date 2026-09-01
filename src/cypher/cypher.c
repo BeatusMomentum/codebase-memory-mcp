@@ -25,6 +25,7 @@ enum {
     CYP_MAX_VARS = 16,     /* max Cypher variables in a query */
     CYP_MAX_EDGE_VARS = 8, /* max edge variables */
     CYP_GROWTH_10 = 10,    /* binding growth factor */
+    CYP_GROWTH_2 = 2,      /* geometric buffer growth (#1196) */
     CYP_CHAR_IDX1 = 1,     /* second character index (e.g. op[1]) */
     CYP_EBUF_MASK = 7,
     CYP_NODE_COLS = 4, /* columns per node var: name, qn, label, file */
@@ -3101,10 +3102,33 @@ static void scan_pattern_nodes(cbm_store_t *store, const char *project, cbm_node
 
 /* Process edges: look up target node, filter by label/props, add binding.
  * `inbound` controls which end of the edge is the target id. */
+/* #1196 (second mechanism): a hop's output buffer must hold EVERY matched
+ * row. max_rows is an OUTPUT-row limit — projection already enforces it — and
+ * WHERE/aggregation run after expansion, so any cap here silently falsifies
+ * results: field-measured, count() reported 9,360 of 13,691 DEFINES because
+ * the old bind_cap*10 ceiling dropped edges before aggregation ever saw them,
+ * and a labeled source did not save you. The buffer now grows geometrically;
+ * only allocation failure stops materialisation (the #601 deadline still
+ * bounds time), and match_count stays truthful either way (#627 contract). */
+static bool binding_out_append(binding_t **rows, int *count, int *cap, binding_t *nb) {
+    if (*count == *cap) {
+        int next = *cap > 0 ? *cap * CYP_GROWTH_2 : CYP_GROWTH_10;
+        binding_t *grown = realloc(*rows, (size_t)next * sizeof(binding_t));
+        if (!grown) {
+            binding_free(nb);
+            return false;
+        }
+        *rows = grown;
+        *cap = next;
+    }
+    (*rows)[(*count)++] = *nb;
+    return true;
+}
+
 static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count, bool inbound,
                           const cbm_node_pattern_t *target_node, binding_t *b, const char *to_var,
-                          const char *rel_var, binding_t *new_bindings, int *new_count, int max_new,
-                          int *match_count) {
+                          const char *rel_var, binding_t **new_bindings, int *new_count,
+                          int *new_cap, int *match_count) {
     /* When the terminal node variable is ALREADY bound (e.g. the second pattern
      * `(c)-[:CALLS]->(f)` where `f` came from an earlier MATCH), we must FILTER
      * to edges that actually reach the bound node — not overwrite the caller's
@@ -3137,16 +3161,14 @@ static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count,
             node_fields_free(&found);
             continue;
         }
-        (*match_count)++; /* a real neighbour exists, budget or not */
-        if (*new_count < max_new) {
-            binding_t nb = {0};
-            binding_copy(&nb, b);
-            binding_set(&nb, to_var, &found);
-            if (rel_var) {
-                binding_set_edge(&nb, rel_var, &edges[ei]);
-            }
-            new_bindings[(*new_count)++] = nb;
+        (*match_count)++; /* a real neighbour exists, OOM or not */
+        binding_t nb = {0};
+        binding_copy(&nb, b);
+        binding_set(&nb, to_var, &found);
+        if (rel_var) {
+            binding_set_edge(&nb, rel_var, &edges[ei]);
         }
+        (void)binding_out_append(new_bindings, new_count, new_cap, &nb);
         node_fields_free(&found);
     }
 }
@@ -3158,11 +3180,12 @@ static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count,
 /* C11 _Thread_local directly: cypher.c stays windows.h-free (compat.h pulls
  * in windows.h, whose legacy `far` macro breaks this file's identifiers). */
 static _Thread_local int g_cypher_depth_clamped = 0;
+static _Thread_local int g_cypher_trail_truncated = 0;
 
 static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
                               cbm_node_pattern_t *target_node, binding_t *b, cbm_node_t *src,
-                              const char *to_var, binding_t *new_bindings, int *new_count,
-                              int max_new, int *match_count) {
+                              const char *to_var, binding_t **new_bindings, int *new_count,
+                              int *new_cap, int *match_count) {
     /* Clamp BOTH the explicit (`*1..N`) and unbounded (`*`, `*..m`) forms to the
      * engine ceiling: an explicit N above the cap was previously honoured
      * verbatim, driving cbm_store_bfs to an unbounded hop count (#887). WARN on
@@ -3180,7 +3203,11 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
     }
     cbm_traverse_result_t tr = {0};
     const char *dir = rel->direction ? rel->direction : "outbound";
-    cbm_store_bfs(store, src->id, dir, rel->types, rel->type_count, max_depth, CBM_PERCENT, &tr);
+    cbm_store_bfs_trail(store, src->id, dir, rel->types, rel->type_count, max_depth, CBM_PERCENT,
+                        &tr);
+    if (tr.truncated) {
+        g_cypher_trail_truncated = 1;
+    }
     cbm_node_t *bound_to = binding_get(b, to_var);
     int64_t bound_to_id = bound_to ? bound_to->id : 0;
     /* Same contract as process_edges: the budget caps materialisation, never
@@ -3201,12 +3228,10 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
             continue;
         }
         (*match_count)++;
-        if (*new_count < max_new) {
-            binding_t nb = {0};
-            binding_copy(&nb, b);
-            binding_set(&nb, to_var, &hop->node);
-            new_bindings[(*new_count)++] = nb;
-        }
+        binding_t nb = {0};
+        binding_copy(&nb, b);
+        binding_set(&nb, to_var, &hop->node);
+        (void)binding_out_append(new_bindings, new_count, new_cap, &nb);
     }
     cbm_store_traverse_free(&tr);
 }
@@ -3214,8 +3239,8 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
 /* Expand fixed-length (1-hop) relationship edges */
 static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
                                 cbm_node_pattern_t *target_node, binding_t *b, cbm_node_t *src,
-                                const char *to_var, binding_t *new_bindings, int *new_count,
-                                int max_new, int *match_count) {
+                                const char *to_var, binding_t **new_bindings, int *new_count,
+                                int *new_cap, int *match_count) {
     bool is_inbound = rel->direction && strcmp(rel->direction, "inbound") == 0;
     bool is_any = rel->direction && strcmp(rel->direction, "any") == 0;
     const char *rel_var = rel->variable;
@@ -3232,7 +3257,7 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
                                                     &edge_count);
             }
             process_edges(store, edges, edge_count, is_inbound, target_node, b, to_var, rel_var,
-                          new_bindings, new_count, max_new, match_count);
+                          new_bindings, new_count, new_cap, match_count);
             cbm_store_free_edges(edges, edge_count);
         }
         if (is_any) {
@@ -3242,7 +3267,7 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
                 cbm_store_find_edges_by_target_type(store, src->id, rel->types[ti], &edges,
                                                     &edge_count);
                 process_edges(store, edges, edge_count, true, target_node, b, to_var, rel_var,
-                              new_bindings, new_count, max_new, match_count);
+                              new_bindings, new_count, new_cap, match_count);
                 cbm_store_free_edges(edges, edge_count);
             }
         }
@@ -3255,21 +3280,21 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
             cbm_store_find_edges_by_source(store, src->id, &edges, &edge_count);
         }
         process_edges(store, edges, edge_count, is_inbound, target_node, b, to_var, rel_var,
-                      new_bindings, new_count, max_new, match_count);
+                      new_bindings, new_count, new_cap, match_count);
         cbm_store_free_edges(edges, edge_count);
         if (is_any) {
             edges = NULL;
             edge_count = 0;
             cbm_store_find_edges_by_target(store, src->id, &edges, &edge_count);
             process_edges(store, edges, edge_count, true, target_node, b, to_var, rel_var,
-                          new_bindings, new_count, max_new, match_count);
+                          new_bindings, new_count, new_cap, match_count);
             cbm_store_free_edges(edges, edge_count);
         }
     }
 }
 
 static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_t **bindings,
-                                int *bind_count, const int *bind_cap, const char **var_name,
+                                int *bind_count, int *bind_cap, const char **var_name,
                                 bool is_optional) {
     for (int ri = 0; ri < pat->rel_count; ri++) {
         /* #601: stop expanding further hops once the wall-clock budget is spent
@@ -3283,16 +3308,14 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
 
         bool is_variable_length = (rel->min_hops != SKIP_ONE || rel->max_hops != SKIP_ONE);
 
-        /* Size this hop's output for BOTH writers without dropping any row: the
-         * expansion helpers emit at most max_new = bind_cap*10 rows (they stop at
-         * max_new), and the OPTIONAL fallback emits at most one row per source
-         * (<= *bind_count). A source either matches (feeds the expansion) or takes
-         * the fallback, never both, so the two counts are additive and bounded by
-         * max_new + *bind_count. Computed in size_t so the product cannot overflow.
-         * The previous "+ 1" sizing fit only a SINGLE fallback row after a
-         * saturated expansion; a second one ran off the end (heap OOB, CWE-787). */
-        size_t alloc_n = (size_t)*bind_cap * (size_t)CYP_GROWTH_10 + (size_t)*bind_count;
-        binding_t *new_bindings = malloc(alloc_n * sizeof(binding_t));
+        /* #1196: the hop's output buffer GROWS to hold every matched row —
+         * the old bind_cap*10 ceiling silently dropped edges before WHERE and
+         * aggregation, falsifying counts. binding_out_append handles growth
+         * and the OPTIONAL fallback shares it, so no writer can run off the
+         * end and no row class is dropped (the old fixed sizing had exactly
+         * those two failure modes, CWE-787 and the OPTIONAL data loss). */
+        int new_cap = *bind_count > 0 ? *bind_count : CYP_GROWTH_10;
+        binding_t *new_bindings = malloc((size_t)new_cap * sizeof(binding_t));
         if (!new_bindings) {
             return; /* OOM: leave existing bindings untouched rather than corrupt */
         }
@@ -3310,24 +3333,22 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
 
             int match_count = 0;
 
-            int max_new = *bind_cap * CYP_GROWTH_10;
             if (is_variable_length) {
-                expand_var_length(store, rel, target_node, b, src, to_var, new_bindings, &new_count,
-                                  max_new, &match_count);
+                expand_var_length(store, rel, target_node, b, src, to_var, &new_bindings,
+                                  &new_count, &new_cap, &match_count);
             } else {
-                expand_fixed_length(store, rel, target_node, b, src, to_var, new_bindings,
-                                    &new_count, max_new, &match_count);
+                expand_fixed_length(store, rel, target_node, b, src, to_var, &new_bindings,
+                                    &new_count, &new_cap, &match_count);
             }
 
             /* OPTIONAL MATCH: no expansion for this source, so keep the binding
-             * with the target unbound (projection renders it ""). The buffer is
-             * sized max_new + *bind_count precisely so every such fallback row has
-             * a slot — no guard needed, and no OPTIONAL no-match row is dropped. */
+             * with the target unbound (projection renders it ""). The shared
+             * growable append gives every fallback row a slot. */
             if (is_optional && match_count == 0) {
                 binding_t nb = {0};
                 binding_copy(&nb, b);
                 /* Don't set to_var — it remains unbound; projection returns "" */
-                new_bindings[new_count++] = nb;
+                (void)binding_out_append(&new_bindings, &new_count, &new_cap, &nb);
             }
         }
 
@@ -3337,6 +3358,7 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
         free(*bindings);
         *bindings = new_bindings;
         *bind_count = new_count;
+        *bind_cap = new_cap;
         *var_name = to_var;
     }
 }
@@ -4577,8 +4599,8 @@ static void cross_join_with_rels(cbm_store_t *store, cbm_pattern_t *patn, bindin
      * graphs (e.g. an unbound `c` scanned against ~29 K `f` bindings), wrapping
      * the int product negative and yielding a tiny/garbage malloc → heap OOB
      * write → SIGSEGV/SIGABRT (#627). */
-    size_t alloc_n = (size_t)*bind_count * (size_t)extra_count * (size_t)CYP_GROWTH_10 + SKIP_ONE;
-    binding_t *new_bindings = malloc(alloc_n * sizeof(binding_t));
+    int new_cap = *bind_count > 0 && extra_count > 0 ? *bind_count : SKIP_ONE;
+    binding_t *new_bindings = malloc((size_t)new_cap * sizeof(binding_t));
     if (!new_bindings) {
         return; /* OOM: leave existing bindings untouched rather than corrupt */
     }
@@ -4595,7 +4617,7 @@ static void cross_join_with_rels(cbm_store_t *store, cbm_pattern_t *patn, bindin
             const char *tv = nvar;
             expand_pattern_rels(store, patn, &tmp, &tc, &tcap, &tv, opt);
             for (int ti = 0; ti < tc; ti++) {
-                new_bindings[new_count++] = tmp[ti];
+                (void)binding_out_append(&new_bindings, &new_count, &new_cap, &tmp[ti]);
             }
             free(tmp);
         }
@@ -4647,13 +4669,12 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
      * OPTIONAL no-match row (a data-loss bug, not an OOB — the fallback stayed
      * in-bounds behind that guard) — exactly the rows
      * `OPTIONAL MATCH ... WHERE <start> IS NULL` is meant to surface. */
-    size_t alloc_n = (size_t)*bind_count * (size_t)CYP_GROWTH_10 + (size_t)*bind_count;
-    binding_t *new_bindings = malloc(alloc_n * sizeof(binding_t));
+    int new_cap = *bind_count > 0 ? *bind_count : CYP_GROWTH_10;
+    binding_t *new_bindings = malloc((size_t)new_cap * sizeof(binding_t));
     if (!new_bindings) {
         return;
     }
     int new_count = 0;
-    int max_new = *bind_count * CYP_GROWTH_10;
 
     for (int bi = 0; bi < *bind_count; bi++) {
         binding_t *b = &(*bindings)[bi];
@@ -4694,15 +4715,13 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
                         continue;
                     }
                     match_count++;
-                    if (new_count < max_new) {
-                        binding_t nb = {0};
-                        binding_copy(&nb, b);
-                        binding_set(&nb, start_var, &found);
-                        if (rel->variable) {
-                            binding_set_edge(&nb, rel->variable, &edges[ei]);
-                        }
-                        new_bindings[new_count++] = nb;
+                    binding_t nb = {0};
+                    binding_copy(&nb, b);
+                    binding_set(&nb, start_var, &found);
+                    if (rel->variable) {
+                        binding_set_edge(&nb, rel->variable, &edges[ei]);
                     }
+                    (void)binding_out_append(&new_bindings, &new_count, &new_cap, &nb);
                     node_fields_free(&found);
                 }
                 cbm_store_free_edges(edges, edge_count);
@@ -4711,15 +4730,12 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
         if (opt && match_count == 0) {
             /* GENUINELY no matching neighbour: the scan above runs unconditionally,
              * so match_count is the true neighbour count and match_count == 0 here
-             * means the terminal really has none — not merely that the buffer filled
-             * first. Keep the row with start_var left UNBOUND
-             * so `WHERE <start> IS NULL` correctly identifies the no-edge case. The
-             * buffer is sized max_new + *bind_count precisely so every fallback row
-             * has a slot — no guard needed, and no OPTIONAL no-match row is dropped
-             * even after the expansion has saturated max_new. */
+             * means the terminal really has none. Keep the row with start_var left
+             * UNBOUND so `WHERE <start> IS NULL` correctly identifies the no-edge
+             * case; the shared growable append gives every fallback row a slot. */
             binding_t nb = {0};
             binding_copy(&nb, b);
-            new_bindings[new_count++] = nb;
+            (void)binding_out_append(&new_bindings, &new_count, &new_cap, &nb);
         }
     }
 
@@ -4878,10 +4894,169 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
 
 /* ── Main entry point ─────────────────────────────────────────── */
 
+/* ── Is every name a RETURN or WITH item uses actually in scope? ──
+ *
+ * An unbound variable resolves to NULL and renders as "" on purpose: an
+ * OPTIONAL MATCH target that found no row has to project a blank rather than
+ * drop the row. The cost of that convention is that a name the query NEVER
+ * carried through looks exactly the same on screen. A typo, or a variable a
+ * WITH dropped, then reads as "the graph holds no such data" instead of "your
+ * query named something that is not there" (#1919). Same failure shape as
+ * #373, and the same answer: say so out loud.
+ *
+ * The check runs on the parsed query, not on the run-time bindings, and that
+ * is the whole trick. It asks whether the query DECLARED the name — a
+ * different question from whether a row happened to bind it. So the OPTIONAL
+ * MATCH convention above is untouched: a target that did not match is still
+ * declared, still legal, and still projects "".
+ */
+
+/* Cap for one query's declared names. CYP_MAX_VARS is the binding cap for
+ * nodes alone; a pattern also names edges, so this is the roomier of the two.
+ * A query that overruns it skips the check rather than guessing — a wrong
+ * refusal costs the caller a working query, which is worse than the silence
+ * this guard removes. */
+enum { CYP_SCOPE_MAX_NAMES = 32 };
+
+static bool scope_holds(const char *const *names, int count, const char *want) {
+    for (int i = 0; i < count; i++) {
+        if (names[i] && strcmp(names[i], want) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Every name the query's patterns declare, plus an UNWIND alias.
+ * Answers -1 when there are more names than the cap holds. */
+static int collect_declared_names(const cbm_query_t *q, const char **out, int cap) {
+    int n = 0;
+    for (int pi = 0; pi < q->pattern_count; pi++) {
+        const cbm_pattern_t *pat = &q->patterns[pi];
+        for (int ni = 0; ni < pat->node_count; ni++) {
+            const char *var = pat->nodes[ni].variable;
+            if (var && !scope_holds(out, n, var)) {
+                if (n >= cap) {
+                    return -1;
+                }
+                out[n++] = var;
+            }
+        }
+        for (int ri = 0; ri < pat->rel_count; ri++) {
+            const char *var = pat->rels[ri].variable;
+            if (var && !scope_holds(out, n, var)) {
+                if (n >= cap) {
+                    return -1;
+                }
+                out[n++] = var;
+            }
+        }
+    }
+    if (q->unwind_alias && !scope_holds(out, n, q->unwind_alias)) {
+        if (n >= cap) {
+            return -1;
+        }
+        out[n++] = q->unwind_alias;
+    }
+    return n;
+}
+
+/* What a WITH leaves behind: its alias where it made one, and the plain
+ * variable where it carried one through whole. `WITH f.name AS caller` leaves
+ * `caller` and nothing else — `f` is gone, which is the case #1919 is about. */
+static int collect_with_names(const cbm_return_clause_t *wc, const char **out, int cap) {
+    int n = 0;
+    for (int i = 0; i < wc->count; i++) {
+        const cbm_return_item_t *item = &wc->items[i];
+        const char *name = NULL;
+        if (item->alias) {
+            name = item->alias;
+        } else if (item->variable && !item->property && !item->func) {
+            name = item->variable;
+        }
+        if (name && !scope_holds(out, n, name)) {
+            if (n >= cap) {
+                return -1;
+            }
+            out[n++] = name;
+        }
+    }
+    return n;
+}
+
+/* Build the message. It names the variable and the clause, because an error
+ * that does not say WHICH name is wrong sends the reader back to guessing. */
+static char *scope_error(const char *var, const char *clause, const char *why) {
+    char buf[CBM_SZ_256];
+    snprintf(buf, sizeof(buf), "variable '%s' is not in scope for %s — %s", var, clause, why);
+    return heap_strdup(buf);
+}
+
+/* The variable this item really references, or NULL when it references none.
+ * Two items carry a placeholder in that field rather than a name the query
+ * declared: `count(*)` stores "*", and a CASE expression stores "CASE". Both
+ * would read as an unknown variable, so neither is checkable here. */
+static const char *scope_checkable_var(const cbm_return_item_t *item) {
+    if (item->kase || !item->variable) {
+        return NULL;
+    }
+    if (strcmp(item->variable, "*") == 0) {
+        return NULL;
+    }
+    return item->variable;
+}
+
+/* Answers NULL when the query is fine, or a heap message naming the first
+ * variable that is not in scope. Checks one query; the caller walks a UNION. */
+static char *check_projection_scope(const cbm_query_t *q) {
+    const char *declared[CYP_SCOPE_MAX_NAMES];
+    int declared_n = collect_declared_names(q, declared, CYP_SCOPE_MAX_NAMES);
+    if (declared_n < 0) {
+        return NULL; /* too many names to model — stay quiet rather than guess */
+    }
+
+    /* A WITH still reads the pattern variables. */
+    if (q->with_clause && !q->with_clause->star) {
+        for (int i = 0; i < q->with_clause->count; i++) {
+            const char *var = scope_checkable_var(&q->with_clause->items[i]);
+            if (var && !scope_holds(declared, declared_n, var)) {
+                return scope_error(var, "WITH", "no pattern in this query names it");
+            }
+        }
+    }
+
+    if (!q->ret || q->ret->star) {
+        return NULL;
+    }
+
+    /* A RETURN after a WITH reads only what the WITH left behind. */
+    const char *after_with[CYP_SCOPE_MAX_NAMES];
+    const char *const *scope = declared;
+    int scope_n = declared_n;
+    if (q->with_clause) {
+        scope_n = collect_with_names(q->with_clause, after_with, CYP_SCOPE_MAX_NAMES);
+        if (scope_n < 0) {
+            return NULL;
+        }
+        scope = after_with;
+    }
+
+    for (int i = 0; i < q->ret->count; i++) {
+        const char *var = scope_checkable_var(&q->ret->items[i]);
+        if (var && !scope_holds(scope, scope_n, var)) {
+            return scope_error(var, "RETURN",
+                               q->with_clause ? "the WITH clause did not carry it through"
+                                              : "no pattern in this query names it");
+        }
+    }
+    return NULL;
+}
+
 int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *project, int max_rows,
                        cbm_cypher_result_t *out) {
     memset(out, 0, sizeof(*out));
     g_cypher_depth_clamped = 0;
+    g_cypher_trail_truncated = 0;
     cypher_deadline_arm(); /* #601: start the wall-clock budget for this query */
     if (max_rows <= 0) {
         max_rows = CYPHER_RESULT_CEILING;
@@ -4892,6 +5067,15 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     if (cbm_cypher_parse(query, &q, &err) < 0) {
         out->error = err;
         return CBM_NOT_FOUND;
+    }
+
+    for (const cbm_query_t *sq = q; sq; sq = sq->union_next) {
+        char *scope_err = check_projection_scope(sq);
+        if (scope_err) {
+            cbm_query_free(q);
+            out->error = scope_err;
+            return CBM_NOT_FOUND;
+        }
     }
 
     result_builder_t rb = {0};
@@ -4952,12 +5136,22 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     out->col_count = rb.col_count;
     out->rows = rb.rows;
     out->row_count = rb.row_count;
-    if (g_cypher_depth_clamped > 0) {
+    if (g_cypher_depth_clamped > 0 || g_cypher_trail_truncated) {
         char wbuf[CBM_SZ_256];
-        snprintf(wbuf, sizeof(wbuf),
-                 "variable-length hop range clamped to the engine ceiling (%d) — an empty "
-                 "result may mean \"clamped\", not \"no such path\"",
-                 g_cypher_depth_clamped);
+        if (g_cypher_depth_clamped > 0 && g_cypher_trail_truncated) {
+            snprintf(wbuf, sizeof(wbuf),
+                     "variable-length hop range clamped to the engine ceiling (%d) and "
+                     "traversal budget was exhausted — results may be partial",
+                     g_cypher_depth_clamped);
+        } else if (g_cypher_depth_clamped > 0) {
+            snprintf(wbuf, sizeof(wbuf),
+                     "variable-length hop range clamped to the engine ceiling (%d) — an empty "
+                     "result may mean \"clamped\", not \"no such path\"",
+                     g_cypher_depth_clamped);
+        } else {
+            snprintf(wbuf, sizeof(wbuf),
+                     "variable-length traversal budget was exhausted — results may be partial");
+        }
         out->warning = heap_strdup(wbuf);
     }
 
