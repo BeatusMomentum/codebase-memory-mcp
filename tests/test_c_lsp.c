@@ -15331,13 +15331,13 @@ TEST(registry_short_name_indexes) {
     /* Qualified-name bare segment "Trait": types 0, 4, then the bare-QN type
      * 5. The iterator is a hash prefilter, so apply the exact predicate before
      * asserting its order just like production consumers do. */
-    CBMTypeNameIter nit;
+    CBMTypeShortIter nit;
     cbm_registry_types_by_short_name(&reg, "Trait", &nit);
     {
         int expected[] = {0, 4, 5};
         int exact_count = 0;
         int candidate;
-        while ((candidate = cbm_type_name_iter_next(&nit)) >= 0) {
+        while ((candidate = cbm_type_short_iter_next(&nit)) >= 0) {
             const char *qn = reg.types[candidate].qualified_name;
             const char *last_dot = qn ? strrchr(qn, '.') : NULL;
             const char *candidate_short = last_dot ? last_dot + 1 : qn;
@@ -15352,7 +15352,7 @@ TEST(registry_short_name_indexes) {
     {
         int exact_count = 0;
         int candidate;
-        while ((candidate = cbm_type_name_iter_next(&nit)) >= 0) {
+        while ((candidate = cbm_type_short_iter_next(&nit)) >= 0) {
             const char *qn = reg.types[candidate].qualified_name;
             const char *last_dot = qn ? strrchr(qn, '.') : NULL;
             const char *candidate_short = last_dot ? last_dot + 1 : qn;
@@ -15382,7 +15382,7 @@ TEST(registry_short_name_indexes) {
 
             int actual;
             for (;;) {
-                actual = cbm_type_name_iter_next(&nit);
+                actual = cbm_type_short_iter_next(&nit);
                 if (actual < 0)
                     break;
                 const char *qn = reg.types[actual].qualified_name;
@@ -15437,11 +15437,11 @@ TEST(registry_short_name_indexes) {
     t.short_name = "Trait";
     cbm_registry_add_type(&reg, t);
     cbm_registry_types_by_short_name(&reg, "Trait", &nit);
-    ASSERT_EQ(cbm_type_name_iter_next(&nit), 0);
-    ASSERT_EQ(cbm_type_name_iter_next(&nit), 4);
-    ASSERT_EQ(cbm_type_name_iter_next(&nit), 5);
-    ASSERT_EQ(cbm_type_name_iter_next(&nit), tail_type_i);
-    ASSERT_EQ(cbm_type_name_iter_next(&nit), -1);
+    ASSERT_EQ(cbm_type_short_iter_next(&nit), 0);
+    ASSERT_EQ(cbm_type_short_iter_next(&nit), 4);
+    ASSERT_EQ(cbm_type_short_iter_next(&nit), 5);
+    ASSERT_EQ(cbm_type_short_iter_next(&nit), tail_type_i);
+    ASSERT_EQ(cbm_type_short_iter_next(&nit), -1);
 
     int *saved_type_short_buckets = reg.type_short_buckets;
     reg.type_short_buckets = NULL;
@@ -15449,7 +15449,7 @@ TEST(registry_short_name_indexes) {
     int fallback_expected[] = {0, 4, 5, tail_type_i};
     int fallback_count = 0;
     int candidate;
-    while ((candidate = cbm_type_name_iter_next(&nit)) >= 0) {
+    while ((candidate = cbm_type_short_iter_next(&nit)) >= 0) {
         const char *qn = reg.types[candidate].qualified_name;
         const char *last_dot = qn ? strrchr(qn, '.') : NULL;
         const char *candidate_short = last_dot ? last_dot + 1 : qn;
@@ -15479,7 +15479,7 @@ TEST(registry_short_name_indexes) {
 
     cbm_registry_types_by_short_name(&reg, "Trait", &nit);
     fallback_count = 0;
-    while ((candidate = cbm_type_name_iter_next(&nit)) >= 0) {
+    while ((candidate = cbm_type_short_iter_next(&nit)) >= 0) {
         const char *qn = reg.types[candidate].qualified_name;
         const char *last_dot = qn ? strrchr(qn, '.') : NULL;
         const char *candidate_short = last_dot ? last_dot + 1 : qn;
