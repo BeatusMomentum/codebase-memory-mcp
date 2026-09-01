@@ -503,9 +503,19 @@ static int tf_maybe_run_runtime_image_holder(int argc, char **argv) {
     Sleep(INFINITE);
     return 25;
 #else
-    (void)argc;
-    (void)argv;
-    return -1;
+    /* POSIX copied-image holder: block reading stdin until the parent closes
+     * the release pipe, exactly like the cat(1) donor this replaced. A system
+     * utility cannot serve as the copied image — a multi-call coreutils
+     * binary (uutils cat) refuses to execute under the copied name. */
+    if (argc != 2 || strcmp(argv[1], "__cbm_runtime_image_holder") != 0) {
+        return -1;
+    }
+    char release[16];
+    ssize_t count;
+    do {
+        count = read(STDIN_FILENO, release, sizeof(release));
+    } while (count > 0 || (count < 0 && errno == EINTR));
+    return count == 0 ? 0 : 25;
 #endif
 }
 

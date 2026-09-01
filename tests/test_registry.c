@@ -811,6 +811,54 @@ TEST(cross_language_suffix_match_drops_py_vs_js) {
     PASS();
 }
 
+TEST(cross_language_ref_drops_go_vs_c) {
+    /* #1928: the USAGE/WRITES/READS analog of #725. Reference edges carry no
+     * import-closure evidence, so EVERY registry strategy is a bare-name
+     * guess and no strategy-level carve-out applies — the predicate takes no
+     * strategy at all. */
+    ASSERT_TRUE(cbm_suppress_cross_language_ref(CBM_LANG_GO, "bpf/probe.c"));
+    ASSERT_TRUE(cbm_suppress_cross_language_ref(CBM_LANG_GO, "driver/mock.hpp"));
+    ASSERT_TRUE(cbm_suppress_cross_language_ref(CBM_LANG_C, "pkg/events/event.go"));
+    ASSERT_TRUE(cbm_suppress_cross_language_ref(CBM_LANG_PYTHON, "web/src/pages/Editor.js"));
+    /* Same language → keep. */
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_GO, "pkg/state/state.go"));
+    /* C and C++ are one family: .h maps to CBM_LANG_CPP, and a .c file
+     * referencing its own header's declarations is not a boundary. */
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_C, "bpf/probe.h"));
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_CPP, "driver/compat.c"));
+    /* …but Go into a header is still a boundary. */
+    ASSERT_TRUE(cbm_suppress_cross_language_ref(CBM_LANG_GO, "bpf/probe.h"));
+    /* JS/TS/TSX/ArkTS are one family. */
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_JAVASCRIPT, "lib/util.ts"));
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_TYPESCRIPT, "ui/Panel.tsx"));
+    /* Unknown caller/target language or no path → nothing to judge → keep. */
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_COUNT, "store.py"));
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_GO, NULL));
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_GO, ""));
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_GO, "Makefile.inc.unknownext"));
+    PASS();
+}
+
+TEST(go_bare_ref_never_binds_field) {
+    /* #1942: a bare (dot-less) Go reference can never denote a struct field —
+     * field access is always a selector expression. */
+    ASSERT_TRUE(cbm_go_suppress_bare_field_ref(true, "err", "Field"));
+    ASSERT_TRUE(cbm_go_suppress_bare_field_ref(true, "config", "Field"));
+    /* A selector-shaped reference may bind a field. */
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "t.err", "Field"));
+    /* Bare references to non-fields are untouched. */
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "err", "Variable"));
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "err", "Function"));
+    /* Other languages reference their own members bare inside methods —
+     * never suppressed (cp_reads_writes_cs_static_field pins the C# shape). */
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(false, "_count", "Field"));
+    /* Degenerate inputs → nothing to judge. */
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, NULL, "Field"));
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "", "Field"));
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "err", NULL));
+    PASS();
+}
+
 TEST(dynamic_suppress_drops_weak_method_matches) {
     /* #592/#606/#1276: a member call whose receiver the LSP could not type, that
      * landed via a WEAK short-name strategy, is generic-resolver noise → drop.
@@ -1016,6 +1064,8 @@ SUITE(registry) {
     RUN_TEST(perl_suppress_drops_weak_builtin_and_method_matches);
     RUN_TEST(perl_suppress_keeps_high_confidence_and_genuine_calls);
     RUN_TEST(cross_language_suffix_match_drops_py_vs_js);
+    RUN_TEST(cross_language_ref_drops_go_vs_c);
+    RUN_TEST(go_bare_ref_never_binds_field);
     RUN_TEST(dynamic_suppress_drops_weak_method_matches);
     RUN_TEST(dynamic_suppress_keeps_high_confidence_and_non_methods);
     RUN_TEST(local_binding_suppress_drops_weak_shadowed_bare_calls);

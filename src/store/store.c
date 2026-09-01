@@ -2640,6 +2640,233 @@ int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char
                               project, file_path, out, count);
 }
 
+typedef struct {
+    cbm_store_cancel_fn cancel;
+    void *context;
+} file_outline_cancel_guard_t;
+
+static bool file_outline_cancelled(const file_outline_cancel_guard_t *guard) {
+    return guard && guard->cancel && guard->cancel(guard->context);
+}
+
+static int file_outline_progress_cancel(void *context) {
+    return file_outline_cancelled((const file_outline_cancel_guard_t *)context) ? 1 : 0;
+}
+
+static bool file_outline_build_sql(char *sql, size_t sql_size, bool count_only, int label_count) {
+    int written =
+        snprintf(sql, sql_size,
+                 count_only ? "SELECT COUNT(*) FROM nodes WHERE project = ?1 AND file_path = ?2 "
+                              "AND label NOT IN ('Module','Package','File','Folder','Project')"
+                            : "SELECT name, label, qualified_name, start_line, end_line FROM nodes "
+                              "WHERE project = ?1 AND file_path = ?2 "
+                              "AND label NOT IN ('Module','Package','File','Folder','Project')");
+    if (written < 0 || (size_t)written >= sql_size) {
+        return false;
+    }
+    size_t used = (size_t)written;
+    if (label_count > 0) {
+        written = snprintf(sql + used, sql_size - used, " AND label IN (");
+        if (written < 0 || (size_t)written >= sql_size - used) {
+            return false;
+        }
+        used += (size_t)written;
+        for (int i = 0; i < label_count; i++) {
+            written = snprintf(sql + used, sql_size - used, "%s?%d", i > 0 ? "," : "", i + 3);
+            if (written < 0 || (size_t)written >= sql_size - used) {
+                return false;
+            }
+            used += (size_t)written;
+        }
+        written = snprintf(sql + used, sql_size - used, ")");
+        if (written < 0 || (size_t)written >= sql_size - used) {
+            return false;
+        }
+        used += (size_t)written;
+    }
+    if (!count_only) {
+        int limit_bind = label_count + 3;
+        int offset_bind = limit_bind + 1;
+        written = snprintf(sql + used, sql_size - used,
+                           " ORDER BY start_line, end_line, label COLLATE BINARY, "
+                           "name COLLATE BINARY, qualified_name COLLATE BINARY, id "
+                           "LIMIT ?%d OFFSET ?%d",
+                           limit_bind, offset_bind);
+        if (written < 0 || (size_t)written >= sql_size - used) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void file_outline_bind_common(sqlite3_stmt *stmt, const char *project, const char *file_path,
+                                     const char *const *labels, int label_count) {
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, file_path);
+    for (int i = 0; i < label_count; i++) {
+        bind_text(stmt, i + 3, labels[i]);
+    }
+}
+
+void cbm_store_free_file_outline(cbm_file_outline_row_t *rows, int count) {
+    if (!rows) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free((char *)rows[i].name);
+        free((char *)rows[i].label);
+        free((char *)rows[i].qualified_name);
+    }
+    free(rows);
+}
+
+int cbm_store_get_file_outline(cbm_store_t *s, const char *project, const char *file_path,
+                               const char *const *labels, int label_count, int limit, int offset,
+                               cbm_store_cancel_fn cancel, void *cancel_context,
+                               cbm_file_outline_row_t **out, int *count, int *total) {
+    if (out) {
+        *out = NULL;
+    }
+    if (count) {
+        *count = 0;
+    }
+    if (total) {
+        *total = 0;
+    }
+    if (!s || !s->db || !project || !project[0] || !file_path || !file_path[0] || !out || !count ||
+        !total || label_count < 0 || label_count > CBM_STORE_FILE_OUTLINE_MAX_LABELS ||
+        (label_count > 0 && !labels) || limit < 1 || limit > CBM_STORE_FILE_OUTLINE_MAX_LIMIT ||
+        offset < 0) {
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < label_count; i++) {
+        if (!labels[i] || !labels[i][0]) {
+            return CBM_STORE_ERR;
+        }
+    }
+
+    file_outline_cancel_guard_t guard = {.cancel = cancel, .context = cancel_context};
+    if (file_outline_cancelled(&guard)) {
+        return CBM_STORE_CANCELLED;
+    }
+    if (cancel) {
+        sqlite3_progress_handler(s->db, 1000, file_outline_progress_cancel, &guard);
+    }
+
+    char sql[ST_SQL_BUF];
+    if (!file_outline_build_sql(sql, sizeof(sql), true, label_count)) {
+        sqlite3_progress_handler(s->db, 0, NULL, NULL);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        store_set_error_sqlite(s, "file outline count prepare");
+        sqlite3_progress_handler(s->db, 0, NULL, NULL);
+        return CBM_STORE_ERR;
+    }
+    file_outline_bind_common(stmt, project, file_path, labels, label_count);
+    rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        *total = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    if (rc == SQLITE_INTERRUPT || file_outline_cancelled(&guard)) {
+        sqlite3_progress_handler(s->db, 0, NULL, NULL);
+        *total = 0;
+        return CBM_STORE_CANCELLED;
+    }
+    if (rc != SQLITE_ROW) {
+        store_set_error_sqlite(s, "file outline count");
+        sqlite3_progress_handler(s->db, 0, NULL, NULL);
+        *total = 0;
+        return CBM_STORE_ERR;
+    }
+
+    if (!file_outline_build_sql(sql, sizeof(sql), false, label_count)) {
+        sqlite3_progress_handler(s->db, 0, NULL, NULL);
+        *total = 0;
+        return CBM_STORE_ERR;
+    }
+    stmt = NULL;
+    rc = sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        store_set_error_sqlite(s, "file outline prepare");
+        sqlite3_progress_handler(s->db, 0, NULL, NULL);
+        *total = 0;
+        return CBM_STORE_ERR;
+    }
+    file_outline_bind_common(stmt, project, file_path, labels, label_count);
+    sqlite3_bind_int(stmt, label_count + 3, limit);
+    sqlite3_bind_int(stmt, label_count + 4, offset);
+
+    cbm_file_outline_row_t *rows = calloc((size_t)limit, sizeof(*rows));
+    if (!rows) {
+        sqlite3_finalize(stmt);
+        sqlite3_progress_handler(s->db, 0, NULL, NULL);
+        *total = 0;
+        return CBM_STORE_ERR;
+    }
+    size_t text_bytes = 0U;
+    int n = 0;
+    bool was_cancelled = false;
+    for (;;) {
+        if (file_outline_cancelled(&guard)) {
+            was_cancelled = true;
+            break;
+        }
+        rc = sqlite3_step(stmt);
+        if (rc != SQLITE_ROW) {
+            break;
+        }
+        const char *name = (const char *)sqlite3_column_text(stmt, 0);
+        const char *label = (const char *)sqlite3_column_text(stmt, 1);
+        const char *qn = (const char *)sqlite3_column_text(stmt, 2);
+        size_t row_bytes = (size_t)sqlite3_column_bytes(stmt, 0) +
+                           (size_t)sqlite3_column_bytes(stmt, 1) +
+                           (size_t)sqlite3_column_bytes(stmt, 2) + 3U;
+        if (row_bytes > CBM_STORE_FILE_OUTLINE_MAX_TEXT_BYTES - text_bytes) {
+            sqlite3_finalize(stmt);
+            sqlite3_progress_handler(s->db, 0, NULL, NULL);
+            cbm_store_free_file_outline(rows, n);
+            *total = 0;
+            return CBM_STORE_SCAN_LIMIT;
+        }
+        rows[n].name = heap_strdup(name ? name : "");
+        rows[n].label = heap_strdup(label ? label : "");
+        rows[n].qualified_name = heap_strdup(qn ? qn : "");
+        rows[n].start_line = sqlite3_column_int(stmt, 3);
+        rows[n].end_line = sqlite3_column_int(stmt, 4);
+        if (!rows[n].name || !rows[n].label || !rows[n].qualified_name) {
+            sqlite3_finalize(stmt);
+            sqlite3_progress_handler(s->db, 0, NULL, NULL);
+            cbm_store_free_file_outline(rows, n + 1);
+            *total = 0;
+            return CBM_STORE_ERR;
+        }
+        text_bytes += row_bytes;
+        n++;
+    }
+    was_cancelled = was_cancelled || rc == SQLITE_INTERRUPT || file_outline_cancelled(&guard);
+    sqlite3_finalize(stmt);
+    sqlite3_progress_handler(s->db, 0, NULL, NULL);
+    if (was_cancelled) {
+        cbm_store_free_file_outline(rows, n);
+        *total = 0;
+        return CBM_STORE_CANCELLED;
+    }
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "file outline rows");
+        cbm_store_free_file_outline(rows, n);
+        *total = 0;
+        return CBM_STORE_ERR;
+    }
+
+    *out = rows;
+    *count = n;
+    return CBM_STORE_OK;
+}
+
 int cbm_store_count_nodes(cbm_store_t *s, const char *project) {
     if (!s || !s->db) {
         return 0;
@@ -8708,46 +8935,364 @@ int cbm_adr_validate_content(const char *content, char *errbuf, int errbuf_size)
     return CBM_STORE_OK;
 }
 
-int cbm_adr_validate_section_keys(const char **keys, int count, char *errbuf, int errbuf_size) {
-    char invalid[CBM_SZ_256] = "";
-    int ilen = 0;
-    int ninvalid = 0;
+/* ── ADR heading scanning and splicing ──────────────────────────── */
 
-    /* Collect and sort invalid keys */
-    const char *inv_keys[ST_MAX_SECTIONS];
-    int inv_n = 0;
-    for (int i = 0; i < count; i++) {
-        if (!is_canonical_section(keys[i])) {
-            if (inv_n < ST_BUF_16) {
-                inv_keys[inv_n++] = keys[i];
+/* Length of a code-fence run (``` or ~~~, after at most three spaces of
+ * indent), or 0 when the line does not open or close a fence. */
+static int adr_fence_run(const char *line, int line_len, char *ch_out) {
+    int i = 0;
+    while (i < line_len && i < ST_HEADER_PREFIX && line[i] == ' ') {
+        i++;
+    }
+    if (i >= line_len || (line[i] != '`' && line[i] != '~')) {
+        return 0;
+    }
+    char c = line[i];
+    int n = 0;
+    while (i + n < line_len && line[i + n] == c) {
+        n++;
+    }
+    if (n < ST_HEADER_PREFIX) {
+        return 0;
+    }
+    *ch_out = c;
+    return n;
+}
+
+/* True when the line is a closing fence for an open run of `open_n` `open_ch`:
+ * same character, at least as long, and nothing but whitespace after it. */
+static bool adr_fence_closes(const char *line, int line_len, char open_ch, int open_n) {
+    char ch = 0;
+    int n = adr_fence_run(line, line_len, &ch);
+    if (n == 0 || ch != open_ch || n < open_n) {
+        return false;
+    }
+    int i = 0;
+    while (i < line_len && line[i] != open_ch) {
+        i++;
+    }
+    i += n;
+    while (i < line_len) {
+        if (line[i] != ' ' && line[i] != '\t' && line[i] != '\r') {
+            return false;
+        }
+        i++;
+    }
+    return true;
+}
+
+/* Name length of a "## NAME" heading line, or 0 when it is not a heading.
+ * "###" fails on the third '#', so deeper markdown headings are body text. */
+static int adr_heading_name_len(const char *line, int line_len) {
+    if (line_len <= ST_HEADER_PREFIX || line[0] != '#' || line[SKIP_ONE] != '#' ||
+        line[PAIR_LEN] != ' ') {
+        return 0;
+    }
+    int len = line_len - ST_HEADER_PREFIX;
+    const char *name = line + ST_HEADER_PREFIX;
+    while (len > 0 && (name[len - SKIP_ONE] == ' ' || name[len - SKIP_ONE] == '\t' ||
+                       name[len - SKIP_ONE] == '\r')) {
+        len--;
+    }
+    /* A leading space would not survive a render/scan round-trip. */
+    if (len == 0 || name[0] == ' ' || name[0] == '\t') {
+        return 0;
+    }
+    return len;
+}
+
+/* True when the document leaves a code fence open. Such a document cannot be
+ * spliced: every heading after the opener is hidden, so an update would append
+ * a duplicate heading instead of replacing the existing one. */
+static bool adr_has_unterminated_fence(const char *content) {
+    const char *p = content;
+    bool in_fence = false;
+    char fence_ch = 0;
+    int fence_n = 0;
+    while (p && *p) {
+        const char *eol = strchr(p, '\n');
+        int line_len = eol ? (int)(eol - p) : (int)strlen(p);
+        if (in_fence) {
+            if (adr_fence_closes(p, line_len, fence_ch, fence_n)) {
+                in_fence = false;
+            }
+        } else {
+            char ch = 0;
+            int n = adr_fence_run(p, line_len, &ch);
+            if (n > 0) {
+                in_fence = true;
+                fence_ch = ch;
+                fence_n = n;
             }
         }
-    }
-    /* Sort alphabetically */
-    for (int i = SKIP_ONE; i < inv_n; i++) {
-        int j = i;
-        while (j > 0 && strcmp(inv_keys[j], inv_keys[j - SKIP_ONE]) < 0) {
-            const char *tmp = inv_keys[j];
-            inv_keys[j] = inv_keys[j - SKIP_ONE];
-            inv_keys[j - SKIP_ONE] = tmp;
-            j--;
+        if (!eol) {
+            break;
         }
+        p = eol + SKIP_ONE;
     }
+    return in_fence;
+}
 
-    for (int i = 0; i < inv_n; i++) {
-        if (ilen > 0) {
-            ilen += snprintf(invalid + ilen, sizeof(invalid) - ilen, ", ");
-        }
-        ilen += snprintf(invalid + ilen, sizeof(invalid) - ilen, "%s", inv_keys[i]);
-        ninvalid++;
+int cbm_adr_scan_headings(const char *content, void (*cb)(void *ctx, const cbm_adr_heading_t *h),
+                          void *ctx) {
+    if (!content || !cb) {
+        return content ? CBM_STORE_ERR : CBM_STORE_OK;
     }
-
-    if (ninvalid > 0) {
-        snprintf(errbuf, errbuf_size,
-                 "invalid section names: %s. Valid sections: PURPOSE, STACK, ARCHITECTURE, "
-                 "PATTERNS, TRADEOFFS, PHILOSOPHY",
-                 invalid);
+    if (adr_has_unterminated_fence(content)) {
         return CBM_STORE_ERR;
+    }
+
+    cbm_adr_heading_t pending;
+    memset(&pending, 0, sizeof(pending));
+    bool have_pending = false;
+    bool in_fence = false;
+    char fence_ch = 0;
+    int fence_n = 0;
+
+    const char *p = content;
+    while (*p) {
+        const char *eol = strchr(p, '\n');
+        int line_len = eol ? (int)(eol - p) : (int)strlen(p);
+        size_t line_off = (size_t)(p - content);
+
+        if (in_fence) {
+            if (adr_fence_closes(p, line_len, fence_ch, fence_n)) {
+                in_fence = false;
+            }
+        } else {
+            char ch = 0;
+            int fn = adr_fence_run(p, line_len, &ch);
+            if (fn > 0) {
+                in_fence = true;
+                fence_ch = ch;
+                fence_n = fn;
+            } else {
+                int name_len = adr_heading_name_len(p, line_len);
+                if (name_len > 0) {
+                    /* The previous heading's body ends where this one starts. */
+                    if (have_pending) {
+                        pending.body_end = line_off;
+                        cb(ctx, &pending);
+                    }
+                    pending.name = p + ST_HEADER_PREFIX;
+                    pending.name_len = name_len;
+                    pending.heading_start = line_off;
+                    pending.body_start =
+                        eol ? line_off + (size_t)line_len + SKIP_ONE : line_off + (size_t)line_len;
+                    have_pending = true;
+                }
+            }
+        }
+        if (!eol) {
+            break;
+        }
+        p = eol + SKIP_ONE;
+    }
+    if (have_pending) {
+        pending.body_end = strlen(content);
+        cb(ctx, &pending);
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_adr_check_structure(const char *content, char *errbuf, int errbuf_size) {
+    if (content && adr_has_unterminated_fence(content)) {
+        snprintf(errbuf, (size_t)errbuf_size,
+                 "the stored ADR leaves a code fence open, so its section boundaries are "
+                 "ambiguous and a section write could splice into a code sample; repair it "
+                 "with mode='update'");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+typedef struct {
+    const char *name;
+    int name_len;
+    bool found;
+    size_t body_start;
+    size_t body_end;
+} adr_find_ctx_t;
+
+static void adr_find_cb(void *ctx, const cbm_adr_heading_t *h) {
+    adr_find_ctx_t *f = (adr_find_ctx_t *)ctx;
+    /* First occurrence wins, so a document that repeats a heading updates
+     * deterministically rather than depending on scan order. */
+    if (f->found || h->name_len != f->name_len ||
+        memcmp(h->name, f->name, (size_t)f->name_len) != 0) {
+        return;
+    }
+    f->found = true;
+    f->body_start = h->body_start;
+    f->body_end = h->body_end;
+}
+
+/* The line ending this code should WRITE into `doc`: whichever of "\r\n" and
+ * "\n" the document already uses more often, LF on a tie or an empty document.
+ * Lines that already exist are never rewritten — this decides only the
+ * separator and the "## NAME" line an append adds, so a CRLF document does not
+ * acquire a stray bare newline nobody asked for. */
+static const char *adr_dominant_eol(const char *doc, size_t doc_len) {
+    size_t crlf = 0;
+    size_t lf = 0;
+    for (size_t i = 0; i < doc_len; i++) {
+        if (doc[i] != '\n') {
+            continue;
+        }
+        if (i > 0 && doc[i - SKIP_ONE] == '\r') {
+            crlf++;
+        } else {
+            lf++;
+        }
+    }
+    return crlf > lf ? "\r\n" : "\n";
+}
+
+/* Trailing line breaks, counting a "\r\n" PAIR as ONE break. Counting raw '\n'
+ * characters gets the count right but loses the shape, and the separator that
+ * is then appended has to match the ending it is continuing. */
+static size_t adr_trailing_breaks(const char *doc, size_t doc_len) {
+    size_t idx = doc_len;
+    size_t breaks = 0;
+    while (idx > 0 && (doc[idx - SKIP_ONE] == '\n' || doc[idx - SKIP_ONE] == '\r')) {
+        bool was_lf = doc[idx - SKIP_ONE] == '\n';
+        idx--;
+        if (was_lf && idx > 0 && doc[idx - SKIP_ONE] == '\r') {
+            idx--;
+        }
+        breaks++;
+    }
+    return breaks;
+}
+
+char *cbm_adr_splice_section(const char *content, const char *name, const char *body) {
+    if (!name || !body) {
+        return NULL;
+    }
+    const char *doc = content ? content : "";
+    size_t doc_len = strlen(doc);
+
+    /* Trailing newlines are stripped from the incoming body so that splicing
+     * the same body twice is byte-identical: without this the separator run
+     * would grow by one blank line on every repeat. */
+    size_t body_len = strlen(body);
+    while (body_len > 0 &&
+           (body[body_len - SKIP_ONE] == '\n' || body[body_len - SKIP_ONE] == '\r')) {
+        body_len--;
+    }
+
+    adr_find_ctx_t find;
+    memset(&find, 0, sizeof(find));
+    find.name = name;
+    find.name_len = (int)strlen(name);
+    if (cbm_adr_scan_headings(doc, adr_find_cb, &find) != CBM_STORE_OK) {
+        return NULL;
+    }
+
+    char *out = NULL;
+    if (find.found) {
+        /* Keep the replaced region's own trailing newline run, so the blank
+         * line that separates this section from the next survives untouched. */
+        size_t ws = find.body_end;
+        while (ws > find.body_start && (doc[ws - SKIP_ONE] == '\n' || doc[ws - SKIP_ONE] == '\r')) {
+            ws--;
+        }
+        size_t ws_len = find.body_end - ws;
+        size_t total = find.body_start + body_len + ws_len + (doc_len - find.body_end);
+        out = malloc(total + SKIP_ONE);
+        if (!out) {
+            return NULL;
+        }
+        size_t at = 0;
+        memcpy(out, doc, find.body_start);
+        at += find.body_start;
+        memcpy(out + at, body, body_len);
+        at += body_len;
+        memcpy(out + at, doc + ws, ws_len);
+        at += ws_len;
+        memcpy(out + at, doc + find.body_end, doc_len - find.body_end);
+        at += doc_len - find.body_end;
+        out[at] = '\0';
+        return out;
+    }
+
+    /* Absent: append. Enough line breaks are added to leave exactly one blank
+     * line before the new heading — never fewer, and never rewriting the
+     * breaks the document already ends with. Both the separator and the
+     * heading line use the document's OWN ending: counting raw '\n' here would
+     * drop a bare newline into a CRLF document, leaving it mixed. */
+    const char *eol = adr_dominant_eol(doc, doc_len);
+    size_t eol_len = strlen(eol);
+    size_t breaks = adr_trailing_breaks(doc, doc_len);
+    size_t sep = 0;
+    if (doc_len > 0 && breaks < PAIR_LEN) {
+        sep = PAIR_LEN - breaks;
+    }
+    size_t name_len = strlen(name);
+    size_t total = doc_len + (sep * eol_len) + ST_HEADER_PREFIX + name_len + eol_len + body_len;
+    out = malloc(total + SKIP_ONE);
+    if (!out) {
+        return NULL;
+    }
+    size_t cursor = 0;
+    memcpy(out, doc, doc_len);
+    cursor += doc_len;
+    for (size_t i = 0; i < sep; i++) {
+        memcpy(out + cursor, eol, eol_len);
+        cursor += eol_len;
+    }
+    memcpy(out + cursor, "## ", ST_HEADER_PREFIX);
+    cursor += ST_HEADER_PREFIX;
+    memcpy(out + cursor, name, name_len);
+    cursor += name_len;
+    memcpy(out + cursor, eol, eol_len);
+    cursor += eol_len;
+    memcpy(out + cursor, body, body_len);
+    cursor += body_len;
+    out[cursor] = '\0';
+    return out;
+}
+
+int cbm_adr_validate_section_name(const char *name, char *errbuf, int errbuf_size) {
+    if (!name || !name[0]) {
+        snprintf(errbuf, (size_t)errbuf_size, "section name must not be empty");
+        return CBM_STORE_ERR;
+    }
+    size_t len = strlen(name);
+    if (len >= CBM_SZ_64) {
+        snprintf(errbuf, (size_t)errbuf_size, "section name must be shorter than %d characters",
+                 CBM_SZ_64);
+        return CBM_STORE_ERR;
+    }
+    /* Everything below would make the written "## NAME" line scan back as a
+     * different heading, or as no heading at all. */
+    if (name[0] == '#') {
+        snprintf(errbuf, (size_t)errbuf_size, "section name must not start with '#': %s", name);
+        return CBM_STORE_ERR;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (name[i] == '\n' || name[i] == '\r') {
+            snprintf(errbuf, (size_t)errbuf_size, "section name must not contain a line break");
+            return CBM_STORE_ERR;
+        }
+    }
+    if (name[0] == ' ' || name[0] == '\t' || name[len - SKIP_ONE] == ' ' ||
+        name[len - SKIP_ONE] == '\t') {
+        snprintf(errbuf, (size_t)errbuf_size,
+                 "section name must not start or end with whitespace: '%s'", name);
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_adr_validate_section_keys(const char **keys, int count, char *errbuf, int errbuf_size) {
+    /* Section names used to be restricted to the six canonical headings. They
+     * are now a convention rather than a privilege, so the only names refused
+     * are the ones that could not round-trip through a "## NAME" line. */
+    for (int i = 0; i < count; i++) {
+        if (cbm_adr_validate_section_name(keys[i], errbuf, errbuf_size) != CBM_STORE_OK) {
+            return CBM_STORE_ERR;
+        }
     }
     return CBM_STORE_OK;
 }
@@ -8883,47 +9428,66 @@ int cbm_store_adr_delete(cbm_store_t *s, const char *project) {
 
 int cbm_store_adr_update_sections(cbm_store_t *s, const char *project, const char **keys,
                                   const char **values, int count, cbm_adr_t *out) {
+    if (!s || !s->db || !project || !keys || !values || !out) {
+        return CBM_STORE_ERR;
+    }
+
+    /* The read-modify-write below must be ONE transaction. Three writers
+     * replace this row wholesale — the indexing pipeline, the UI POST
+     * /api/adr handler, and manage_adr mode='update' — so an unguarded
+     * get/merge/store silently loses whichever of them commits between the
+     * read and the UPSERT. BEGIN IMMEDIATE takes the write lock up front, so a
+     * competing writer waits rather than being overwritten. */
+    if (cbm_store_begin(s) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+
     /* Get existing ADR */
     cbm_adr_t existing;
     int rc = cbm_store_adr_get(s, project, &existing);
     if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
         store_set_error(s, "no existing ADR to update");
         return rc;
     }
 
-    /* Parse existing sections */
-    cbm_adr_sections_t sections = cbm_adr_parse_sections(existing.content);
-    cbm_store_adr_free(&existing);
-
-    /* Merge new sections */
-    for (int i = 0; i < count; i++) {
-        bool found = false;
-        for (int j = 0; j < sections.count; j++) {
-            if (strcmp(sections.keys[j], keys[i]) == 0) {
-                free(sections.values[j]);
-                sections.values[j] = heap_strdup(values[i]);
-                found = true;
-                break;
-            }
-        }
-        if (!found && sections.count < ST_BUF_16) {
-            sections.keys[sections.count] = heap_strdup(keys[i]);
-            sections.values[sections.count] = heap_strdup(values[i]);
-            sections.count++;
-        }
+    /* Splice each section in place. The document is NOT rebuilt from parsed
+     * sections: that model drops the preamble, drops headings it does not
+     * recognise (including a mis-cased '## Purpose', whose whole block then
+     * disappears) and reorders the rest, so rendering from it would silently
+     * rewrite text nobody asked to change. Replacing byte spans leaves every
+     * untouched byte exactly as it was. */
+    char structure_err[CBM_SZ_256] = "";
+    if (cbm_adr_check_structure(existing.content, structure_err, (int)sizeof(structure_err)) !=
+        CBM_STORE_OK) {
+        cbm_store_adr_free(&existing);
+        (void)cbm_store_rollback(s);
+        store_set_error(s, structure_err);
+        return CBM_STORE_ERR;
     }
 
-    /* Render merged */
-    char *merged = cbm_adr_render(&sections);
-    cbm_adr_sections_free(&sections);
+    char *merged = heap_strdup(existing.content ? existing.content : "");
+    cbm_store_adr_free(&existing);
+    for (int i = 0; merged && i < count; i++) {
+        char *next = cbm_adr_splice_section(merged, keys[i], values[i]);
+        free(merged);
+        merged = next;
+    }
+
+    if (!merged) {
+        (void)cbm_store_rollback(s);
+        store_set_error(s, "failed to splice ADR section");
+        return CBM_STORE_ERR;
+    }
 
     /* Check length */
     if ((int)strlen(merged) > CBM_ADR_MAX_LENGTH) {
         char msg[CBM_SZ_128];
         snprintf(msg, sizeof(msg), "merged ADR exceeds %d chars (%d chars)", CBM_ADR_MAX_LENGTH,
                  (int)strlen(merged));
-        store_set_error(s, msg);
         free(merged);
+        (void)cbm_store_rollback(s);
+        store_set_error(s, msg);
         return CBM_STORE_ERR;
     }
 
@@ -8931,10 +9495,22 @@ int cbm_store_adr_update_sections(cbm_store_t *s, const char *project, const cha
     rc = cbm_store_adr_store(s, project, merged);
     free(merged);
     if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
         return rc;
     }
 
-    return cbm_store_adr_get(s, project, out);
+    /* Read back INSIDE the transaction so `out` is exactly what commits. */
+    rc = cbm_store_adr_get(s, project, out);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+    if (cbm_store_commit(s) != CBM_STORE_OK) {
+        cbm_store_adr_free(out);
+        (void)cbm_store_rollback(s);
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
 }
 
 void cbm_store_adr_free(cbm_adr_t *adr) {

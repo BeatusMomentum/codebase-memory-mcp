@@ -300,6 +300,22 @@ bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_b
 bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const char *target_file_path,
                                               const char *strategy);
 
+/* #1928: USAGE/WRITES/READS analog of the CALLS guard above. Reference edges
+ * resolved by the short-name registry carry no import-closure evidence, so a
+ * cross-language binding is a bare-name collision for EVERY strategy — drop
+ * it whenever the caller's language and the target file's language disagree
+ * (JS/TS family members and the C/C++ header family excepted). Pure;
+ * unit-tested in test_registry.c. */
+bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target_file_path);
+
+/* #1942: a bare (dot-less) Go reference can never denote a struct field —
+ * field access is always a selector expression, and selector references
+ * resolve on the LSP path. Drops a READS/WRITES/USAGE bind whose target is a
+ * Field when the reference text carries no '.'. Go only: other OO languages
+ * legitimately reference their own members bare inside method bodies. Pure;
+ * unit-tested in test_registry.c. */
+bool cbm_go_suppress_bare_field_ref(bool is_go, const char *ref_name, const char *target_label);
+
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);
 

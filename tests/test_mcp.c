@@ -851,6 +851,7 @@ TEST(mcp_tools_list) {
     ASSERT_NOT_NULL(strstr(json, "query_graph"));
     ASSERT_NOT_NULL(strstr(json, "trace_path"));
     ASSERT_NOT_NULL(strstr(json, "get_code_snippet"));
+    ASSERT_NOT_NULL(strstr(json, "get_file_outline"));
     ASSERT_NOT_NULL(strstr(json, "get_graph_schema"));
     ASSERT_NOT_NULL(strstr(json, "get_architecture"));
     ASSERT_NOT_NULL(strstr(json, "search_code"));
@@ -905,6 +906,7 @@ TEST(mcp_tools_list_latest_metadata) {
     ASSERT_NOT_NULL(strstr(json, "\"title\":\"Search graph\""));
     ASSERT_NOT_NULL(strstr(json, "\"title\":\"Index repository\""));
     ASSERT_NOT_NULL(strstr(json, "\"title\":\"Check index coverage\""));
+    ASSERT_NOT_NULL(strstr(json, "\"title\":\"Get file outline\""));
     /* No tool may declare an outputSchema. The blanket permissive schema
      * ({"type":"object","additionalProperties":true}) carried zero information
      * for clients, but its presence made spec-compliant clients read
@@ -939,6 +941,7 @@ TEST(mcp_tools_have_behavior_annotations) {
         {"query_graph", false, true, true, false},
         {"trace_path", false, true, true, false},
         {"get_code_snippet", false, true, true, false},
+        {"get_file_outline", false, true, true, false},
         {"get_graph_schema", false, true, true, false},
         {"compare_graphs", true, false, true, false},
         {"get_architecture", false, true, true, false},
@@ -1336,9 +1339,9 @@ static int issue403_initialize_count_calls(const char *session_root, bool approv
     cbm_setenv("CBM_CACHE_DIR", cache, 1);
 
     char err[1024];
-    bool approved = !approve_sensitive ||
-                    cbm_workspace_grant_add(cache, cbm_workspace_home_dir(), session_root, true,
-                                            err, sizeof(err));
+    bool approved =
+        !approve_sensitive || cbm_workspace_grant_add(cache, cbm_workspace_home_dir(), session_root,
+                                                      true, err, sizeof(err));
     cbm_config_t *cfg = approved ? cbm_config_open(cache) : NULL;
     cbm_mcp_server_t *srv = cfg ? cbm_mcp_server_new(NULL) : NULL;
     int calls = -2;
@@ -1368,8 +1371,8 @@ static int issue403_initialize_count_calls(const char *session_root, bool approv
 }
 
 TEST(mcp_issue403_sensitive_root_stops_before_discovery_count) {
-    int sensitive = issue403_initialize_count_calls(
-        "C:/Users/dev/AppData/Local/Programs/Antigravity", false);
+    int sensitive =
+        issue403_initialize_count_calls("C:/Users/dev/AppData/Local/Programs/Antigravity", false);
     int ordinary = issue403_initialize_count_calls("C:/Users/dev/projects/app", false);
     ASSERT_EQ(sensitive, 0);
     ASSERT_EQ(ordinary, 1);
@@ -1434,13 +1437,37 @@ TEST(server_handle_tools_list_defaults_to_all_tools_and_accepts_cursor) {
     ASSERT_NOT_NULL(strstr(resp, "ingest_traces"));
     free(resp);
 
-    resp = cbm_mcp_server_handle(
-        srv,
-        "{\"jsonrpc\":\"2.0\",\"id\":201,\"method\":\"tools/list\",\"params\":{\"cursor\":\"8\"}}");
+    /* A cursored page advertises nextCursor exactly while tools remain after
+     * it. This used to pass the literal cursor "8", which silently encoded
+     * "there are at most MCP_TOOLS_PAGE_SIZE * 2 tools" -- so registering a
+     * 17th tool broke it for a reason that had nothing to do with pagination.
+     * Derive the offset from the live count instead: the final page, wherever
+     * it falls, is the one that must not advertise more. */
+    resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":203,\"method\":\"tools/list\"}");
+    ASSERT_NOT_NULL(resp);
+    size_t total_tools = mcp_response_tool_count(resp);
+    free(resp);
+    ASSERT_TRUE(total_tools > 1U);
+
+    char last_page_req[160];
+    snprintf(last_page_req, sizeof(last_page_req),
+             "{\"jsonrpc\":\"2.0\",\"id\":201,\"method\":\"tools/list\","
+             "\"params\":{\"cursor\":\"%zu\"}}",
+             total_tools - 1U);
+    resp = cbm_mcp_server_handle(srv, last_page_req);
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"id\":201"));
     ASSERT_NULL(strstr(resp, "\"nextCursor\""));
-    ASSERT_NOT_NULL(strstr(resp, "manage_adr"));
+    ASSERT_EQ(mcp_response_tool_count(resp), 1U);
+    free(resp);
+
+    /* ...and a page that does have tools after it MUST advertise the cursor,
+     * so the assertion above cannot pass merely because paging never emits. */
+    resp = cbm_mcp_server_handle(
+        srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":204,\"method\":\"tools/list\",\"params\":{\"cursor\":\"0\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"nextCursor\""));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -1463,9 +1490,10 @@ TEST(server_handle_analysis_profile_filters_and_rejects_mutators) {
     resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":220,\"method\":\"tools/list\"}");
     ASSERT_NOT_NULL(resp);
     static const char *const analysis_tools[] = {
-        "search_graph",     "query_graph",    "trace_path",           "get_code_snippet",
-        "get_graph_schema", "compare_graphs", "get_architecture",     "search_code",
-        "list_projects",    "index_status",   "check_index_coverage", "detect_changes",
+        "search_graph",     "query_graph",      "trace_path",     "get_code_snippet",
+        "get_file_outline", "get_graph_schema", "compare_graphs", "get_architecture",
+        "search_code",      "list_projects",    "index_status",   "check_index_coverage",
+        "detect_changes",
     };
     ASSERT_EQ(mcp_response_tool_count(resp), sizeof(analysis_tools) / sizeof(analysis_tools[0]));
     for (size_t i = 0U; i < sizeof(analysis_tools) / sizeof(analysis_tools[0]); i++) {
@@ -1504,10 +1532,11 @@ TEST(server_handle_scout_profile_exposes_only_the_fast_tier) {
 
     resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":223,\"method\":\"tools/list\"}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_EQ(mcp_response_tool_count(resp), 7U);
+    ASSERT_EQ(mcp_response_tool_count(resp), 8U);
     ASSERT_TRUE(mcp_response_has_exact_tool(resp, "search_graph"));
     ASSERT_TRUE(mcp_response_has_exact_tool(resp, "trace_path"));
     ASSERT_TRUE(mcp_response_has_exact_tool(resp, "get_code_snippet"));
+    ASSERT_TRUE(mcp_response_has_exact_tool(resp, "get_file_outline"));
     ASSERT_TRUE(mcp_response_has_exact_tool(resp, "get_architecture"));
     ASSERT_TRUE(mcp_response_has_exact_tool(resp, "list_projects"));
     ASSERT_TRUE(mcp_response_has_exact_tool(resp, "index_status"));
@@ -1730,6 +1759,8 @@ static cbm_mcp_server_t *setup_mcp_with_data(void) {
     return srv;
 }
 
+static char *extract_text_content(const char *mcp_result);
+
 TEST(tool_list_projects_empty) {
     cbm_mcp_server_t *srv = setup_mcp_with_data();
 
@@ -1788,6 +1819,142 @@ TEST(tool_compare_graphs_registered_issue525) {
     ASSERT_NOT_NULL(resp);
     ASSERT_NULL(strstr(resp, "unknown tool: compare_graphs"));
     free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_get_file_outline_returns_bounded_filtered_columnar_rows_issue469) {
+    cbm_mcp_server_t *srv = setup_mcp_with_data();
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "outline-project", "/tmp/outline-project"),
+              CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, "outline-project");
+
+    cbm_node_t nodes[] = {
+        {.project = "outline-project",
+         .label = "Module",
+         .name = "main",
+         .qualified_name = "outline-project.main",
+         .file_path = "src/main.c",
+         .start_line = 1,
+         .end_line = 80},
+        {.project = "outline-project",
+         .label = "Function",
+         .name = "alpha",
+         .qualified_name = "outline-project.src.main.alpha",
+         .file_path = "src/main.c",
+         .start_line = 10,
+         .end_line = 14},
+        {.project = "outline-project",
+         .label = "Class",
+         .name = "IgnoredClass",
+         .qualified_name = "outline-project.src.main.IgnoredClass",
+         .file_path = "src/main.c",
+         .start_line = 15,
+         .end_line = 40},
+        {.project = "outline-project",
+         .label = "Method",
+         .name = "omega",
+         .qualified_name = "outline-project.src.main.omega",
+         .file_path = "src/main.c",
+         .start_line = 30,
+         .end_line = 33},
+        {.project = "outline-project",
+         .label = "Function",
+         .name = "other",
+         .qualified_name = "outline-project.src.other.other",
+         .file_path = "src/other.c",
+         .start_line = 1,
+         .end_line = 2},
+    };
+    for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
+        ASSERT_GT(cbm_store_upsert_node(store, &nodes[i]), 0);
+    }
+
+    char *response =
+        cbm_mcp_handle_tool(srv, "get_file_outline",
+                            "{\"project\":\"outline-project\",\"file_path\":\"src/main.c\","
+                            "\"labels\":[\"Function\",\"Method\"],\"limit\":1}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "cols"));
+    ASSERT_NOT_NULL(strstr(response, "(cols: name label lines qn)"));
+    ASSERT_NOT_NULL(strstr(response, "alpha"));
+    ASSERT_NULL(strstr(response, "omega"));
+    ASSERT_NULL(strstr(response, "IgnoredClass"));
+    ASSERT_NOT_NULL(strstr(response, "total: 2"));
+    ASSERT_NOT_NULL(strstr(response, "has_more: true"));
+    ASSERT_NULL(strstr(response, "unknown tool"));
+    free(response);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_get_file_outline_validates_json_path_limit_and_cancel_issue469) {
+    cbm_mcp_server_t *srv = setup_mcp_with_data();
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "outline-controls", "/tmp/outline-controls"),
+              CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, "outline-controls");
+    cbm_node_t node = {.project = "outline-controls",
+                       .label = "Function",
+                       .name = "bounded",
+                       .qualified_name = "outline-controls.src.main.bounded",
+                       .file_path = "src/main.c",
+                       .start_line = 7,
+                       .end_line = 9};
+    ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+
+    char *response =
+        cbm_mcp_handle_tool(srv, "get_file_outline",
+                            "{\"project\":\"outline-controls\",\"file_path\":\"../outside.c\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "repository-relative"));
+    ASSERT_NOT_NULL(strstr(response, "isError"));
+    free(response);
+
+    response = cbm_mcp_handle_tool(
+        srv, "get_file_outline",
+        "{\"project\":\"outline-controls\",\"file_path\":\"src/main.c\",\"limit\":201}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "between 1 and 200"));
+    ASSERT_NOT_NULL(strstr(response, "isError"));
+    free(response);
+
+    response = cbm_mcp_handle_tool(srv, "get_file_outline",
+                                   "{\"project\":\"outline-controls\",\"file_path\":\"src/main.c\","
+                                   "\"format\":\"json\"}");
+    ASSERT_NOT_NULL(response);
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_TRUE(yyjson_is_arr(yyjson_obj_get(root, "cols")));
+    ASSERT_TRUE(yyjson_is_arr(yyjson_obj_get(root, "rows")));
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "total")), 1);
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    ASSERT_TRUE(cbm_mcp_server_request_scope_begin(srv));
+    ASSERT_TRUE(cbm_mcp_server_cancel_active(srv));
+    response = cbm_mcp_handle_tool(
+        srv, "get_file_outline", "{\"project\":\"outline-controls\",\"file_path\":\"src/main.c\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "cancelled for this request"));
+    ASSERT_NOT_NULL(strstr(response, "isError"));
+    free(response);
+    cbm_mcp_server_request_scope_end(srv);
+
+    response = cbm_mcp_handle_tool(
+        srv, "get_file_outline", "{\"project\":\"outline-controls\",\"file_path\":\"src/main.c\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "bounded"));
+    ASSERT_NULL(strstr(response, "cancelled"));
+    free(response);
 
     cbm_mcp_server_free(srv);
     PASS();
@@ -1812,7 +1979,6 @@ TEST(tool_search_graph_basic) {
 /* Forward declarations for helpers defined later in this file */
 static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz);
 static void cleanup_snippet_dir(const char *tmp_dir);
-static char *extract_text_content(const char *mcp_result);
 
 TEST(tool_search_graph_semantic_only_skips_structural_results_issue1295) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
@@ -3555,6 +3721,118 @@ TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped) {
     ASSERT_NULL(strstr(ev_json_txt, "lsp_trait_dispatch"));
     free(ev_json_txt);
     free(ev_json);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* #1542 leftover: header order is strategy,confidence then args, but json
+ * used to emit args first; tree flat_trace (risk_labels || data_flow) used
+ * to call bfs_to_toon_table without include_evidence. Pin both: every row
+ * has len(cols)==len(row), and the strategy cell is the class not the args
+ * array. */
+TEST(tool_trace_path_evidence_columns_match_header_issue1542) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "ev-order";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/ev-order");
+    cbm_node_t caller = {.project = proj,
+                         .label = "Function",
+                         .name = "caller",
+                         .qualified_name = "ev-order.src.caller",
+                         .file_path = "src/a.c",
+                         .start_line = 1,
+                         .end_line = 5};
+    cbm_node_t callee = {.project = proj,
+                         .label = "Function",
+                         .name = "target",
+                         .qualified_name = "ev-order.src.target",
+                         .file_path = "src/a.c",
+                         .start_line = 10,
+                         .end_line = 20};
+    int64_t id_caller = cbm_store_upsert_node(st, &caller);
+    int64_t id_callee = cbm_store_upsert_node(st, &callee);
+    ASSERT_GT(id_caller, 0);
+    ASSERT_GT(id_callee, 0);
+    cbm_edge_t e = {.project = proj,
+                    .source_id = id_caller,
+                    .target_id = id_callee,
+                    .type = "CALLS",
+                    .properties_json = "{\"callee\":\"target\",\"confidence\":0.95,"
+                                       "\"strategy\":\"lsp_trait_dispatch\",\"candidates\":1,"
+                                       "\"args\":[\"x\"]}"};
+    ASSERT_GT(cbm_store_insert_edge(st, &e), 0);
+
+    /* json × data_flow × include_evidence: cols identity, not just count. */
+    char *js = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":94,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"function_name\":\"caller\","
+             "\"project\":\"ev-order\",\"direction\":\"outbound\",\"include_evidence\":true,"
+             "\"mode\":\"data_flow\",\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(js);
+    char *js_txt = extract_text_content(js);
+    ASSERT_NOT_NULL(js_txt);
+    yyjson_doc *doc = yyjson_read(js_txt, strlen(js_txt), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *callees = yyjson_obj_get(yyjson_doc_get_root(doc), "callees");
+    ASSERT_NOT_NULL(callees);
+    yyjson_val *cols = yyjson_obj_get(callees, "cols");
+    ASSERT_NOT_NULL(cols);
+    static const char *want[] = {"name", "hop", "strategy", "confidence", "args"};
+    ASSERT_EQ((int)yyjson_arr_size(cols), 5);
+    for (int i = 0; i < 5; i++) {
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(cols, i)), want[i]);
+    }
+    yyjson_val *hop1 = NULL;
+    yyjson_val *groups = yyjson_obj_get(callees, "groups");
+    ASSERT_NOT_NULL(groups);
+    size_t ng = yyjson_arr_size(groups);
+    for (size_t g = 0; g < ng; g++) {
+        yyjson_val *rows = yyjson_obj_get(yyjson_arr_get(groups, g), "rows");
+        if (!rows) {
+            continue;
+        }
+        size_t nr = yyjson_arr_size(rows);
+        for (size_t r = 0; r < nr; r++) {
+            yyjson_val *row = yyjson_arr_get(rows, r);
+            yyjson_val *hop = row ? yyjson_arr_get(row, 1) : NULL;
+            if (hop && yyjson_get_int(hop) >= 1) {
+                hop1 = row;
+                break;
+            }
+        }
+        if (hop1) {
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(hop1);
+    ASSERT_EQ((int)yyjson_arr_size(hop1), 5);
+    ASSERT_TRUE(yyjson_is_str(yyjson_arr_get(hop1, 2)));
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(hop1, 2)), "lsp");
+    ASSERT_TRUE(yyjson_is_num(yyjson_arr_get(hop1, 3)));
+    ASSERT_TRUE(yyjson_is_arr(yyjson_arr_get(hop1, 4)));
+    yyjson_doc_free(doc);
+    free(js_txt);
+    free(js);
+
+    /* tree × risk_labels × include_evidence used to drop evidence entirely
+     * because flat_trace routed through bfs_to_toon_table without the flag. */
+    char *tree = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":95,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"function_name\":\"caller\","
+             "\"project\":\"ev-order\",\"direction\":\"outbound\",\"include_evidence\":true,"
+             "\"risk_labels\":true}}}");
+    ASSERT_NOT_NULL(tree);
+    char *tree_txt = extract_text_content(tree);
+    ASSERT_NOT_NULL(tree_txt);
+    ASSERT_NOT_NULL(strstr(tree_txt, "strategy"));
+    ASSERT_NOT_NULL(strstr(tree_txt, "confidence"));
+    ASSERT_NOT_NULL(strstr(tree_txt, "lsp"));
+    ASSERT_NOT_NULL(strstr(tree_txt, "0.95"));
+    ASSERT_NULL(strstr(tree_txt, "lsp_trait_dispatch"));
+    free(tree_txt);
+    free(tree);
+
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -5843,6 +6121,489 @@ TEST(tool_manage_adr_rejects_removed_sections_argument) {
     ASSERT_STR_EQ(adr.content, "## PURPOSE\nOriginal ADR.\n");
     cbm_store_adr_free(&adr);
 
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* mode='set_sections' rewrites only the named sections. mode='update' replaces
+ * the whole document, so adding one entry costs a full re-send and every byte
+ * the caller did not mean to touch survives only as well as that round-trip. */
+TEST(tool_manage_adr_set_sections_replaces_only_named) {
+    const char *project = "adr-sec-named";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/adr-sec-named"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_adr_store(st, project, "## PURPOSE\nOriginal purpose.\n\n## STACK\nC."),
+              CBM_STORE_OK);
+
+    /* A section write is a mutation: it must take the per-project lease, or it
+     * runs concurrently with an index through a query-only store handle. */
+    mcp_mutation_guard_probe_t probe = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                                     "{\"project\":\"adr-sec-named\",\"mode\":\"set_sections\","
+                                     "\"section_updates\":{\"PATTERNS\":\"- Pipeline stages.\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "sections_updated"));
+    ASSERT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+    ASSERT_EQ(probe.begin_count, 1);
+    ASSERT_EQ(probe.end_count, 1);
+    ASSERT_STR_EQ(probe.begin_projects[0], project);
+
+    /* The sections nobody named survive verbatim, and the named one landed. */
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &adr), CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr.content);
+    ASSERT_NOT_NULL(strstr(adr.content, "## PURPOSE\nOriginal purpose."));
+    ASSERT_NOT_NULL(strstr(adr.content, "## STACK\nC."));
+    ASSERT_NOT_NULL(strstr(adr.content, "## PATTERNS\n- Pipeline stages."));
+    cbm_store_adr_free(&adr);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* THE reason this shape was chosen over a whole-document append: applying the
+ * same request twice must leave the document byte-identical. An MCP client that
+ * loses a response and retries would silently duplicate an appended chunk. */
+TEST(tool_manage_adr_set_sections_is_idempotent) {
+    const char *project = "adr-sec-idem";
+    const char *request = "{\"project\":\"adr-sec-idem\",\"mode\":\"set_sections\","
+                          "\"section_updates\":{\"PATTERNS\":\"- Pipeline stages.\"}}";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/adr-sec-idem"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_adr_store(st, project, "## PURPOSE\nOriginal purpose.\n\n## STACK\nC."),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr", request);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "sections_updated"));
+    free(resp);
+
+    cbm_adr_t first;
+    memset(&first, 0, sizeof(first));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &first), CBM_STORE_OK);
+    ASSERT_NOT_NULL(first.content);
+    char *after_first = strdup(first.content);
+    ASSERT_NOT_NULL(after_first);
+    cbm_store_adr_free(&first);
+
+    /* Replay the identical request — the lost-response retry. */
+    resp = cbm_mcp_handle_tool(srv, "manage_adr", request);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "sections_updated"));
+    ASSERT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+
+    cbm_adr_t second;
+    memset(&second, 0, sizeof(second));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &second), CBM_STORE_OK);
+    ASSERT_NOT_NULL(second.content);
+    ASSERT_STR_EQ(second.content, after_first);
+    /* And the body is present exactly once, not appended twice. */
+    const char *hit = strstr(second.content, "- Pipeline stages.");
+    ASSERT_NOT_NULL(hit);
+    ASSERT_NULL(strstr(hit + 1, "- Pipeline stages."));
+    cbm_store_adr_free(&second);
+    free(after_first);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* A project with no ADR yet degrades to a plain create rather than erroring:
+ * the store primitive requires an existing row, so the handler seeds one. */
+TEST(tool_manage_adr_set_sections_creates_when_absent) {
+    const char *project = "adr-sec-new";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/adr-sec-new"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                                     "{\"project\":\"adr-sec-new\",\"mode\":\"set_sections\","
+                                     "\"section_updates\":{\"PURPOSE\":\"Only entry.\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "sections_updated"));
+    ASSERT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &adr), CBM_STORE_OK);
+    /* Exact match: a create must not leave a leading separator behind. */
+    ASSERT_STR_EQ(adr.content, "## PURPOSE\nOnly entry.");
+    cbm_store_adr_free(&adr);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* set_sections without section_updates must fail loudly. Falling through to
+ * 'get' would hand a caller that meant to write a success-shaped read — and it
+ * must not take the mutation lease on the way to being rejected. */
+TEST(tool_manage_adr_set_sections_without_updates_errors) {
+    const char *project = "adr-sec-missing";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/adr-sec-missing"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_adr_store(st, project, "## PURPOSE\nUntouched.\n"), CBM_STORE_OK);
+
+    mcp_mutation_guard_probe_t probe = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                                     "{\"project\":\"adr-sec-missing\",\"mode\":\"set_sections\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "missing_section_updates"));
+    ASSERT_NOT_NULL(strstr(resp, "No ADR write was performed"));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NULL(strstr(resp, "adr_hint"));
+    free(resp);
+    ASSERT_EQ(probe.begin_count, 0);
+    ASSERT_EQ(probe.end_count, 0);
+
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &adr), CBM_STORE_OK);
+    ASSERT_STR_EQ(adr.content, "## PURPOSE\nUntouched.\n");
+    cbm_store_adr_free(&adr);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* An empty body would leave a heading with nothing under it — a content
+ * deletion wearing the response shape of an update. A name that cannot survive
+ * a "## NAME" round-trip would scan back as a different heading or as none, so
+ * writing it twice would duplicate it. Both are refused before a store opens. */
+TEST(tool_manage_adr_set_sections_rejects_unwritable_sections) {
+    const char *project = "adr-sec-guards";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/adr-sec-guards"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_adr_store(st, project, "## PURPOSE\nUntouched.\n"), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                                     "{\"project\":\"adr-sec-guards\",\"mode\":\"set_sections\","
+                                     "\"section_updates\":{\"PURPOSE\":\"\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "empty_section_content"));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+
+    /* A '#'-leading name would render "## # PURPOSE" and scan back different. */
+    resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                               "{\"project\":\"adr-sec-guards\",\"mode\":\"set_sections\","
+                               "\"section_updates\":{\"# PURPOSE\":\"x\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "invalid_section_name"));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+
+    /* A newline in the name would forge a second heading line. */
+    resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                               "{\"project\":\"adr-sec-guards\",\"mode\":\"set_sections\","
+                               "\"section_updates\":{\"A\\nB\":\"x\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "invalid_section_name"));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                               "{\"project\":\"adr-sec-guards\",\"mode\":\"set_sections\","
+                               "\"section_updates\":{}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "invalid_section_updates"));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+
+    /* Every rejection left the stored ADR byte-identical. */
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &adr), CBM_STORE_OK);
+    ASSERT_STR_EQ(adr.content, "## PURPOSE\nUntouched.\n");
+    cbm_store_adr_free(&adr);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* The use case the whole change exists for: add an entry under its own
+ * heading, and be able to retry it. Under the old canonical-only rules this
+ * was the exact request that would have corrupted an ADR. */
+TEST(tool_manage_adr_set_sections_adds_custom_heading) {
+    const char *project = "adr-sec-custom";
+    const char *request = "{\"project\":\"adr-sec-custom\",\"mode\":\"set_sections\","
+                          "\"section_updates\":{\"DECISIONS\":\"- Chose SQLite.\"}}";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/adr-sec-custom"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_adr_store(st, project, "## PURPOSE\nFoo"), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr", request);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "sections_updated"));
+    ASSERT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &adr), CBM_STORE_OK);
+    ASSERT_STR_EQ(adr.content, "## PURPOSE\nFoo\n\n## DECISIONS\n- Chose SQLite.");
+    cbm_store_adr_free(&adr);
+
+    /* Retry the identical request: byte-identical, not duplicated. */
+    resp = cbm_mcp_handle_tool(srv, "manage_adr", request);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "sections_updated"));
+    free(resp);
+
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &adr), CBM_STORE_OK);
+    ASSERT_STR_EQ(adr.content, "## PURPOSE\nFoo\n\n## DECISIONS\n- Chose SQLite.");
+    cbm_store_adr_free(&adr);
+
+    /* And it is now a real section the write path can target again. */
+    resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                               "{\"project\":\"adr-sec-custom\",\"mode\":\"set_sections\","
+                               "\"section_updates\":{\"DECISIONS\":\"- Chose DuckDB.\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "sections_updated"));
+    free(resp);
+
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &adr), CBM_STORE_OK);
+    ASSERT_STR_EQ(adr.content, "## PURPOSE\nFoo\n\n## DECISIONS\n- Chose DuckDB.");
+    cbm_store_adr_free(&adr);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Regression for real data loss: rebuilding the document from parsed sections
+ * dropped the preamble, dropped a mis-cased heading together with its whole
+ * block, and reordered what survived. Splicing leaves all of it alone. */
+TEST(tool_manage_adr_set_sections_preserves_preamble_and_order) {
+    const char *project = "adr-sec-preserve";
+    /* The fenced block sits inside the mis-cased section, NOT the one being
+     * written: a section's body runs to the next heading, so rewriting STACK
+     * would legitimately replace a fence that belonged to STACK. */
+    const char *stored = "Notes before any heading.\n\n"
+                         "## Purpose\nMis-cased but real.\n\n"
+                         "```md\n## Example\nfenced sample\n```\n\n"
+                         "## STACK\nC and SQLite.\n\n"
+                         "## PURPOSE\nCanonical one.";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/adr-sec-preserve"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_adr_store(st, project, stored), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                                     "{\"project\":\"adr-sec-preserve\",\"mode\":\"set_sections\","
+                                     "\"section_updates\":{\"STACK\":\"C only.\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "sections_updated"));
+    free(resp);
+
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &adr), CBM_STORE_OK);
+    ASSERT_STR_EQ(adr.content, "Notes before any heading.\n\n"
+                               "## Purpose\nMis-cased but real.\n\n"
+                               "```md\n## Example\nfenced sample\n```\n\n"
+                               "## STACK\nC only.\n\n"
+                               "## PURPOSE\nCanonical one.");
+    cbm_store_adr_free(&adr);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* An unterminated fence hides every heading after it, so a write would append
+ * a duplicate heading rather than replace the real one. Refuse, explicitly,
+ * and leave the document alone. */
+TEST(tool_manage_adr_set_sections_refuses_unterminated_fence) {
+    const char *project = "adr-sec-fence";
+    const char *stored = "## PURPOSE\nFoo\n\n```\nunclosed sample\n\n## STACK\nBar";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/adr-sec-fence"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_adr_store(st, project, stored), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                                     "{\"project\":\"adr-sec-fence\",\"mode\":\"set_sections\","
+                                     "\"section_updates\":{\"STACK\":\"New bar.\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "write_error"));
+    ASSERT_NOT_NULL(strstr(resp, "code fence"));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &adr), CBM_STORE_OK);
+    ASSERT_STR_EQ(adr.content, stored);
+    cbm_store_adr_free(&adr);
+
+    /* mode='sections' reports the same ambiguity rather than a partial list. */
+    resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                               "{\"project\":\"adr-sec-fence\",\"mode\":\"sections\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "unterminated_code_fence"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* mode='sections' and the section write path must agree on what a heading is.
+ * They used to disagree — 'sections' listed every '#'-prefixed line, including
+ * ones inside code fences that no write could ever target — and two components
+ * disagreeing about what a section is is how a section write came to be able
+ * to destroy one. */
+TEST(tool_manage_adr_sections_agrees_with_write_path) {
+    const char *project = "adr-sec-agree";
+    const char *stored = "Preamble.\n\n"
+                         "# Title\n\n"
+                         "## PURPOSE\nFoo\n\n"
+                         "### Sub\n\n"
+                         "```md\n## Fenced\n```\n\n"
+                         "## DECISIONS\nBar";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/adr-sec-agree"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_adr_store(st, project, stored), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                                     "{\"project\":\"adr-sec-agree\",\"mode\":\"sections\"}");
+    ASSERT_NOT_NULL(resp);
+    /* Listed: exactly the two headings the write path can target. */
+    ASSERT_NOT_NULL(strstr(resp, "## PURPOSE"));
+    ASSERT_NOT_NULL(strstr(resp, "## DECISIONS"));
+    /* Not listed: a fenced '##', a '#' title, a '###' subheading. */
+    ASSERT_NULL(strstr(resp, "## Fenced"));
+    ASSERT_NULL(strstr(resp, "# Title"));
+    ASSERT_NULL(strstr(resp, "### Sub"));
+    free(resp);
+
+    /* Every listed heading is writable, and the unlisted ones stay as text. */
+    resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                               "{\"project\":\"adr-sec-agree\",\"mode\":\"set_sections\","
+                               "\"section_updates\":{\"DECISIONS\":\"New bar\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "sections_updated"));
+    free(resp);
+
+    /* The '#', '###' and fenced lines are body text of PURPOSE, and writing a
+     * different section leaves every byte of them alone. */
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &adr), CBM_STORE_OK);
+    ASSERT_STR_EQ(adr.content, "Preamble.\n\n"
+                               "# Title\n\n"
+                               "## PURPOSE\nFoo\n\n"
+                               "### Sub\n\n"
+                               "```md\n## Fenced\n```\n\n"
+                               "## DECISIONS\nNew bar");
+    cbm_store_adr_free(&adr);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* CBM_ADR_MAX_LENGTH is enforced on this path — mode='update' bypasses it, so
+ * exposing an incremental writer without the cap would make unbounded growth
+ * cheap. The rejected merge must also roll back to the byte-identical prior
+ * document rather than leaving a half-applied write. */
+TEST(tool_manage_adr_set_sections_rejects_oversize) {
+    const char *project = "adr-sec-cap";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/adr-sec-cap"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_adr_store(st, project, "## PURPOSE\nSmall.\n"), CBM_STORE_OK);
+
+    size_t huge_len = (size_t)CBM_ADR_MAX_LENGTH + 100;
+    char *huge = malloc(huge_len + 1);
+    ASSERT_NOT_NULL(huge);
+    memset(huge, 'x', huge_len);
+    huge[huge_len] = '\0';
+
+    size_t args_len = huge_len + 256;
+    char *args = malloc(args_len);
+    ASSERT_NOT_NULL(args);
+    snprintf(args, args_len,
+             "{\"project\":\"adr-sec-cap\",\"mode\":\"set_sections\","
+             "\"section_updates\":{\"STACK\":\"%s\"}}",
+             huge);
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "write_error"));
+    ASSERT_NOT_NULL(strstr(resp, "exceeds"));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+    free(args);
+    free(huge);
+
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, project, &adr), CBM_STORE_OK);
+    ASSERT_STR_EQ(adr.content, "## PURPOSE\nSmall.\n");
+    cbm_store_adr_free(&adr);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* The mode must be advertised, or callers never learn it exists and keep
+ * paying for whole-document rewrites. */
+TEST(tool_manage_adr_set_sections_is_advertised) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}");
+    ASSERT_NOT_NULL(resp);
+    const char *adr_tool = strstr(resp, "manage_adr");
+    ASSERT_NOT_NULL(adr_tool);
+    ASSERT_NOT_NULL(strstr(adr_tool, "set_sections"));
+    ASSERT_NOT_NULL(strstr(adr_tool, "section_updates"));
+    free(resp);
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -13072,6 +13833,8 @@ SUITE(mcp) {
     RUN_TEST(tool_compare_graphs_enforces_encoded_budget_issue525);
     RUN_TEST(tool_compare_graphs_validation_and_scan_cap_are_atomic_issue525);
     RUN_TEST(tool_compare_graphs_cancel_and_readonly_handles_release_issue525);
+    RUN_TEST(tool_get_file_outline_returns_bounded_filtered_columnar_rows_issue469);
+    RUN_TEST(tool_get_file_outline_validates_json_path_limit_and_cancel_issue469);
     RUN_TEST(tool_search_graph_basic);
     RUN_TEST(tool_search_graph_semantic_only_skips_structural_results_issue1295);
     RUN_TEST(tool_trace_totals_respect_test_filter);
@@ -13106,6 +13869,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_call_path_prefers_definition);
     RUN_TEST(trace_evidence_strategy_class_vocabulary_is_closed);
     RUN_TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped);
+    RUN_TEST(tool_trace_path_evidence_columns_match_header_issue1542);
     RUN_TEST(tool_trace_call_path_depth_clamped);
     RUN_TEST(tool_trace_call_path_distinct_defs_not_over_unioned);
     RUN_TEST(tool_trace_call_path_dts_stub_unions_with_impl);
@@ -13163,6 +13927,17 @@ SUITE(mcp) {
     RUN_TEST(tool_manage_adr_get_with_existing_adr);
     RUN_TEST(tool_manage_adr_unified_backend_issue256);
     RUN_TEST(tool_manage_adr_rejects_removed_sections_argument);
+    RUN_TEST(tool_manage_adr_set_sections_replaces_only_named);
+    RUN_TEST(tool_manage_adr_set_sections_is_idempotent);
+    RUN_TEST(tool_manage_adr_set_sections_creates_when_absent);
+    RUN_TEST(tool_manage_adr_set_sections_without_updates_errors);
+    RUN_TEST(tool_manage_adr_set_sections_rejects_unwritable_sections);
+    RUN_TEST(tool_manage_adr_set_sections_adds_custom_heading);
+    RUN_TEST(tool_manage_adr_set_sections_preserves_preamble_and_order);
+    RUN_TEST(tool_manage_adr_set_sections_refuses_unterminated_fence);
+    RUN_TEST(tool_manage_adr_sections_agrees_with_write_path);
+    RUN_TEST(tool_manage_adr_set_sections_rejects_oversize);
+    RUN_TEST(tool_manage_adr_set_sections_is_advertised);
     RUN_TEST(tool_index_repository_reports_store_backed_adr);
     RUN_TEST(tool_index_repository_resolves_root_path_from_project_name_issue1211);
     RUN_TEST(tool_index_repository_unknown_project_name_still_requires_repo_path);

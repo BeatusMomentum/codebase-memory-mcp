@@ -824,8 +824,8 @@ TEST(pipeline_calls_resolution) {
 
 /* True iff a CALLS edge exists from a node named src_name to a node named
  * tgt_name. Used to assert cross-file call resolution survives a reindex. */
-static bool cross_file_call_exists(cbm_store_t *s, const char *project, const char *src_name,
-                                   const char *tgt_name) {
+static bool cross_file_edge_exists(cbm_store_t *s, const char *project, const char *src_name,
+                                   const char *tgt_name, const char *edge_type) {
     cbm_node_t *srcs = NULL;
     cbm_node_t *tgts = NULL;
     int sc = 0;
@@ -836,7 +836,7 @@ static bool cross_file_call_exists(cbm_store_t *s, const char *project, const ch
     for (int i = 0; i < sc && !found; i++) {
         cbm_edge_t *edges = NULL;
         int ec = 0;
-        cbm_store_find_edges_by_source_type(s, srcs[i].id, "CALLS", &edges, &ec);
+        cbm_store_find_edges_by_source_type(s, srcs[i].id, edge_type, &edges, &ec);
         for (int j = 0; j < ec && !found; j++) {
             for (int k = 0; k < tc; k++) {
                 if (edges[j].target_id == tgts[k].id) {
@@ -856,6 +856,11 @@ static bool cross_file_call_exists(cbm_store_t *s, const char *project, const ch
         cbm_store_free_nodes(tgts, tc);
     }
     return found;
+}
+
+static bool cross_file_call_exists(cbm_store_t *s, const char *project, const char *src_name,
+                                   const char *tgt_name) {
+    return cross_file_edge_exists(s, project, src_name, tgt_name, "CALLS");
 }
 
 /* True iff the exact named CALLS edge exists and its serialized strategy
@@ -4688,6 +4693,247 @@ TEST(pipeline_python_receiver_suppresses_weak_method_edge) {
     PASS();
 }
 
+/* Fixture for the #1928 cross-language reference-guard probes (sequential and
+ * parallel twins). pad_files > 0 adds filler files to push the index over the
+ * parallel-pipeline threshold, since USAGE/WRITES/READS have one resolver per
+ * path and both must consult the guard. */
+static void write_go_c_ref_guard_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "go.mod", "module example.com/fxguard\n\ngo 1.22\n");
+    /* The C probe: a local named `event` and a file-scope function `handle`,
+     * the two shapes Go identifiers collide with. */
+    write_temp_file(tmp, "probe/probe.c",
+                    "static int total_events = 0;\n"
+                    "\n"
+                    "static int handle(void) {\n"
+                    "    int event = 0;\n"
+                    "    total_events += event;\n"
+                    "    return event;\n"
+                    "}\n");
+    /* Go: a local write named like the C local, and a value use named like
+     * the C function. Neither can touch anything in a C translation unit. */
+    write_temp_file(tmp, "app/app.go",
+                    "package app\n"
+                    "\n"
+                    "func TrackEvent() int {\n"
+                    "\tevent := 1\n"
+                    "\treturn event\n"
+                    "}\n"
+                    "\n"
+                    "func UsesHandle() int {\n"
+                    "\th := handle\n"
+                    "\t_ = h\n"
+                    "\treturn 4\n"
+                    "}\n"
+                    "\n"
+                    "func WriteTotal() {\n"
+                    "\ttotal_events := 5\n"
+                    "\t_ = total_events\n"
+                    "}\n");
+    /* Same-language control: a Go package-level var written from another
+     * file must keep its WRITES edge. */
+    write_temp_file(tmp, "state/vars.go",
+                    "package state\n"
+                    "\n"
+                    "var Counter int\n");
+    write_temp_file(tmp, "state/state.go",
+                    "package state\n"
+                    "\n"
+                    "func Bump() {\n"
+                    "\tCounter = 2\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/filler%d.go", i);
+        snprintf(body, sizeof(body), "package pad\n\nfunc filler%d() int { return %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+TEST(pipeline_go_rw_usage_never_cross_into_c) {
+    /* #1928: USAGE and WRITES/READS resolve through the same short-name
+     * registry as CALLS but never consulted the #725 cross-language guard.
+     * On a Go tree with eBPF C probes every Go identifier spelled like a C
+     * one produced an edge into the C file — 31.5% of all WRITES on the
+     * measured repo crossed the Go/C boundary. Go code cannot write a C
+     * automatic variable, so every edge in that class is false. This is the
+     * SEQUENTIAL-path twin; the parallel twin follows. */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_rw_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_go_c_ref_guard_fixture(tmp, 0);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_rw.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* Reproduce-first: RED before the fix — the Go local write binds the C
+     * probe's global, and the Go value use binds the C `handle`. */
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "TrackEvent", "event", "WRITES"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "TrackEvent", "event", "READS"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "UsesHandle", "handle", "WRITES"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "UsesHandle", "handle", "READS"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "UsesHandle", "handle", "USAGE"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "WriteTotal", "total_events", "WRITES"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "WriteTotal", "total_events", "USAGE"));
+    /* Same-language reference edges survive the guard. */
+    ASSERT_TRUE(cross_file_edge_exists(s, project, "Bump", "Counter", "WRITES"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_go_rw_usage_never_cross_into_c_parallel) {
+    /* Parallel twin of the test above: USAGE and WRITES/READS each have a
+     * second, independent resolver in pass_parallel.c (resolve_file_usages /
+     * resolve_file_rw) that must consult the same guard — the field census
+     * that motivated this caught the sequential-only fix leaving 344 Go→C
+     * WRITES alive on a ~1150-file repo. >= 50 files forces the parallel
+     * pipeline. */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_rwp_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_go_c_ref_guard_fixture(tmp, 52);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_rwp.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "TrackEvent", "event", "WRITES"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "TrackEvent", "event", "READS"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "UsesHandle", "handle", "WRITES"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "UsesHandle", "handle", "READS"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "UsesHandle", "handle", "USAGE"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "WriteTotal", "total_events", "WRITES"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "WriteTotal", "total_events", "USAGE"));
+    ASSERT_TRUE(cross_file_edge_exists(s, project, "Bump", "Counter", "WRITES"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+static int count_nodes_named(cbm_store_t *s, const char *project, const char *name);
+
+/* Fixture for the #1942 bare-reference-vs-Field probes: a Go struct field
+ * named like the commonest local (`err`), and a function whose local of the
+ * same name must NOT bind it — in Go a field is only reachable through a
+ * selector expression, never a bare identifier. Needs Go Field extraction
+ * (#1935) to have anything to falsely bind. */
+static void write_go_bare_field_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "go.mod", "module example.com/fxbare\n\ngo 1.22\n");
+    write_temp_file(tmp, "state/state.go",
+                    "package state\n"
+                    "\n"
+                    "type Tracker struct {\n"
+                    "\terr error\n"
+                    "\tn   int\n"
+                    "}\n");
+    write_temp_file(tmp, "app/app.go",
+                    "package app\n"
+                    "\n"
+                    "import \"errors\"\n"
+                    "\n"
+                    "func Run() error {\n"
+                    "\terr := errors.New(\"x\")\n"
+                    "\treturn err\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/filler%d.go", i);
+        snprintf(body, sizeof(body), "package pad\n\nfunc filler%d() int { return %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+TEST(pipeline_go_bare_ref_never_binds_field) {
+    /* #1942: the READS/WRITES resolvers and the USAGE registry fallback hand
+     * bare reference text to the short-name registry, which contains Field
+     * nodes — so every Go local `err := …` bound whichever struct field was
+     * named err (21308 USAGE / 5191 WRITES onto Go fields on the measured
+     * repo, top target a test struct's field collecting 3013 edges).
+     * Sequential-path twin; the parallel twin follows. */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_bare_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_go_bare_field_fixture(tmp, 0);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_bare.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* The field must exist for the probe to mean anything (#1935's fix). */
+    ASSERT_TRUE(count_nodes_named(s, project, "err") >= 1);
+    /* Reproduce-first: RED before the fix — the bare local binds the field. */
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "WRITES"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "READS"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "USAGE"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_go_bare_ref_never_binds_field_parallel) {
+    /* Parallel twin: resolve_file_rw / resolve_file_usages are independent
+     * resolvers and must consult the same predicate (#1928's lesson). */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_barep_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_go_bare_field_fixture(tmp, 52);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_barep.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_TRUE(count_nodes_named(s, project, "err") >= 1);
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "WRITES"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "READS"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "USAGE"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Count nodes with the given exact name in the project (e.g. a Route path). */
 static int count_nodes_named(cbm_store_t *s, const char *project, const char *name) {
     cbm_node_t *ns = NULL;
@@ -5229,6 +5475,70 @@ TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier) {
     ASSERT_TRUE(store_opened);
     ASSERT_TRUE(render_target_present); /* target is present in the parallel graph */
     ASSERT_TRUE(hidden_to_render);      /* RED: fused eligibility skips hidden.rs */
+    PASS();
+}
+
+/* Slash-prefixed call arguments are not necessarily HTTP routes. Keep the
+ * parallel arg-url heuristic from minting Route nodes for filesystem paths or
+ * regex-replacement operands, while preserving a genuine API path. */
+TEST(pipeline_arg_url_rejects_non_http_slash_arguments) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_arg_url_guard_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "src/args.py",
+                    "import requests\n"
+                    "TMP = '/tmp/pgv_fuzz.bin'\n"
+                    "def run_copy(path):\n"
+                    "    return path\n"
+                    "def write_fixture():\n"
+                    "    return run_copy(TMP)\n"
+                    "def load_api():\n"
+                    "    return requests.get('/api/data')\n");
+    write_temp_file(tmp, "src/regex.js",
+                    "function sink(value) { return value; }\n"
+                    "export function sanitize(template) {\n"
+                    "  sink(/<table/i);\n"
+                    "  return template.replace('/html/g', '');\n"
+                    "}\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/filler%d.ts", i);
+        snprintf(body, sizeof(body), "export function filler%d(): number { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/arg_url_guard.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_EQ(count_nodes_named(s, project, "/html/g"), 0);
+    ASSERT_EQ(count_nodes_named(s, project, "/<table/i"), 0);
+    ASSERT_EQ(count_nodes_named(s, project, "/tmp/pgv_fuzz.bin"), 0);
+    ASSERT_GTE(count_nodes_named(s, project, "/api/data"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
     PASS();
 }
 
@@ -12931,12 +13241,17 @@ SUITE(pipeline) {
 #endif
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_go_rw_usage_never_cross_into_c);
+    RUN_TEST(pipeline_go_rw_usage_never_cross_into_c_parallel);
+    RUN_TEST(pipeline_go_bare_ref_never_binds_field);
+    RUN_TEST(pipeline_go_bare_ref_never_binds_field_parallel);
     RUN_TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges);
     RUN_TEST(pipeline_python_receiver_parallel_suppresses_weak_method_edges);
     RUN_TEST(pipeline_python_bare_local_binding_suppresses_weak_edge);
     RUN_TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge);
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
     RUN_TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier);
+    RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);
     RUN_TEST(pipeline_native_fetch_parallel_classified_as_http_calls);
     RUN_TEST(pipeline_local_fetch_shadow_not_classified_as_http);
