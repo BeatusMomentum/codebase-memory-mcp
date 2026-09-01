@@ -2818,10 +2818,10 @@ static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const ch
         const char *shortn = dot ? dot + 1 : type_qn;
         size_t slen = strlen(shortn);
         const char *best_qn = NULL;
-        CBMTypeNameIter it;
+        CBMTypeShortIter it;
         cbm_registry_types_by_short_name(ctx->registry, shortn, &it);
         int i;
-        while ((i = cbm_type_name_iter_next(&it)) >= 0) {
+        while ((i = cbm_type_short_iter_next(&it)) >= 0) {
             const char *q = ctx->registry->types[i].qualified_name;
             if (!q) {
                 continue;

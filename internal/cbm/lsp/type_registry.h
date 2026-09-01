@@ -119,6 +119,7 @@ typedef struct CBMTypeRegistry {
     int *type_short_buckets;
     CBMRegistryHashEntry *type_short_entries;
     int type_short_bucket_count;
+    int type_short_entry_count;
     // Embedded-type index: fnv1a(bare last-'.'-segment of each embedded_type) -> chain
     // of TYPE indices declaring it. payload_index = type index (a type may appear once
     // per embedded entry; consumers dedup adjacent same-type via the iterator).
@@ -128,10 +129,6 @@ typedef struct CBMTypeRegistry {
     int type_embed_entry_count;
     // Free-function short-name index: fnv1a(short_name) -> chain of FREE-function
     // (receiver_type==NULL) indices. payload_index = func index.
-    int *type_short_buckets;
-    CBMRegistryHashEntry *type_short_entries;
-    int type_short_bucket_count;
-    int type_short_entry_count;
     int *ffunc_short_buckets;
     CBMRegistryHashEntry *ffunc_short_entries;
     int ffunc_short_bucket_count;
@@ -236,16 +233,19 @@ const CBMRegisteredFunc *cbm_registry_lookup_symbol_by_types(const CBMTypeRegist
 // any post-finalize tail; otherwise it degrades to the original full scan. Results
 // preserve ascending registry order. The index is a hash prefilter; callers must
 // re-check their exact predicate, including tail entries.
+// Built by finalize into type_short_buckets. Shared by the C++ short-name lookup
+// and by cs_resolve_type_name's step-9 fallback, which scanned type_count per
+// unresolved name — quadratic against the shared Tier-2 registry.
 typedef struct {
     const CBMTypeRegistry *reg;
     uint64_t hash;
     int chain_idx;
     int tail_i;
     int tail_end;
-} CBMTypeNameIter;
+} CBMTypeShortIter;
 void cbm_registry_types_by_short_name(const CBMTypeRegistry *reg, const char *short_name,
-                                      CBMTypeNameIter *out);
-int cbm_type_name_iter_next(CBMTypeNameIter *it);
+                                      CBMTypeShortIter *out);
+int cbm_type_short_iter_next(CBMTypeShortIter *it);
 
 // Iterate registry TYPE indices whose embedded_types contain an entry whose BARE
 // name (last '.'-segment) equals `bare`. On a finalized registry this walks the
@@ -278,21 +278,6 @@ typedef struct {
     int tail_i;
     int tail_end;
 } CBMFreeFuncIter;
-/* Iterate TYPE indices sharing a short name — the type-side twin of the free-
- * function iterator. Built by finalize into type_short_buckets; degrades to a
- * full types[] scan on an unfinalized registry (same correctness, old cost).
- * Added for cs_resolve_type_name's step-9 fallback, which scanned type_count
- * per unresolved name — quadratic against the shared Tier-2 registry. */
-typedef struct {
-    const CBMTypeRegistry *reg;
-    uint64_t hash;
-    int chain_idx;
-    int tail_i;
-    int tail_end;
-} CBMTypeShortIter;
-void cbm_registry_types_by_short_name(const CBMTypeRegistry *reg, const char *short_name,
-                                      CBMTypeShortIter *out);
-int cbm_type_short_iter_next(CBMTypeShortIter *it);
 
 void cbm_registry_free_funcs_by_short_name(const CBMTypeRegistry *reg, const char *short_name,
                                            CBMFreeFuncIter *out);

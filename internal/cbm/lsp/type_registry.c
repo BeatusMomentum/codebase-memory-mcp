@@ -299,7 +299,7 @@ static void build_ffunc_short_index(CBMTypeRegistry *reg, CBMArena *idx_arena) {
 }
 
 void cbm_registry_types_by_short_name(const CBMTypeRegistry *reg, const char *short_name,
-                                      CBMTypeNameIter *out) {
+                                      CBMTypeShortIter *out) {
     out->reg = reg;
     out->hash = fnv1a(short_name);
     if (reg->type_qn_buckets && reg->type_qn_bucket_count > 0) {
@@ -319,7 +319,7 @@ void cbm_registry_types_by_short_name(const CBMTypeRegistry *reg, const char *sh
     }
 }
 
-int cbm_type_name_iter_next(CBMTypeNameIter *it) {
+int cbm_type_short_iter_next(CBMTypeShortIter *it) {
     const CBMTypeRegistry *reg = it->reg;
     while (it->chain_idx >= 0) {
         const CBMRegistryHashEntry *e = &reg->type_short_entries[it->chain_idx];
@@ -407,42 +407,6 @@ int cbm_free_func_iter_next(CBMFreeFuncIter *it) {
         if (h != it->hash)
             continue;
         return p; /* each free func has one short_name → no dedup needed */
-    }
-    if (it->tail_i < it->tail_end)
-        return it->tail_i++;
-    return -1;
-}
-
-void cbm_registry_types_by_short_name(const CBMTypeRegistry *reg, const char *short_name,
-                                      CBMTypeShortIter *out) {
-    out->reg = reg;
-    out->hash = fnv1a(short_name);
-    if (reg->type_qn_buckets && reg->type_qn_bucket_count > 0) {
-        if (reg->type_short_buckets && reg->type_short_bucket_count > 0) {
-            int slot = (int)(out->hash & (uint64_t)(reg->type_short_bucket_count - 1));
-            out->chain_idx = reg->type_short_buckets[slot];
-        } else {
-            out->chain_idx = -1;
-        }
-        out->tail_i = reg->type_qn_entry_count;
-        out->tail_end = reg->type_count;
-    } else {
-        out->chain_idx = -1;
-        out->tail_i = 0;
-        out->tail_end = reg->type_count;
-    }
-}
-
-int cbm_type_short_iter_next(CBMTypeShortIter *it) {
-    const CBMTypeRegistry *reg = it->reg;
-    while (it->chain_idx >= 0) {
-        const CBMRegistryHashEntry *e = &reg->type_short_entries[it->chain_idx];
-        int p = e->payload_index;
-        uint64_t h = e->hash;
-        it->chain_idx = e->next_index;
-        if (h != it->hash)
-            continue;
-        return p;
     }
     if (it->tail_i < it->tail_end)
         return it->tail_i++;
