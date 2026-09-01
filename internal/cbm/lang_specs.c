@@ -80,6 +80,7 @@ extern const TSLanguage *tree_sitter_powershell(void);
 extern const TSLanguage *tree_sitter_pascal(void);
 extern const TSLanguage *tree_sitter_d(void);
 extern const TSLanguage *tree_sitter_scheme(void);
+extern const TSLanguage *tree_sitter_chialisp(void);
 extern const TSLanguage *tree_sitter_fennel(void);
 extern const TSLanguage *tree_sitter_fish(void);
 extern const TSLanguage *tree_sitter_awk(void);
@@ -892,6 +893,14 @@ static const char *graphql_field_types[] = {"field_definition", "input_value_def
 // the generic embedded-imports walker re-parse that slice with the JS grammar
 // so the existing ES import extractor sees real import_statement nodes.
 // Terminator: an entry whose script_node_type is NULL.
+static const CBMEmbeddedLangSpec cfml_embedded_imports[] = {
+    /* Tag-dialect CFML keeps <cfscript> bodies as opaque cf_script_content;
+     * re-parse them with the cfscript grammar through the shared included-
+     * ranges machinery so defs (and calls) inside legacy components extract
+     * with absolute coordinates. Distilled from #1412. */
+    {"cf_script_tag", "cf_script_content", CBM_LANG_CFSCRIPT},
+    {NULL, NULL, 0},
+};
 static const CBMEmbeddedLangSpec vue_embedded_imports[] = {
     {"script_element", "raw_text", CBM_LANG_JAVASCRIPT},
     {NULL, NULL, 0},
@@ -1099,6 +1108,13 @@ static const char *scheme_func_types[] = {"list", NULL};
 static const char *scheme_call_types[] = {"list", NULL};
 static const char *scheme_var_types[] = {"symbol", NULL};
 static const char *scheme_module_types[] = {"program", NULL};
+// Chialisp: a deliberately generic s-expression grammar (tools/tree-sitter-chialisp).
+// Every parenthesized form is a `list` and every atom a `symbol`; which lists are
+// definitions is decided in extract_defs.c, not by the parser. Root is `source_file`.
+static const char *chialisp_func_types[] = {"list", NULL};
+static const char *chialisp_call_types[] = {"list", NULL};
+static const char *chialisp_var_types[] = {"symbol", NULL};
+static const char *chialisp_module_types[] = {"source_file", NULL};
 static const char *fennel_func_types[] = {"fn", "lambda", "hashfn", NULL};
 static const char *fennel_call_types[] = {"list", NULL};
 static const char *fennel_branch_types[] = {"each", "for", "match", NULL};
@@ -2119,7 +2135,7 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
     [CBM_LANG_CFML] = {CBM_LANG_CFML, cfml_func_types, empty_types, empty_types, cfml_module_types,
                        cfml_call_types, empty_types, empty_types, cfml_branch_types, empty_types,
                        empty_types, empty_types, NULL, empty_types, NULL, NULL, tree_sitter_cfml,
-                       NULL},
+                       cfml_embedded_imports},
 
     // CBM_LANG_GLEAM
     [CBM_LANG_GLEAM] = {CBM_LANG_GLEAM, gleam_func_types, gleam_class_types, gleam_field_types,
@@ -2152,6 +2168,12 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                          scheme_module_types, scheme_call_types, empty_types, empty_types,
                          empty_types, scheme_var_types, empty_types, empty_types, NULL, empty_types,
                          NULL, NULL, tree_sitter_scheme, NULL},
+
+    // CBM_LANG_CHIALISP — lisp-family shape (generic list/symbol nodes)
+    [CBM_LANG_CHIALISP] = {CBM_LANG_CHIALISP, chialisp_func_types, empty_types, empty_types,
+                           chialisp_module_types, chialisp_call_types, empty_types, empty_types,
+                           empty_types, chialisp_var_types, empty_types, empty_types, NULL,
+                           empty_types, NULL, NULL, tree_sitter_chialisp, NULL},
 
     // CBM_LANG_FENNEL
     [CBM_LANG_FENNEL] = {CBM_LANG_FENNEL, fennel_func_types, empty_types, empty_types,

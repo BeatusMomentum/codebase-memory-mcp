@@ -1588,8 +1588,18 @@ static void parse_embedded_imports(CBMExtractCtx *ctx) {
         embedded_collect_content_nodes(ctx->root, e, hits, &hit_count, MAX_EMBEDDED_BLOCKS);
         for (int i = 0; i < hit_count; i++) {
             CBMLanguage embedded_language = e->embedded_language;
-            bool extract_structure = ctx->language == CBM_LANG_VUE;
-            if (extract_structure &&
+            /* Structure (defs + calls), not just imports, for hosts whose
+             * embedded language carries real code. Vue since #1852; CFML's
+             * <cfscript> since the #1412 distillation. */
+            bool extract_structure =
+                ctx->language == CBM_LANG_VUE || ctx->language == CBM_LANG_CFML;
+            /* The attribute resolver is Vue's: it inspects <script lang=/src=>
+             * and OVERRIDES the spec's embedded language (JS default, TS on
+             * lang="ts", bail on src=). CFML's cf_script_tag carries no such
+             * attributes and its embedded language is fixed by the spec row
+             * (CFSCRIPT) — running the resolver would silently rewrite it to
+             * JavaScript. Resolve only for Vue. */
+            if (ctx->language == CBM_LANG_VUE &&
                 !vue_embedded_language(ctx, hits[i].script, &embedded_language)) {
                 continue;
             }
@@ -1919,6 +1929,46 @@ static void lisp_process_list(CBMExtractCtx *ctx, TSNode node) {
     if (strcmp(hn, "in-package") == 0 && nc >= 2) {
         lisp_set_namespace(ctx, ts_node_named_child(node, 1));
         return;
+    }
+
+    /* Chialisp include/embed forms.
+     *
+     * `(include *standard-cl-26*)` selects a dialect; every `*...*` sigil is a
+     * compiler directive, not a file dependency. The Chialisp compiler filters
+     * these with its own `!name.starts_with("*")` check and so do we — recording
+     * one as an import would invent a dependency on a file that does not exist.
+     *
+     * `(embed-file NAME kind "file")` / `(compile-file NAME "file")` DO create a
+     * real dependency on the embedded/compiled artifact; the path is the string
+     * argument. There is no dedicated EMBEDS edge type, so it is recorded as an
+     * import — which is what it is for reachability. */
+    if (ctx->language == CBM_LANG_CHIALISP) {
+        if (strcmp(hn, "include") == 0) {
+            for (uint32_t j = 1; j < nc; j++) {
+                TSNode mod_node = ts_node_named_child(node, j);
+                const char *mk = ts_node_type(mod_node);
+                if (strcmp(mk, "symbol") == 0 || strcmp(mk, "sym_lit") == 0) {
+                    char *sig = cbm_node_text(ctx->arena, mod_node, ctx->source);
+                    if (sig && sig[0] == '*') {
+                        continue; /* dialect sigil, not a file */
+                    }
+                }
+                lisp_push_module(ctx, mod_node);
+            }
+            return;
+        }
+        if (strcmp(hn, "embed-file") == 0 || strcmp(hn, "compile-file") == 0) {
+            /* the embedded/compiled path is the last string argument. */
+            for (uint32_t j = nc; j-- > 1;) {
+                TSNode arg = ts_node_named_child(node, j);
+                const char *ak = ts_node_type(arg);
+                if (strcmp(ak, "string") == 0 || strcmp(ak, "str_lit") == 0) {
+                    lisp_push_module(ctx, arg);
+                    break;
+                }
+            }
+            return;
+        }
     }
 
     /* Plain import head: `(require :util)`, `(import ...)`, `(use ...)`. */
@@ -2986,6 +3036,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
     case CBM_LANG_FENNEL:
     case CBM_LANG_COMMONLISP:
     case CBM_LANG_CLOJURE:
+    case CBM_LANG_CHIALISP:
         parse_lisp_imports(ctx);
         break;
     case CBM_LANG_STARLARK:
@@ -3083,6 +3134,9 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
     case CBM_LANG_SVELTE:
     case CBM_LANG_VUE:
     case CBM_LANG_ASTRO:
+    /* Tag-dialect CFML: <cfscript> bodies are opaque cf_script_content to the
+     * cfml grammar; the embedded spec re-parses them as CFSCRIPT (#1412). */
+    case CBM_LANG_CFML:
         parse_embedded_imports(ctx);
         break;
     default:
