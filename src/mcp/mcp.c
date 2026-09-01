@@ -130,6 +130,7 @@ enum {
 #define MCP_MAX_HEADER_SIZE ((size_t)8U * 1024U)
 #define MCP_SEARCH_OUTPUT_MAX ((size_t)64U * 1024U * 1024U)
 #define MCP_SEARCH_SCAN_TIMEOUT_MS ((uint64_t)30000U)
+#define MCP_FILE_OUTLINE_OUTPUT_MAX ((size_t)2U * 1024U * 1024U)
 
 /* ── Helpers ────────────────────────────────────────────────────── */
 
@@ -557,6 +558,21 @@ static const tool_def_t TOOLS[] = {
      "\"type\":\"string\"},\"include_neighbors\":{"
      "\"type\":\"boolean\",\"default\":false}},\"required\":[\"qualified_name\",\"project\"]}"},
 
+    {"get_file_outline", "Get file outline",
+     "Return a compact declaration outline for one exact repository-relative file. Results are "
+     "filtered by optional exact labels, ordered deterministically by source position, and "
+     "bounded with exact total/offset/limit pagination metadata. File/folder/container nodes "
+     "are excluded. The query observes request cancellation and fails without partial output.",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
+     "\"file_path\":{\"type\":\"string\",\"description\":\"Exact repository-relative "
+     "file path\"},\"labels\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
+     "\"maxItems\":16,\"description\":\"Optional exact node-label filter\"},"
+     "\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":200,\"default\":100},"
+     "\"offset\":{\"type\":\"integer\",\"minimum\":0,\"default\":0},"
+     "\"format\":{\"type\":\"string\",\"enum\":[\"tree\",\"json\"],"
+     "\"default\":\"tree\"}},\"additionalProperties\":false,"
+     "\"required\":[\"project\",\"file_path\"]}"},
+
     {"get_graph_schema", "Get graph schema",
      "Get the schema of the knowledge graph (node labels, edge types)",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
@@ -745,6 +761,7 @@ static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"query_graph", false, true, true, false},
     {"trace_path", false, true, true, false},
     {"get_code_snippet", false, true, true, false},
+    {"get_file_outline", false, true, true, false},
     {"get_graph_schema", false, true, true, false},
     {"compare_graphs", true, false, true, false},
     {"get_architecture", false, true, true, false},
@@ -808,13 +825,14 @@ static void mcp_add_tool_def(yyjson_mut_doc *doc, yyjson_mut_val *tools, int i) 
 
 static bool mcp_tool_allowed(cbm_mcp_tool_profile_t profile, const char *name) {
     static const char *const analysis_tools[] = {
-        "search_graph",     "query_graph",    "trace_path",           "get_code_snippet",
-        "get_graph_schema", "compare_graphs", "get_architecture",     "search_code",
-        "list_projects",    "index_status",   "check_index_coverage", "detect_changes",
+        "search_graph",     "query_graph",      "trace_path",     "get_code_snippet",
+        "get_file_outline", "get_graph_schema", "compare_graphs", "get_architecture",
+        "search_code",      "list_projects",    "index_status",   "check_index_coverage",
+        "detect_changes",
     };
     static const char *const scout_tools[] = {
-        "search_graph",  "trace_path",   "get_code_snippet",     "get_architecture",
-        "list_projects", "index_status", "check_index_coverage",
+        "search_graph",     "trace_path",    "get_code_snippet", "get_file_outline",
+        "get_architecture", "list_projects", "index_status",     "check_index_coverage",
     };
     if (!name) {
         return false;
@@ -9303,6 +9321,230 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     return result;
 }
 
+static bool file_outline_request_cancelled(void *context) {
+    return mcp_request_cancelled((const cbm_mcp_server_t *)context);
+}
+
+static char *handle_get_file_outline(cbm_mcp_server_t *srv, const char *args) {
+    const char *args_text = args ? args : "{}";
+    yyjson_doc *args_doc = yyjson_read(args_text, strlen(args_text), 0);
+    yyjson_val *root = args_doc ? yyjson_doc_get_root(args_doc) : NULL;
+    if (!root || !yyjson_is_obj(root)) {
+        yyjson_doc_free(args_doc);
+        return cbm_mcp_text_result("get_file_outline arguments must be a JSON object", true);
+    }
+
+    char *project = get_project_arg(args_text);
+    yyjson_val *file_value = yyjson_obj_get(root, "file_path");
+    const char *file_path =
+        file_value && yyjson_is_str(file_value) ? yyjson_get_str(file_value) : NULL;
+    if (!project) {
+        yyjson_doc_free(args_doc);
+        return cbm_mcp_text_result("project is required", true);
+    }
+    if (!file_path || !file_path[0]) {
+        free(project);
+        yyjson_doc_free(args_doc);
+        return cbm_mcp_text_result("file_path is required", true);
+    }
+
+    char normalized_path[CBM_SZ_4K];
+    if (coverage_normalize_rel(file_path, false, normalized_path, sizeof(normalized_path)) !=
+        COVERAGE_PATH_OK) {
+        free(project);
+        yyjson_doc_free(args_doc);
+        return cbm_mcp_text_result("file_path must be a repository-relative path without '..'",
+                                   true);
+    }
+
+    int limit = 100;
+    yyjson_val *limit_value = yyjson_obj_get(root, "limit");
+    if (limit_value) {
+        if (!yyjson_is_int(limit_value)) {
+            free(project);
+            yyjson_doc_free(args_doc);
+            return cbm_mcp_text_result("limit must be an integer", true);
+        }
+        int64_t parsed = yyjson_get_sint(limit_value);
+        if (parsed < 1 || parsed > CBM_STORE_FILE_OUTLINE_MAX_LIMIT) {
+            free(project);
+            yyjson_doc_free(args_doc);
+            return cbm_mcp_text_result("limit must be between 1 and 200", true);
+        }
+        limit = (int)parsed;
+    }
+
+    int offset = 0;
+    yyjson_val *offset_value = yyjson_obj_get(root, "offset");
+    if (offset_value) {
+        if (!yyjson_is_int(offset_value)) {
+            free(project);
+            yyjson_doc_free(args_doc);
+            return cbm_mcp_text_result("offset must be a non-negative integer", true);
+        }
+        int64_t parsed = yyjson_get_sint(offset_value);
+        if (parsed < 0 || parsed > INT_MAX) {
+            free(project);
+            yyjson_doc_free(args_doc);
+            return cbm_mcp_text_result("offset must be a non-negative integer", true);
+        }
+        offset = (int)parsed;
+    }
+
+    bool json_format = false;
+    yyjson_val *format_value = yyjson_obj_get(root, "format");
+    if (format_value) {
+        const char *format = yyjson_is_str(format_value) ? yyjson_get_str(format_value) : NULL;
+        if (!format || (strcmp(format, "tree") != 0 && strcmp(format, "json") != 0)) {
+            free(project);
+            yyjson_doc_free(args_doc);
+            return cbm_mcp_text_result("format must be either 'tree' or 'json'", true);
+        }
+        json_format = strcmp(format, "json") == 0;
+    }
+
+    const char *labels[CBM_STORE_FILE_OUTLINE_MAX_LABELS];
+    int label_count = 0;
+    yyjson_val *labels_value = yyjson_obj_get(root, "labels");
+    if (labels_value) {
+        if (!yyjson_is_arr(labels_value) ||
+            yyjson_arr_size(labels_value) > CBM_STORE_FILE_OUTLINE_MAX_LABELS) {
+            free(project);
+            yyjson_doc_free(args_doc);
+            return cbm_mcp_text_result("labels must be an array of at most 16 strings", true);
+        }
+        size_t index = 0;
+        size_t max = 0;
+        yyjson_val *item;
+        yyjson_arr_foreach(labels_value, index, max, item) {
+            const char *label = yyjson_is_str(item) ? yyjson_get_str(item) : NULL;
+            if (!label || !label[0] || strlen(label) >= CBM_SZ_128) {
+                free(project);
+                yyjson_doc_free(args_doc);
+                return cbm_mcp_text_result("labels must contain only non-empty bounded strings",
+                                           true);
+            }
+            labels[label_count++] = label;
+        }
+    }
+
+    cbm_store_t *store = resolve_store(srv, project);
+    if (!store) {
+        char *error = build_project_list_error("project not found or not indexed");
+        char *result = cbm_mcp_text_result(error, true);
+        free(error);
+        free(project);
+        yyjson_doc_free(args_doc);
+        return result;
+    }
+    char *not_indexed = verify_project_indexed(store, project);
+    if (not_indexed) {
+        free(project);
+        yyjson_doc_free(args_doc);
+        return not_indexed;
+    }
+
+    cbm_file_outline_row_t *rows = NULL;
+    int row_count = 0;
+    int total = 0;
+    int rc = cbm_store_get_file_outline(store, project, normalized_path, labels, label_count, limit,
+                                        offset, file_outline_request_cancelled, srv, &rows,
+                                        &row_count, &total);
+    if (rc != CBM_STORE_OK) {
+        free(project);
+        yyjson_doc_free(args_doc);
+        if (rc == CBM_STORE_CANCELLED) {
+            return cbm_mcp_text_result("get_file_outline cancelled for this request", true);
+        }
+        if (rc == CBM_STORE_SCAN_LIMIT) {
+            return cbm_mcp_text_result("get_file_outline exceeded its fixed output safety limit",
+                                       true);
+        }
+        return cbm_mcp_text_result("get_file_outline query failed", true);
+    }
+
+    char *payload = NULL;
+    if (!json_format) {
+        cbm_sb_t sb;
+        cbm_sb_init(&sb);
+        cbm_tree_scalar_str(&sb, "file_path", normalized_path);
+        static const char *const columns[] = {"name", "label", "lines", "qn"};
+        cbm_tree_table_header(&sb, "results", row_count, columns, 4);
+        for (int i = 0; i < row_count; i++) {
+            char lines[CBM_SZ_32];
+            if (rows[i].start_line > 0) {
+                snprintf(lines, sizeof(lines), "%d-%d", rows[i].start_line,
+                         rows[i].end_line > rows[i].start_line ? rows[i].end_line
+                                                               : rows[i].start_line);
+            } else {
+                lines[0] = '\0';
+            }
+            cbm_tree_row_begin(&sb);
+            cbm_tree_cell_str(&sb, rows[i].name, true);
+            cbm_tree_cell_str(&sb, rows[i].label, false);
+            cbm_tree_cell_str(&sb, lines, false);
+            cbm_tree_cell_str(&sb, rows[i].qualified_name, false);
+            cbm_tree_row_end(&sb);
+        }
+        cbm_tree_scalar_int(&sb, "total", total);
+        cbm_tree_scalar_int(&sb, "offset", offset);
+        cbm_tree_scalar_int(&sb, "limit", limit);
+        cbm_tree_scalar_int(&sb, "returned", row_count);
+        cbm_tree_scalar_bool(&sb, "has_more", (int64_t)offset + row_count < total);
+        payload = cbm_sb_finish(&sb);
+    } else {
+        yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val *object = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, object);
+        yyjson_mut_obj_add_str(doc, object, "file_path", normalized_path);
+        yyjson_mut_val *columns = yyjson_mut_arr(doc);
+        static const char *const column_names[] = {"name", "label", "lines", "qn"};
+        for (size_t i = 0; i < sizeof(column_names) / sizeof(column_names[0]); i++) {
+            yyjson_mut_arr_add_str(doc, columns, column_names[i]);
+        }
+        yyjson_mut_obj_add_val(doc, object, "cols", columns);
+        yyjson_mut_val *json_rows = yyjson_mut_arr(doc);
+        for (int i = 0; i < row_count; i++) {
+            char lines[CBM_SZ_32];
+            if (rows[i].start_line > 0) {
+                snprintf(lines, sizeof(lines), "%d-%d", rows[i].start_line,
+                         rows[i].end_line > rows[i].start_line ? rows[i].end_line
+                                                               : rows[i].start_line);
+            } else {
+                lines[0] = '\0';
+            }
+            yyjson_mut_val *row = yyjson_mut_arr(doc);
+            yyjson_mut_arr_add_strcpy(doc, row, rows[i].name);
+            yyjson_mut_arr_add_strcpy(doc, row, rows[i].label);
+            yyjson_mut_arr_add_strcpy(doc, row, lines);
+            yyjson_mut_arr_add_strcpy(doc, row, rows[i].qualified_name);
+            yyjson_mut_arr_add_val(json_rows, row);
+        }
+        yyjson_mut_obj_add_val(doc, object, "rows", json_rows);
+        yyjson_mut_obj_add_int(doc, object, "total", total);
+        yyjson_mut_obj_add_int(doc, object, "offset", offset);
+        yyjson_mut_obj_add_int(doc, object, "limit", limit);
+        yyjson_mut_obj_add_int(doc, object, "returned", row_count);
+        yyjson_mut_obj_add_bool(doc, object, "has_more", (int64_t)offset + row_count < total);
+        payload = yy_doc_to_str(doc);
+        yyjson_mut_doc_free(doc);
+    }
+
+    cbm_store_free_file_outline(rows, row_count);
+    free(project);
+    yyjson_doc_free(args_doc);
+    if (!payload) {
+        return cbm_mcp_text_result("get_file_outline output allocation failed", true);
+    }
+    if (strlen(payload) > MCP_FILE_OUTLINE_OUTPUT_MAX) {
+        free(payload);
+        return cbm_mcp_text_result("get_file_outline exceeded its fixed output safety limit", true);
+    }
+    char *result = cbm_mcp_text_result(payload, false);
+    free(payload);
+    return result;
+}
+
 static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     char *qn = cbm_mcp_get_string_arg(args, "qualified_name");
     char *project = get_project_arg(args);
@@ -12360,6 +12602,9 @@ static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const c
     }
     if (strcmp(tool_name, "get_code_snippet") == 0) {
         return handle_get_code_snippet(srv, args_json);
+    }
+    if (strcmp(tool_name, "get_file_outline") == 0) {
+        return handle_get_file_outline(srv, args_json);
     }
     if (strcmp(tool_name, "search_code") == 0) {
         return handle_search_code(srv, args_json);

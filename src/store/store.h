@@ -28,6 +28,10 @@ typedef struct cbm_store cbm_store_t;
 #define CBM_STORE_SCAN_LIMIT (-4)
 #define CBM_STORE_CALLBACK_ERR (-5)
 
+#define CBM_STORE_FILE_OUTLINE_MAX_LIMIT 200
+#define CBM_STORE_FILE_OUTLINE_MAX_LABELS 16
+#define CBM_STORE_FILE_OUTLINE_MAX_TEXT_BYTES (256U * 1024U)
+
 /* ── Data structures ────────────────────────────────────────────── */
 
 typedef struct {
@@ -41,6 +45,18 @@ typedef struct {
     int end_line;
     const char *properties_json; /* JSON string, NULL → "{}" */
 } cbm_node_t;
+
+/* Compact declaration row returned by the bounded file-outline query. */
+typedef struct {
+    const char *name;
+    const char *label;
+    const char *qualified_name;
+    int start_line;
+    int end_line;
+} cbm_file_outline_row_t;
+
+/* Optional cancellation callback for bounded store queries. */
+typedef bool (*cbm_store_cancel_fn)(void *context);
 
 typedef struct {
     int64_t id;
@@ -496,6 +512,18 @@ int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const cha
 /* Find nodes by file path. */
 int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char *file_path,
                                  cbm_node_t **out, int *count);
+
+/* Return a stable, paginated outline for one exact repository-relative file.
+ * File/folder/container nodes are excluded. labels may be NULL when
+ * label_count is zero; otherwise labels are exact-match filters. The query is
+ * capped by CBM_STORE_FILE_OUTLINE_MAX_LIMIT and a fixed aggregate text-byte
+ * budget, and fails without partial rows when cancelled or over budget.
+ * total is the exact filtered count before pagination. */
+int cbm_store_get_file_outline(cbm_store_t *s, const char *project, const char *file_path,
+                               const char *const *labels, int label_count, int limit, int offset,
+                               cbm_store_cancel_fn cancel, void *cancel_context,
+                               cbm_file_outline_row_t **out, int *count, int *total);
+void cbm_store_free_file_outline(cbm_file_outline_row_t *rows, int count);
 
 /* Batch lookup: map qualified names → node IDs.
  * qns[i] is resolved; out_ids[i] receives the ID or 0 if not found.
