@@ -3924,6 +3924,75 @@ TEST(extract_java_jaxrs_path_composition_issue1005) {
     PASS();
 }
 
+/* Return the file's Module definition (extraction pushes it first), or NULL. */
+static const CBMDefinition *find_module_def(CBMFileResult *r) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].label && strcmp(r->defs.items[i].label, "Module") == 0) {
+            return &r->defs.items[i];
+        }
+    }
+    return NULL;
+}
+
+/* Blazor: a routable component declares its route with a `@page` directive in
+ * MARKUP, above the `@code` block. The C# grammar recovers `@code` (that is why
+ * .razor already yields methods via extra_extensions) but never sees the
+ * directive, so a routable page contributes no Route node and
+ * get_architecture(routes) is empty for a whole Blazor app.
+ *
+ * The route hangs off the file's Module definition, not off a class: a .razor
+ * component's class is implicit — it is never written in the source — so there
+ * is no class node to carry it. The Module's qualified name already IS the
+ * component's identity (t.Pages.Counter), and insert_def_into_gbuf creates
+ * Route+HANDLES for any definition carrying route_path, whatever its label. */
+TEST(extract_blazor_page_directive_routes_component) {
+    CBMFileResult *r = extract("@page \"/counter\"\n"
+                               "@inject NavigationManager Nav\n"
+                               "\n"
+                               "<h1>Counter</h1>\n"
+                               "<button @onclick=\"Increment\">Click</button>\n"
+                               "\n"
+                               "@code {\n"
+                               "    private int count;\n"
+                               "    private void Increment() { count++; }\n"
+                               "}\n",
+                               CBM_LANG_CSHARP, "t", "Pages/Counter.razor");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    /* The markup must not cost us the @code block we already extract today. */
+    ASSERT_NOT_NULL(find_def_by_name(r, "Increment"));
+    const CBMDefinition *mod = find_module_def(r);
+    ASSERT_NOT_NULL(mod);
+    ASSERT_NOT_NULL(mod->route_path);
+    ASSERT_STR_EQ(mod->route_path, "/counter");
+    /* A routable Blazor page is reached by navigation, i.e. GET. */
+    ASSERT_NOT_NULL(mod->route_method);
+    ASSERT_STR_EQ(mod->route_method, "GET");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The directive scan must not fire on every .razor file. A non-routable
+ * component (no @page) has to stay route-free, or every shared component in the
+ * tree becomes a bogus Route node. */
+TEST(extract_blazor_component_without_page_has_no_route) {
+    CBMFileResult *r = extract("@inject IJSRuntime JS\n"
+                               "\n"
+                               "<div class=\"card\">@Title</div>\n"
+                               "\n"
+                               "@code {\n"
+                               "    private void Refresh() { }\n"
+                               "}\n",
+                               CBM_LANG_CSHARP, "t", "Shared/Card.razor");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *mod = find_module_def(r);
+    ASSERT_NOT_NULL(mod);
+    ASSERT_NULL(mod->route_path);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* A comment between decorators must not drop the decorators above it.
  * Comments are NAMED tree-sitter nodes, so the prev-sibling walk used to stop
  * at one — a documented route (@Post + @HttpCode above an explanatory comment)
@@ -6309,16 +6378,6 @@ TEST(iris_export_xml_multi_class) {
  * question asked in words could not reach either. Both now carry the prose in
  * `docstring`, which is what nodes_fts indexes into its `body` column. */
 
-/* First Module-labelled definition, or NULL. */
-static const CBMDefinition *find_module_def(CBMFileResult *r) {
-    for (int i = 0; i < r->defs.count; i++) {
-        if (strcmp(r->defs.items[i].label, "Module") == 0) {
-            return &r->defs.items[i];
-        }
-    }
-    return NULL;
-}
-
 TEST(markdown_section_body_becomes_docstring_issue518) {
     CBMFileResult *r = extract("# Installation\n"
                                "Run the bootstrap script to provision a workstation.\n"
@@ -6827,6 +6886,8 @@ SUITE(extraction) {
     RUN_TEST(arkts_lazy_import);
     RUN_TEST(arkts_ts_compat);
     RUN_TEST(extract_java_jaxrs_path_composition_issue1005);
+    RUN_TEST(extract_blazor_page_directive_routes_component);
+    RUN_TEST(extract_blazor_component_without_page_has_no_route);
     RUN_TEST(extract_ts_template_string_url_issue1006);
     RUN_TEST(extract_go_binary_concat_url_issue1249);
     RUN_TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249);
