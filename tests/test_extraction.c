@@ -1810,6 +1810,24 @@ TEST(swift_chained_call) {
     PASS();
 }
 
+/* A Swift force-unwrap is the one thing that reaches the scanner's suppressor
+ * path -- the rule that stops `try!` emitting its `!` as a token of its own.
+ * That path shifted an int by up to TOKEN_COUNT bits, which runs past the
+ * width of the type once the index reaches 31.
+ *
+ * This test cannot go red here. The normal test build prints the UBSan
+ * message and carries on, which is why the bug survived. The Windows
+ * CLANGARM64 leg runs UBSan in trap mode, where the same shift is an
+ * illegal-instruction crash, so parsing this file at all is the check. */
+TEST(swift_force_unwrap_scanner_shift) {
+    CBMFileResult *r =
+        extract("func load() { let u = cached! }\n", CBM_LANG_SWIFT, "t", "Load.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Objective-C --- */
 TEST(objc_interface) {
     CBMFileResult *r =
@@ -6661,6 +6679,7 @@ SUITE(extraction) {
     RUN_TEST(swift_method_call);
     RUN_TEST(swift_constructor_call);
     RUN_TEST(swift_chained_call);
+    RUN_TEST(swift_force_unwrap_scanner_shift);
     RUN_TEST(objc_interface);
     RUN_TEST(objc_implementation);
     RUN_TEST(dart_top_level_function);
