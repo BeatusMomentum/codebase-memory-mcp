@@ -5345,22 +5345,25 @@ TEST(search_code_file_pattern_prefilter_boundaries) {
     ASSERT_FALSE(cbm_search_code_file_pattern_can_prefilter("src\\*.pas"));
     ASSERT_FALSE(cbm_search_code_file_pattern_can_prefilter("*.c++"));
     ASSERT_FALSE(cbm_search_code_file_pattern_can_prefilter("*R&D*.go"));
+
+    ASSERT_TRUE(cbm_search_code_windows_path_matches_prefilter("src/UnitMain.PAS", "*.pas"));
+    ASSERT_TRUE(cbm_search_code_windows_path_matches_prefilter("types/index.D.TS", "*.d.ts"));
+    ASSERT_FALSE(cbm_search_code_windows_path_matches_prefilter("src/UnitMain.pas.bak", "*.pas"));
+    ASSERT_FALSE(cbm_search_code_windows_path_matches_prefilter("types/index.ts", "*.d.ts"));
     PASS();
 }
 
-TEST(search_code_windows_prefilter_precedes_content_scan) {
+TEST(search_code_windows_scope_prefilter_removes_pipeline_filter) {
 #ifdef _WIN32
     char command[CBM_SZ_4K];
     cbm_search_code_build_grep_cmd(command, sizeof(command), false, true, "*.go", "C:/tmp/pattern",
                                    "C:/tmp/filelist", "C:/tmp/root");
 
-    const char *prefilter = strstr(command, "Where-Object { $_ -like '*.go' }");
     const char *content_scan = strstr(command, "ForEach-Object { Select-String");
     const char *postfilter = strstr(command, "Where-Object { $_.Path -like '**.go' }");
-    ASSERT_NOT_NULL(prefilter);
+    ASSERT_NULL(strstr(command, "Where-Object { $_ -like '*.go' }"));
     ASSERT_NOT_NULL(content_scan);
     ASSERT_NOT_NULL(postfilter);
-    ASSERT_TRUE(prefilter < content_scan);
     ASSERT_TRUE(content_scan < postfilter);
 
     cbm_search_code_build_grep_cmd(command, sizeof(command), false, true, "*handler*.go",
@@ -14003,7 +14006,7 @@ SUITE(mcp) {
     RUN_TEST(search_code_path_filter_prefilter_keeps_matches);
     RUN_TEST(search_code_path_filter_matches_nothing);
     RUN_TEST(search_code_file_pattern_prefilter_boundaries);
-    RUN_TEST(search_code_windows_prefilter_precedes_content_scan);
+    RUN_TEST(search_code_windows_scope_prefilter_removes_pipeline_filter);
     RUN_TEST(search_code_cancel_cleans_supervised_scan);
     RUN_TEST(search_code_output_limit_fails_closed_and_cleans_scan);
     RUN_TEST(search_code_scan_deadline_fails_closed_and_resets);
