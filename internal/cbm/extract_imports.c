@@ -506,8 +506,8 @@ static bool process_commonjs_require(CBMExtractCtx *ctx, TSNode call) {
 
 static void walk_es_imports(CBMExtractCtx *ctx, TSNode root) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->arena, root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, root);
 
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
@@ -540,7 +540,7 @@ static void walk_es_imports(CBMExtractCtx *ctx, TSNode root) {
         }
 
         if (push_children) {
-            ts_nstack_push_children(&stack, ctx->arena, node);
+            ts_nstack_push_children(&stack, node);
         }
     }
 }
@@ -1093,8 +1093,8 @@ static void parse_haskell_imports(CBMExtractCtx *ctx) {
 static void parse_zig_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "builtin_function") == 0) {
@@ -1111,7 +1111,7 @@ static void parse_zig_imports(CBMExtractCtx *ctx) {
                 }
             }
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -1163,8 +1163,8 @@ static void process_wolfram_needs(CBMExtractCtx *ctx, TSNode node) {
 
 static void walk_wolfram_imports(CBMExtractCtx *ctx, TSNode root) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->arena, root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, root);
 
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
@@ -1176,7 +1176,7 @@ static void walk_wolfram_imports(CBMExtractCtx *ctx, TSNode root) {
             process_wolfram_needs(ctx, node);
         }
 
-        ts_nstack_push_children(&stack, ctx->arena, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -1534,8 +1534,8 @@ static void capture_namespace_decl(CBMExtractCtx *ctx) {
 static void parse_hare_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "use_statement") == 0) {
@@ -1554,7 +1554,7 @@ static void parse_hare_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -1566,8 +1566,8 @@ static void parse_hare_imports(CBMExtractCtx *ctx) {
 static void parse_pascal_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "declUses") == 0) {
@@ -1585,7 +1585,7 @@ static void parse_pascal_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -1598,8 +1598,8 @@ static void parse_pascal_imports(CBMExtractCtx *ctx) {
 static void parse_powershell_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "command") == 0) {
@@ -1609,8 +1609,8 @@ static void parse_powershell_imports(CBMExtractCtx *ctx) {
                 /* Find the last generic_token anywhere under the command — that
                  * is the module path / namespace / assembly being imported. */
                 TSNodeStack inner;
-                ts_nstack_init(&inner, a, CBM_SZ_512);
-                ts_nstack_push(&inner, a, node);
+                ts_nstack_init(&inner, ctx, CBM_SZ_512);
+                ts_nstack_push(&inner, node);
                 const char *last_tok = NULL;
                 uint32_t last_start = 0;
                 while (inner.count > 0) {
@@ -1624,7 +1624,7 @@ static void parse_powershell_imports(CBMExtractCtx *ctx) {
                             last_start = sb;
                         }
                     }
-                    ts_nstack_push_children(&inner, a, c);
+                    ts_nstack_push_children(&inner, c);
                 }
                 if (last_tok && last_tok[0]) {
                     CBMImport imp = {.local_name = path_last(a, last_tok),
@@ -1634,7 +1634,7 @@ static void parse_powershell_imports(CBMExtractCtx *ctx) {
             }
             continue; /* commands don't nest imports further */
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -1821,17 +1821,16 @@ static void lisp_process_list(CBMExtractCtx *ctx, TSNode node) {
  * just root children. Stack-based (not recursive) to avoid deep-nesting stack
  * overflow, matching the other walkers in this file. */
 static void parse_lisp_imports(CBMExtractCtx *ctx) {
-    CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         const char *nt = ts_node_type(node);
         if (strcmp(nt, "list") == 0 || strcmp(nt, "list_lit") == 0) {
             lisp_process_list(ctx, node);
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -1841,8 +1840,8 @@ static void parse_lisp_imports(CBMExtractCtx *ctx) {
 static void parse_starlark_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "call") == 0) {
@@ -1870,7 +1869,7 @@ static void parse_starlark_imports(CBMExtractCtx *ctx) {
                 }
             }
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -1881,8 +1880,8 @@ static void parse_starlark_imports(CBMExtractCtx *ctx) {
 static void parse_tcl_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "command") == 0) {
@@ -1904,7 +1903,7 @@ static void parse_tcl_imports(CBMExtractCtx *ctx) {
                 }
             }
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -1915,8 +1914,8 @@ static void parse_tcl_imports(CBMExtractCtx *ctx) {
 static void parse_teal_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "function_call") == 0) {
@@ -1940,7 +1939,7 @@ static void parse_teal_imports(CBMExtractCtx *ctx) {
                 }
             }
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -1950,8 +1949,8 @@ static void parse_teal_imports(CBMExtractCtx *ctx) {
 static void parse_zsh_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "command") == 0) {
@@ -1971,7 +1970,7 @@ static void parse_zsh_imports(CBMExtractCtx *ctx) {
                 }
             }
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2058,15 +2057,15 @@ static void parse_html_imports(CBMExtractCtx *ctx) {
     parse_embedded_imports(ctx);
 
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->arena, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "start_tag") == 0 ||
             strcmp(ts_node_type(node), "self_closing_tag") == 0) {
             html_extract_tag_src(ctx, node);
         }
-        ts_nstack_push_children(&stack, ctx->arena, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2125,8 +2124,8 @@ static void push_string_descendant_import(CBMExtractCtx *ctx, TSNode node) {
 static void parse_cmake_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "normal_command") == 0) {
@@ -2144,15 +2143,15 @@ static void parse_cmake_imports(CBMExtractCtx *ctx) {
                 }
             }
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
 // --- BitBake imports: require/include path ---
 static void parse_bitbake_imports(CBMExtractCtx *ctx) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->arena, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         const char *k = ts_node_type(node);
@@ -2160,7 +2159,7 @@ static void parse_bitbake_imports(CBMExtractCtx *ctx) {
             strcmp(k, "inherit_directive") == 0) {
             push_string_descendant_import(ctx, node);
         }
-        ts_nstack_push_children(&stack, ctx->arena, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2172,8 +2171,8 @@ static void parse_bitbake_imports(CBMExtractCtx *ctx) {
 static void parse_meson_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         const char *k = ts_node_type(node);
@@ -2196,35 +2195,35 @@ static void parse_meson_imports(CBMExtractCtx *ctx) {
                 }
             }
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
 // --- Kconfig imports: source "path" ---
 static void parse_kconfig_imports(CBMExtractCtx *ctx) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->arena, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (ts_node_is_named(node) && strcmp(ts_node_type(node), "source") == 0) {
             push_string_descendant_import(ctx, node);
         }
-        ts_nstack_push_children(&stack, ctx->arena, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
 // --- GN imports: import("//path") ---
 static void parse_gn_imports(CBMExtractCtx *ctx) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->arena, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "import_statement") == 0) {
             push_string_descendant_import(ctx, node);
         }
-        ts_nstack_push_children(&stack, ctx->arena, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2248,8 +2247,8 @@ static void parse_just_imports(CBMExtractCtx *ctx) {
 static void parse_nix_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "apply_expression") == 0) {
@@ -2268,15 +2267,15 @@ static void parse_nix_imports(CBMExtractCtx *ctx) {
                 }
             }
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
 // --- Jsonnet imports: import 'path' / importstr 'path' ---
 static void parse_jsonnet_imports(CBMExtractCtx *ctx) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->arena, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         const char *k = ts_node_type(node);
@@ -2284,15 +2283,15 @@ static void parse_jsonnet_imports(CBMExtractCtx *ctx) {
                                        strcmp(k, "importbin") == 0)) {
             push_string_descendant_import(ctx, node);
         }
-        ts_nstack_push_children(&stack, ctx->arena, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
 // --- Pkl imports: amends/extends/import "path" ---
 static void parse_pkl_imports(CBMExtractCtx *ctx) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->arena, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         const char *k = ts_node_type(node);
@@ -2300,7 +2299,7 @@ static void parse_pkl_imports(CBMExtractCtx *ctx) {
             strcmp(k, "importExpr") == 0) {
             push_string_descendant_import(ctx, node);
         }
-        ts_nstack_push_children(&stack, ctx->arena, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2308,8 +2307,8 @@ static void parse_pkl_imports(CBMExtractCtx *ctx) {
 static void parse_nickel_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         /* The grammar emits an anonymous `import` token followed by a
@@ -2330,7 +2329,7 @@ static void parse_nickel_imports(CBMExtractCtx *ctx) {
                 }
             }
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2354,8 +2353,8 @@ static void parse_thrift_imports(CBMExtractCtx *ctx) {
 // --- Cap'n Proto imports: using X = import "path" ---
 static void parse_capnp_imports(CBMExtractCtx *ctx) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->arena, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         const char *k = ts_node_type(node);
@@ -2364,7 +2363,7 @@ static void parse_capnp_imports(CBMExtractCtx *ctx) {
             push_string_descendant_import(ctx, node);
             continue; /* don't double-emit from nested import_path */
         }
-        ts_nstack_push_children(&stack, ctx->arena, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2372,8 +2371,8 @@ static void parse_capnp_imports(CBMExtractCtx *ctx) {
 static void parse_dlang_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "import_declaration") == 0) {
@@ -2387,15 +2386,15 @@ static void parse_dlang_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
 // --- TableGen imports: include "path.td" ---
 static void parse_tablegen_imports(CBMExtractCtx *ctx) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->arena, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         const char *k = ts_node_type(node);
@@ -2404,22 +2403,22 @@ static void parse_tablegen_imports(CBMExtractCtx *ctx) {
             push_string_descendant_import(ctx, node);
             continue;
         }
-        ts_nstack_push_children(&stack, ctx->arena, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
 // --- Crystal imports: require "./path" ---
 static void parse_crystal_imports(CBMExtractCtx *ctx) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->arena, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (ts_node_is_named(node) && strcmp(ts_node_type(node), "require") == 0) {
             push_string_descendant_import(ctx, node);
             continue;
         }
-        ts_nstack_push_children(&stack, ctx->arena, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2427,8 +2426,8 @@ static void parse_crystal_imports(CBMExtractCtx *ctx) {
 static void parse_fsharp_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         const char *k = ts_node_type(node);
@@ -2444,7 +2443,7 @@ static void parse_fsharp_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2452,8 +2451,8 @@ static void parse_fsharp_imports(CBMExtractCtx *ctx) {
 static void parse_ada_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "with_clause") == 0) {
@@ -2472,7 +2471,7 @@ static void parse_ada_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2483,8 +2482,8 @@ static void parse_ada_imports(CBMExtractCtx *ctx) {
 static void parse_elm_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "import_clause") == 0) {
@@ -2506,7 +2505,7 @@ static void parse_elm_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2517,8 +2516,8 @@ static void parse_elm_imports(CBMExtractCtx *ctx) {
 static void parse_move_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "use_declaration") == 0) {
@@ -2535,7 +2534,7 @@ static void parse_move_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2569,8 +2568,8 @@ static char *smali_demangle_descriptor(CBMArena *a, const char *desc) {
 static void parse_smali_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         const char *k = ts_node_type(node);
@@ -2585,7 +2584,7 @@ static void parse_smali_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2595,8 +2594,8 @@ static void parse_smali_imports(CBMExtractCtx *ctx) {
 static void parse_tlaplus_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         const char *k = ts_node_type(node);
@@ -2615,7 +2614,7 @@ static void parse_tlaplus_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2627,8 +2626,8 @@ static void parse_tlaplus_imports(CBMExtractCtx *ctx) {
 static void parse_vhdl_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "use_clause") == 0) {
@@ -2646,7 +2645,7 @@ static void parse_vhdl_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2656,8 +2655,8 @@ static void parse_vhdl_imports(CBMExtractCtx *ctx) {
 static void parse_wit_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "use_item") == 0) {
@@ -2675,7 +2674,7 @@ static void parse_wit_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2686,8 +2685,8 @@ static void parse_wit_imports(CBMExtractCtx *ctx) {
 static void parse_smithy_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "use_statement") == 0) {
@@ -2709,7 +2708,7 @@ static void parse_smithy_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2719,8 +2718,8 @@ static void parse_smithy_imports(CBMExtractCtx *ctx) {
 static void parse_hyprlang_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "source") == 0) {
@@ -2737,7 +2736,7 @@ static void parse_hyprlang_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 

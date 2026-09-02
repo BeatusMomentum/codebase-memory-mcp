@@ -7,6 +7,7 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
+#include "foundation/constants.h"     /* CBM_SZ_* */
 #include "../src/foundation/compat.h" /* cbm_clock_gettime (wide-flat scaling guard) */
 #include "../src/foundation/compat_fs.h"
 #include <time.h>
@@ -141,6 +142,57 @@ TEST(extract_ts_factory_object_methods_issue341) {
     ASSERT(has_def_any(r, "addItem"));
     ASSERT(has_def_any(r, "moveItem"));
     ASSERT(has_def_any(r, "deleteItem"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2010, split out of #1997: AST traversal stacks were allocated from
+ * result->arena, which the parallel pass holds for every file until the whole
+ * result cache is freed, so a one-file scratch structure was retained for the
+ * length of the index. cbm_extract_channels runs for every file and dispatches
+ * TypeScript to extract_channels_js, whose two walks take a 4096-entry TSNode
+ * stack each, and the ES import walk takes a 512-entry one:
+ * 2 * 4096 * 32 + 512 * 32 = 278528 bytes charged to the arena of a one-line
+ * file.
+ *
+ * The bound is derived, not tuned. Measured on this source, total_alloc was
+ * 365984 before the scratch arena and is 87456 after, exactly that difference.
+ * Of the 87456 that remain, 7680 is the defs item array at GROW_ARRAY's
+ * starting capacity of 32 times sizeof(CBMDefinition) 240, and the other 79776
+ * is everything else this file's extraction interns; none of it is traversal
+ * scratch. So the bound sits above 87456 with room and a factor of four below
+ * 365984.
+ *
+ * It is a byte budget, not a proof of lifetime; that is
+ * extract_traversal_stacks_come_from_ctx_scratch_issue2010 in test_mem.c. */
+TEST(traversal_stack_not_in_result_arena_issue2010) {
+    CBMFileResult *r = extract("export const x = 1;\n", CBM_LANG_TYPESCRIPT, "t", "a.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_TRUE(has_def_any(r, "x"));
+    /* Read the field rather than cbm_arena_total(): this file sees
+     * internal/cbm/arena.h, which declares a subset of the API. test_mem.c
+     * includes foundation/arena.h ahead of cbm.h and can call the accessor. */
+    ASSERT_LT(r->arena.total_alloc, (size_t)CBM_SZ_128 * CBM_SZ_1K);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Not a scratch test. The C and C++ preprocessed second pass builds its own
+ * extraction context (pp_ctx in cbm_extract_file_ex), and that context carries
+ * ctx->scratch so every context in the file is uniform, but nothing reads it
+ * there: pp_ctx reaches only cbm_extract_unified and cbm_run_c_lsp, and neither
+ * extract_unified.c nor anything under internal/cbm/lsp/ includes
+ * extract_node_stack.h, so no traversal stack is built on that path today.
+ * This guards the macro-expansion path itself, which had no assertion on a call
+ * that exists only after expansion. */
+TEST(extract_c_macro_hidden_call_survives_preprocessed_pass_issue2010) {
+    CBMFileResult *r = extract("void target(void) {}\n"
+                               "#define INVOKE() target()\n"
+                               "void caller(void) { INVOKE(); }\n",
+                               CBM_LANG_C, "t", "macro_call.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(has_call(r, "target"));
     cbm_free_result(r);
     PASS();
 }
@@ -5371,6 +5423,8 @@ SUITE(extraction) {
     RUN_TEST(extract_r_box_use_imports_issue218);
     RUN_TEST(extract_r_dollar_call_issue219);
     RUN_TEST(extract_ts_factory_object_methods_issue341);
+    RUN_TEST(traversal_stack_not_in_result_arena_issue2010);
+    RUN_TEST(extract_c_macro_hidden_call_survives_preprocessed_pass_issue2010);
     RUN_TEST(extract_c_macros_issue375);
     RUN_TEST(extract_cpp_macros_issue375);
     RUN_TEST(extract_cpp_functionlike_macro_type_arg_no_false_parse_partial_issue1071);
