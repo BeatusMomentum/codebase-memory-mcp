@@ -754,23 +754,30 @@ typedef struct {
 } tool_annotation_def_t;
 
 /* Tool annotations are deliberately explicit. All tools operate on the local
- * repository/index domain, so none cross an open-world trust boundary. */
+ * repository/index domain, so none cross an open-world trust boundary.
+ *
+ * The ten pure query tools resolve their store through resolve_store(), whose
+ * query-only path is strictly non-mutating: a corrupt database is reported and
+ * left in place, never quarantined or rebuilt — quarantine/rebuild is reserved
+ * for write-side opens (index_repository, manage_adr writes). That is what
+ * makes readOnlyHint=true honest for them and lets plan-mode clients expose
+ * them (the "read-only analysis tools" surface described in #1100). */
 static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"index_repository", false, false, true, false},
-    {"search_graph", false, true, true, false},
-    {"query_graph", false, true, true, false},
-    {"trace_path", false, true, true, false},
-    {"get_code_snippet", false, true, true, false},
+    {"search_graph", true, false, true, false},
+    {"query_graph", true, false, true, false},
+    {"trace_path", true, false, true, false},
+    {"get_code_snippet", true, false, true, false},
     {"get_file_outline", false, true, true, false},
-    {"get_graph_schema", false, true, true, false},
+    {"get_graph_schema", true, false, true, false},
     {"compare_graphs", true, false, true, false},
-    {"get_architecture", false, true, true, false},
-    {"search_code", false, true, true, false},
+    {"get_architecture", true, false, true, false},
+    {"search_code", true, false, true, false},
     {"list_projects", true, false, true, false},
     {"delete_project", false, true, true, false},
-    {"index_status", false, true, true, false},
-    {"check_index_coverage", false, true, true, false},
-    {"detect_changes", false, true, true, false},
+    {"index_status", true, false, true, false},
+    {"check_index_coverage", true, false, true, false},
+    {"detect_changes", true, false, true, false},
     {"manage_adr", false, true, false, false},
     {"ingest_traces", false, false, false, false},
 };
@@ -1624,6 +1631,12 @@ struct cbm_mcp_server {
     bool owns_store;        /* true if we opened the store */
     char *current_project;  /* which project store is open for (heap) */
     time_t store_last_used; /* last time resolve_store was called for a named project */
+    /* Set by a query-only resolve that hit a confirmed-corrupt database and
+     * left it in place (no quarantine, no rebuild). Error builders read this
+     * so the tool reply names the corruption instead of a misleading
+     * "project not found". */
+    bool readonly_resolve_hit_corrupt;
+    char readonly_corrupt_project[CBM_SZ_1K];
 
     /* Session + auto-index state */
     char session_root[CBM_SZ_1K];     /* detected project root path */
@@ -2217,14 +2230,21 @@ typedef enum {
     STORE_RECOVERY_NONE,
     STORE_RECOVERY_BUSY,
     STORE_RECOVERY_TRY_GUARD_UNAVAILABLE,
+    /* Query-only resolve: a confirmed-corrupt database was reported and left
+     * in place. Not an error state of the recovery machinery — the caller is
+     * expected to answer with the corruption, not retry. */
+    STORE_RECOVERY_CORRUPT,
 } store_recovery_status_t;
 
 static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *project,
                                            bool mutation_already_held, bool nonblocking_recovery,
-                                           store_recovery_status_t *recovery_status) {
+                                           store_recovery_status_t *recovery_status,
+                                           bool allow_autorecovery) {
     if (recovery_status) {
         *recovery_status = STORE_RECOVERY_NONE;
     }
+    srv->readonly_resolve_hit_corrupt = false;
+    srv->readonly_corrupt_project[0] = '\0';
     if (!project) {
         return NULL; /* project is required — no implicit fallback */
     }
@@ -2254,6 +2274,38 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
     project_db_path(project, path, sizeof(path));
     srv->store = path[0] ? cbm_store_open_path_query(path) : NULL;
     if (srv->store) {
+        /* Query-only resolve: classify a failed integrity check without any
+         * mutation — no lease, no quarantine. A corrupt database is reported
+         * and left in place for a write-side open (index_repository) to
+         * quarantine and rebuild; that is what keeps the ten read-only
+         * tools' readOnlyHint=true honest. A transient failure (lock, IO, or
+         * the shallow check's own prepare-error-as-corrupt blind spot) is
+         * answered as busy and retried by the next resolve. */
+        if (!allow_autorecovery && !cbm_store_check_integrity(srv->store)) {
+            cbm_store_close(srv->store);
+            srv->store = NULL;
+            srv->store = cbm_store_open_path_query(path);
+            cbm_integrity_verdict_t verdict = srv->store
+                                                  ? cbm_store_check_integrity_verdict(srv->store)
+                                                  : CBM_INTEGRITY_TRANSIENT;
+            if (srv->store) {
+                cbm_store_close(srv->store);
+                srv->store = NULL;
+            }
+            if (verdict == CBM_INTEGRITY_CORRUPT) {
+                srv->readonly_resolve_hit_corrupt = true;
+                snprintf(srv->readonly_corrupt_project, sizeof(srv->readonly_corrupt_project), "%s",
+                         project);
+                cbm_log_warn("store.corrupt_readonly", "project", project, "path", path, "action",
+                             "left in place for a write-side rebuild");
+                if (recovery_status) {
+                    *recovery_status = STORE_RECOVERY_CORRUPT;
+                }
+            } else if (recovery_status) {
+                *recovery_status = STORE_RECOVERY_BUSY;
+            }
+            return NULL;
+        }
         /* Check DB integrity — back up (never silently delete) a corrupt DB */
         if (!cbm_store_check_integrity(srv->store)) {
             cbm_store_close(srv->store);
@@ -2358,7 +2410,8 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
 }
 
 static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
-    return resolve_store_internal(srv, project, false, false, NULL);
+    /* Query-only callers (every read tool): strictly non-mutating resolve. */
+    return resolve_store_internal(srv, project, false, false, NULL, false);
 }
 
 /* Forward decl — definition lives below alongside list_projects. */
@@ -2489,16 +2542,28 @@ static char *build_no_store_error(const char *project) {
                    : build_missing_project_error();
 }
 
+/* Same contract as build_no_store_error, but when the query-only resolve
+ * confirmed a corrupt database and left it in place, name that instead of a
+ * misleading "project not found". */
+static char *build_no_store_error_checked(cbm_mcp_server_t *srv, const char *project) {
+    if (srv->readonly_resolve_hit_corrupt && project &&
+        strcmp(project, srv->readonly_corrupt_project) == 0) {
+        return build_project_list_error(
+            "project store is corrupt (left untouched); run index_repository to rebuild it");
+    }
+    return build_no_store_error(project);
+}
+
 /* Bail with the right error when no store is available. */
-#define REQUIRE_STORE(store, project)                     \
-    do {                                                  \
-        if (!(store)) {                                   \
-            char *_err = build_no_store_error(project);   \
-            char *_res = cbm_mcp_text_result(_err, true); \
-            free(_err);                                   \
-            free(project);                                \
-            return _res;                                  \
-        }                                                 \
+#define REQUIRE_STORE(store, project)                                \
+    do {                                                             \
+        if (!(store)) {                                              \
+            char *_err = build_no_store_error_checked(srv, project); \
+            char *_res = cbm_mcp_text_result(_err, true);            \
+            free(_err);                                              \
+            free(project);                                           \
+            return _res;                                             \
+        }                                                            \
     } while (0)
 
 static bool project_has_adr(cbm_store_t *store, const char *project, const char *root_path) {
@@ -11627,7 +11692,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
 
     char *root_path = get_project_root(srv, project);
     if (!root_path) {
-        char *err = build_no_store_error(project);
+        char *err = build_no_store_error_checked(srv, project);
         char *res = cbm_mcp_text_result(err, true);
         free(err);
         free(project);
@@ -12397,7 +12462,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
      * the UI are visible to each other (#256). */
     store_recovery_status_t recovery_status = STORE_RECOVERY_NONE;
     cbm_store_t *resolved =
-        resolve_store_internal(srv, project, mutation_held, !write_request, &recovery_status);
+        resolve_store_internal(srv, project, mutation_held, !write_request, &recovery_status, true);
     if (!resolved) {
         char *res = NULL;
         if (recovery_status == STORE_RECOVERY_BUSY) {
@@ -12406,7 +12471,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
             res =
                 cbm_mcp_text_result("project recovery requires a nonblocking mutation guard", true);
         } else {
-            char *err = build_no_store_error(project);
+            char *err = build_no_store_error_checked(srv, project);
             res = cbm_mcp_text_result(err, true);
             free(err);
         }
@@ -12458,7 +12523,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
                     invalidate_cached_store(srv);
                     resolved = NULL;
                     store = NULL;
-                    resolved = resolve_store_internal(srv, project, true, false, NULL);
+                    resolved = resolve_store_internal(srv, project, true, false, NULL, true);
                 }
                 if (resolved) {
                     store = open_adr_store_for_write(srv, resolved, &owned_rw);
