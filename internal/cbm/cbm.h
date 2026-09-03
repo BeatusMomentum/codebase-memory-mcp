@@ -269,6 +269,10 @@ typedef struct {
                                         // pass_lsp_cross.c. Default false.
     bool requires_lsp_resolution;       // synthetic semantic candidate (for example an implicit
                                         // C++ operator). Never fall back to textual resolution.
+    bool callee_is_locally_bound;       // bare call foo() whose callee identifier is bound as a
+                                        // parameter of an enclosing function, so it cannot be the
+                                        // module-level foo. Python only today. Read by the
+                                        // weak-local-binding guard. Default false.
 } CBMCall;
 
 typedef struct {
