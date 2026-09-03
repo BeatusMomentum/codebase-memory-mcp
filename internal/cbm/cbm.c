@@ -821,9 +821,13 @@ static void cbm_error_regions_push(cbm_error_regions_t *acc, TSNode n) {
  * untouched.
  *
  * #1746: the Dockerfile grammar places that zero-width missing newline before
- * trailing horizontal whitespace rather than at raw EOF. Preserve the broad
- * exact-EOF rule above; only extend it past spaces/tabs when the missing token
- * is specifically a newline. */
+ * trailing whitespace rather than at raw EOF. Preserve the broad exact-EOF
+ * rule above; only extend it past blanks when the missing token is specifically
+ * a newline. */
+static bool cbm_is_blank_not_newline(char c) {
+    return c == ' ' || c == '\t' || c == '\v' || c == '\f' || c == '\r';
+}
+
 static bool cbm_is_eof_terminator_miss(TSNode n, const char *source, int source_len) {
     if (!ts_node_is_missing(n) || source_len < 0) {
         return false;
@@ -840,7 +844,7 @@ static bool cbm_is_eof_terminator_miss(TSNode n, const char *source, int source_
         return false;
     }
     for (uint32_t i = end; i < (uint32_t)source_len; i++) {
-        if (source[i] != ' ' && source[i] != '\t') {
+        if (!cbm_is_blank_not_newline(source[i])) {
             return false;
         }
     }
