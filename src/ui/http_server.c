@@ -70,6 +70,10 @@
 
 /* ── Constants ────────────────────────────────────────────────── */
 
+#ifndef CBM_VERSION
+#define CBM_VERSION "dev"
+#endif
+
 /* Max JSON-RPC request body size (1 MB) — transport enforces the same cap. */
 #define MAX_BODY_SIZE CBM_HTTP_MAX_BODY
 
@@ -147,8 +151,10 @@ static void handle_ui_config(cbm_http_conn_t *c, const cbm_http_req_t *req) {
      * audit forbids hardcoded external URLs in graph-ui source (external
      * targets must come from an auditable backend response, same pattern as
      * the /api/repo-info deep-links). */
-    cbm_http_replyf(c, 200, g_cors_json, "{\"lang\":\"%s\",\"upstream_issues_url\":\"%s\"}",
-                    lang_buf, "https://github.com/DeusData/codebase-memory-mcp/issues/new");
+    cbm_http_replyf(c, 200, g_cors_json,
+                    "{\"lang\":\"%s\",\"version\":\"%s\",\"upstream_issues_url\":\"%s\"}",
+                    lang_buf, CBM_VERSION,
+                    "https://github.com/DeusData/codebase-memory-mcp/issues/new");
 }
 
 /* ── Server state ─────────────────────────────────────────────── */
