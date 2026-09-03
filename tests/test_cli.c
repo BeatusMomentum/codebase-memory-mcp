@@ -6561,8 +6561,19 @@ TEST(cli_agent_client_registry_routes_plan_install_and_uninstall) {
     char *plan = cbm_build_install_plan_json(tmpdir, binary_path);
     yyjson_doc *plan_doc = plan ? yyjson_read(plan, strlen(plan), 0) : NULL;
     yyjson_val *plan_root = plan_doc ? yyjson_doc_get_root(plan_doc) : NULL;
+    /* Neither of these agents has a plugin directory, so a planned path under
+     * one would be invented. Name the two directories rather than searching the
+     * whole plan for "/plugins/": OpenCode does ship a real plugin file, and
+     * agent detection finds a command in /usr/local/bin or /opt/homebrew/bin
+     * whatever HOME and PATH say, so a blanket search passes or fails according
+     * to what the developer happens to have installed. */
+    char qoder_plugins[700];
+    char pi_plugins[700];
+    snprintf(qoder_plugins, sizeof(qoder_plugins), "%s/plugins/", qoder_dir);
+    snprintf(pi_plugins, sizeof(pi_plugins), "%s/plugins/", pi_dir);
     bool plan_ok =
-        plan && !strstr(plan, "/plugins/") && !strstr(plan, "plugin_files") &&
+        plan && !strstr(plan, qoder_plugins) && !strstr(plan, pi_plugins) &&
+        !strstr(plan, "plugin_files") &&
         test_json_string_array_contains(plan_root, "config_files_planned", qoder_settings) &&
         test_json_string_array_contains(plan_root, "config_files_planned", amazon_config) &&
         test_json_string_array_contains(plan_root, "config_files_planned", roo_config) &&
